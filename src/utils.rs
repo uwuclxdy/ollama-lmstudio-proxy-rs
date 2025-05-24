@@ -142,15 +142,53 @@ pub fn clean_model_name(name: &str) -> String {
     after_latest.to_string()
 }
 
-/// Check if an error message indicates that no models are loaded
-pub fn is_no_models_loaded_error(message: &str) -> bool {
+/// Enhanced function to check if an error message indicates that a model needs to be loaded or switched
+pub fn is_model_loading_error(message: &str) -> bool {
     let lower_msg = message.to_lowercase();
-    lower_msg.contains("no model")
+
+    // Original "no models loaded" patterns
+    if lower_msg.contains("no model")
         || lower_msg.contains("model not loaded")
         || lower_msg.contains("no models loaded")
         || lower_msg.contains("model loading")
         || lower_msg.contains("load a model")
-        || lower_msg.contains("model is not loaded")
+        || lower_msg.contains("model is not loaded") {
+        return true;
+    }
+
+    // Model mismatch/unavailable patterns
+    if lower_msg.contains("model not found")
+        || lower_msg.contains("model not available")
+        || lower_msg.contains("model does not exist")
+        || lower_msg.contains("unknown model")
+        || lower_msg.contains("invalid model")
+        || lower_msg.contains("model not supported")
+        || lower_msg.contains("model mismatch")
+        || lower_msg.contains("requested model")
+        || lower_msg.contains("model is not available") {
+        return true;
+    }
+
+    // LM Studio specific patterns (common error messages)
+    if lower_msg.contains("failed to load model")
+        || lower_msg.contains("model failed to load")
+        || lower_msg.contains("cannot find model")
+        || lower_msg.contains("model path not found")
+        || lower_msg.contains("model file not found") {
+        return true;
+    }
+
+    // HTTP status patterns that might indicate model issues
+    if (lower_msg.contains("404") || lower_msg.contains("not found")) && lower_msg.contains("model") {
+        return true;
+    }
+
+    if (lower_msg.contains("400") || lower_msg.contains("bad request")) &&
+        (lower_msg.contains("model") || lower_msg.contains("invalid")) {
+        return true;
+    }
+
+    false
 }
 
 /// Format a duration into human-readable string
