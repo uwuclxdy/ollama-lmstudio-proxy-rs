@@ -132,7 +132,7 @@ async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
         // For other endpoints, return standard error format
         warp::reply::json(&serde_json::json!({
             "error": {
-                "type": "proxy_error", 
+                "type": "proxy_error",
                 "message": message
             }
         }))

@@ -1,7 +1,6 @@
 pub mod server;
-pub mod handlers;
 pub mod utils;
-
+pub mod handlers;
 /// Public re-exports for easy access
 pub use server::{Config, ProxyServer};
 pub use utils::ProxyError;
@@ -17,6 +16,6 @@ mod tests {
     #[test]
     fn test_version_info() {
         assert!(!VERSION.is_empty());
-        assert_eq!(NAME, "ollama-lmstudio-proxy");
+        assert_eq!(NAME, "ollama-lmstudio-proxy-rust");
     }
 }

@@ -9,6 +9,7 @@ Send requests to Chat Completions (text and images), Completions, and Embeddings
 LM Studio accepts requests on several OpenAI endpoints and returns OpenAI-like response objects.
 
 **Supported endpoints**
+
 ```
 GET    /v1/models
 POST   /v1/chat/completions
@@ -24,13 +25,15 @@ See below for more info about each endpoint
 
 > 💡 **Pro Tip**
 >
-> You can reuse existing OpenAI clients (in Python, JS, C#, etc) by switching up the "base URL" property to point to your LM Studio instead of OpenAI's servers.
+> You can reuse existing OpenAI clients (in Python, JS, C#, etc) by switching up the "base URL" property to point to
+> your LM Studio instead of OpenAI's servers.
 
 ### Switching up the `base url` to point to LM Studio
 
 Note: The following examples assume the server port is `1234`
 
 **Python**
+
 ```python
 from openai import OpenAI
 
@@ -42,6 +45,7 @@ client = OpenAI(
 ```
 
 **Typescript**
+
 ```typescript
 import OpenAI from 'openai';
 
@@ -53,6 +57,7 @@ const client = new OpenAI({
 ```
 
 **cURL**
+
 ```diff
 - curl https://api.openai.com/v1/chat/completions \
 + curl http://localhost:1234/v1/chat/completions \
@@ -71,10 +76,11 @@ const client = new OpenAI({
 
 ### `/v1/models`
 
-*   `GET` request
-*   Lists the currently **loaded** models.
+* `GET` request
+* Lists the currently **loaded** models.
 
 **cURL example**
+
 ```bash
 curl http://localhost:1234/v1/models
 ```
@@ -83,14 +89,16 @@ curl http://localhost:1234/v1/models
 
 ### `/v1/chat/completions`
 
-*   `POST` request
-*   Send a chat history and receive the assistant's response
-*   Prompt template is applied automatically
-*   You can provide inference parameters such as temperature in the payload. See [supported parameters](#supported-payload-parameters)
-*   See [OpenAI's documentation](https://platform.openai.com/docs/api-reference/chat) for more information
-*   As always, keep a terminal window open with `lms log stream` to see what input the model receives
+* `POST` request
+* Send a chat history and receive the assistant's response
+* Prompt template is applied automatically
+* You can provide inference parameters such as temperature in the payload.
+  See [supported parameters](#supported-payload-parameters)
+* See [OpenAI's documentation](https://platform.openai.com/docs/api-reference/chat) for more information
+* As always, keep a terminal window open with `lms log stream` to see what input the model receives
 
 **Python example**
+
 ```python
 # Example: reuse your existing OpenAI setup
 from openai import OpenAI
@@ -114,11 +122,12 @@ print(completion.choices[0].message)
 
 ### `/v1/embeddings`
 
-*   `POST` request
-*   Send a string or array of strings and get an array of text embeddings (integer token IDs)
-*   See [OpenAI's documentation](https://platform.openai.com/docs/api-reference/embeddings) for more information
+* `POST` request
+* Send a string or array of strings and get an array of text embeddings (integer token IDs)
+* See [OpenAI's documentation](https://platform.openai.com/docs/api-reference/embeddings) for more information
 
 **Python example**
+
 ```python
 # Make sure to `pip install openai` first
 from openai import OpenAI
@@ -139,22 +148,24 @@ print(get_embedding("Once upon a time, there was a cat."))
 >
 > This OpenAI-like endpoint is no longer supported by OpenAI. LM Studio continues to support it.
 >
-> Using this endpoint with chat-tuned models might result in unexpected behavior such as extraneous role tokens being emitted by the model.
+> Using this endpoint with chat-tuned models might result in unexpected behavior such as extraneous role tokens being
+> emitted by the model.
 >
 > For best results, utilize a base model.
 
-*   `POST` request
-*   Send a string and get the model's continuation of that string
-*   See [supported payload parameters](#supported-payload-parameters)
-*   Prompt template will NOT be applied, even if the model has one
-*   See [OpenAI's documentation](https://platform.openai.com/docs/api-reference/completions) for more information
-*   As always, keep a terminal window open with `lms log stream` to see what input the model receives
+* `POST` request
+* Send a string and get the model's continuation of that string
+* See [supported payload parameters](#supported-payload-parameters)
+* Prompt template will NOT be applied, even if the model has one
+* See [OpenAI's documentation](https://platform.openai.com/docs/api-reference/completions) for more information
+* As always, keep a terminal window open with `lms log stream` to see what input the model receives
 
 ---
 
 ## Supported payload parameters
 
-For an explanation for each parameter, see [https://platform.openai.com/docs/api-reference/chat/create](https://platform.openai.com/docs/api-reference/chat/create).
+For an explanation for each parameter,
+see [https://platform.openai.com/docs/api-reference/chat/create](https://platform.openai.com/docs/api-reference/chat/create).
 
 ```
 model
@@ -176,4 +187,5 @@ seed
 
 ## Community
 
-Chat with other LM Studio developers, discuss LLMs, hardware, and more on the [LM Studio Discord server](https://discord.gg/YOUR_LM_STUDIO_DISCORD_LINK_HERE).
+Chat with other LM Studio developers, discuss LLMs, hardware, and more on
+the [LM Studio Discord server](https://discord.gg/YOUR_LM_STUDIO_DISCORD_LINK_HERE).
