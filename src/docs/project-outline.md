@@ -1,292 +1,193 @@
-# 🔧 Ollama-LM Studio Proxy - Project Outline
+# Ollama LM Studio Proxy - Project Outline
 
-## 📋 Project Purpose
+## Project Description
+A Rust-based proxy server that bridges the Ollama API and LM Studio API, enabling Ollama clients to communicate with LM Studio backends. The key feature is comprehensive **cancellation support** - when clients disconnect, all related LM Studio requests are immediately cancelled to prevent resource waste.
 
-**Translation proxy** that bridges the gap between Ollama API clients and LM Studio backend, enabling Ollama-compatible
-tools to work with LM Studio models.
+## Key Features
+- **API Translation**: Converts Ollama API calls to LM Studio format and vice versa
+- **Streaming Support**: Handles both streaming and non-streaming responses
+- **Client Disconnection Detection**: Automatically cancels LM Studio requests when clients disconnect
+- **Auto-retry Logic**: Automatically triggers model loading in LM Studio when needed
+- **Comprehensive Error Handling**: Proper error propagation and transformation
 
-- **Input**: Ollama API requests (`/api/*`)
-- **Translation**: Converts to OpenAI/LM Studio format (`/v1/*`)
-- **Output**: Ollama-compatible responses with proper metadata
-- **Passthrough**: Direct LM Studio API access via `/v1/*` endpoints
-
-## 🏗️ Architecture Overview
-
-```
-[Client] → [Proxy Server] → [LM Studio]
-         ↑               ↓
-    [API Translation] [Auto-Retry] [Response Enhancement]
-```
-
-**Core Features:**
-
-- API format translation (Ollama ↔ OpenAI/LM Studio)
-- Streaming support for real-time responses (SSE to JSON-lines)
-- Auto-retry with model loading detection for LM Studio
-- Enhanced response metadata for Ollama compatibility (timing, model details)
-- **Advanced Request Cancellation:**
-    - **Client Disconnection Detection:** Actively monitors client connections via `ConnectionTracker`.
-    - **Cancellable Backend Requests:** HTTP requests to LM Studio (`CancellableRequest`) are aborted if the client
-      disconnects.
-    - **Cancellable Streaming:** Both Ollama-emulated and passthrough streaming operations respect cancellation tokens.
-    - **Graceful Stream Termination:** Sends a specific cancellation message/chunk if a stream is cancelled.
-    - **Cancellation-Aware Retries:** Retry logic for model loading also respects cancellation signals.
-    - **HTTP 499 for Cancellations:** Uses status code 499 (Client Closed Request) for responses to cancelled requests.
-
-## 📁 Project Structure
-
+## File Structure
 ```
 src/
-├── main.rs              # Entry point & CLI setup (~20 lines)
-├── lib.rs               # Module declarations & re-exports (~20 lines)
-├── server.rs            # HTTP server, routing, cancellation tracking (~250 lines)
-├── utils.rs             # Utilities, ProxyError, Logger, model name helpers (~200 lines)
-└── handlers/            # Modular request handlers (~600+ lines)
-    ├── cancelation_handlers.rs # Cancellation-aware request handlers
-    ├── cancelation.rs   # Cancellation token management & request cancellation logic
-    ├── helpers.rs       # Model metadata & response utilities
-    ├── mod.rs           # Module organization & exports
-    ├── retry.rs         # Auto-retry infrastructure with cancellation
-    ├── streaming.rs     # Streaming response handling with cancellation
-    ├── ollama.rs        # Ollama API endpoint handlers with cancellation
-    └── lmstudio.rs      # LM Studio passthrough handlers with cancellation
+├── main.rs                 # Entry point
+├── lib.rs                  # Library root with re-exports
+├── server.rs               # Main server implementation
+├── utils.rs                # Utilities (errors, logging, model name handling)
+├── common.rs               # Core cancellable request infrastructure
+└── handlers/
+    ├── mod.rs              # Handler module organization
+    ├── retry.rs            # Auto-retry with model loading
+    ├── streaming.rs        # Streaming response handling
+    ├── lmstudio.rs         # LM Studio API passthrough
+    ├── ollama.rs           # Ollama API handlers
+    └── helpers.rs          # Response transformation utilities
 ```
 
-## 🔌 API Endpoints
+## Core Components
 
-### Ollama API (Translated & Cancellable)
+### main.rs
+**Purpose**: Application entry point
+- `main()` - Parses CLI arguments using clap and starts the proxy server
 
-- `GET /api/tags` → `GET /v1/models` - List models
-- `POST /api/chat` → `POST /v1/chat/completions` - Chat completion
-- `POST /api/generate` → `POST /v1/completions` - Text completion
-- `POST /api/embed[dings]` → `POST /v1/embeddings` - Generate embeddings
-- `POST /api/show` - Model info (enhanced fake response)
-- `GET /api/ps` - Running models (static empty response)
-- `GET /api/version` - Version info (proxy version)
+### lib.rs
+**Purpose**: Library root module
+- Module declarations and public re-exports
+- Exposes `Config`, `ProxyServer`, `ProxyError` publicly
+- Version constants
 
-### LM Studio API (Passthrough & Cancellable)
+### server.rs
+**Purpose**: Main HTTP server with cancellation support
 
-- `GET /v1/models` - Direct passthrough
-- `POST /v1/chat/completions` - Direct passthrough
-- `POST /v1/completions` - Direct passthrough
-- `POST /v1/embeddings` - Direct passthrough
-- Other `/v1/*` endpoints can be passed through.
+#### Key Structures:
+- `Config` - CLI configuration (listen address, LM Studio URL, timeouts)
+- `CancellationTokenFactory` - Creates cancellation tokens for each request
+- `ProxyServer` - Main server instance with HTTP client and configuration
+- `ConnectionTracker` - Tracks connection lifecycle and triggers cancellation on drop
 
-### Unsupported (501 responses)
+#### Key Functions:
+- `ProxyServer::new(config)` - Creates server instance
+- `ProxyServer::run()` - Starts HTTP server on configured address
+- `handle_request_with_cancellation()` - Routes requests to appropriate handlers with cancellation tokens
+- `handle_rejection()` - Converts errors to proper HTTP responses
 
-- `/api/create`, `/api/pull`, `/api/push`, `/api/delete`, `/api/copy`
+#### Request Routing:
+- `/api/*` → Ollama API handlers (translated to LM Studio)
+- `/v1/*` → LM Studio API direct passthrough
+- Unsupported endpoints return proper error responses
 
-## 🔄 Key Components
+### utils.rs
+**Purpose**: Core utilities and error handling
 
-### 1. Auto-Retry System (`handlers/retry.rs`)
+#### Key Structures:
+- `ProxyError` - Custom error type with status codes and cancellation detection
+- `Logger` - Simple logging utility with enable/disable support
 
-```
-trigger_model_loading_with_cancellation(
-    server: &ProxyServer,
-    cancellation_token: CancellationToken
-) -> Result<bool, ProxyError>
-// Calls GET /v1/models to wake up LM Studio and trigger model loading, respecting cancellation.
+#### Key Functions:
+- `ProxyError::*()` - Various error constructors (bad_request, not_found, request_cancelled, etc.)
+- `clean_model_name(name)` - Removes `:latest` and numeric suffixes from model names
+- `is_no_models_loaded_error(message)` - Detects LM Studio "no model loaded" errors
+- `format_duration(duration)` - Formats durations for logging
+- `validate_model_name(name)` - Validates model names and returns warnings
 
-with_retry_and_cancellation<F, Fut, T>(
-    server: &ProxyServer,
-    operation: F,
-    cancellation_token: CancellationToken
-) -> Result<T, ProxyError>
-// Generic retry wrapper that detects model loading errors and retries operations,
-// respecting cancellation throughout the process (including waits).
-```
+### common.rs
+**Purpose**: Core cancellable request infrastructure
 
-### 2. Streaming Support (`handlers/streaming.rs`)
+#### Key Structures:
+- `CancellableRequest` - Wrapper for HTTP requests that can be cancelled mid-flight
 
-```
-is_streaming_request(body: &Value) -> bool
-// Check if request has "stream": true enabled.
+#### Key Functions:
+- `CancellableRequest::new()` - Creates request wrapper with cancellation token
+- `CancellableRequest::make_request()` - Makes HTTP request that can be cancelled via tokio::select!
+- `handle_cancellable_json_response()` - Parses JSON responses with cancellation support
+- `handle_cancellable_text_response()` - Parses text responses with cancellation support
 
-handle_streaming_response_with_cancellation(
-    response: reqwest::Response,
-    is_chat: bool,
-    model: &str,
-    start_time: Instant,
-    cancellation_token: CancellationToken
-) -> Result<warp::reply::Response, ProxyError>
-// Converts LM Studio SSE stream to Ollama format with proper chunking, final stats,
-// and graceful handling of cancellation (sends cancellation chunk).
+### handlers/retry.rs
+**Purpose**: Auto-retry logic with model loading
 
-handle_passthrough_streaming_response_with_cancellation(
-    response: reqwest::Response,
-    cancellation_token: CancellationToken
-) -> Result<warp::reply::Response, ProxyError>
-// Direct passthrough of LM Studio streaming responses, cancellable.
+#### Key Functions:
+- `trigger_model_loading(server, token)` - Calls /v1/models to trigger LM Studio model loading
+- `with_retry_and_cancellation(server, operation, token)` - Generic retry wrapper that:
+  - Tries operation once
+  - If "no models loaded" error, triggers model loading and retries
+  - Handles cancellation at every step
 
-convert_sse_to_ollama_chat(sse_message: &str, model: &str) -> Option<Value>
-// Parses SSE data and converts to Ollama chat chunk format.
+### handlers/streaming.rs
+**Purpose**: Streaming response handling with cancellation
 
-convert_sse_to_ollama_generate(sse_message: &str, model: &str) -> Option<Value>
-// Parses SSE data and converts to Ollama generate chunk format.
+#### Key Functions:
+- `is_streaming_request(body)` - Checks if request has `"stream": true`
+- `handle_streaming_response()` - Converts LM Studio SSE to Ollama streaming format with cancellation
+- `handle_passthrough_streaming_response()` - Direct SSE passthrough with cancellation
+- `convert_sse_to_ollama_chat()` - Converts LM Studio chat SSE to Ollama format
+- `convert_sse_to_ollama_generate()` - Converts LM Studio completion SSE to Ollama format
 
-create_cancellation_chunk(model, partial_content, duration, tokens, is_chat) -> Value
-// Creates a specific JSON chunk to send when a stream is cancelled.
+#### Streaming Process:
+1. Spawns async task to process LM Studio SSE stream
+2. Uses `tokio::select!` to handle either new chunks or cancellation
+3. On cancellation, sends graceful cancellation chunk and stops processing
+4. Tracks partial content for meaningful cancellation messages
 
-create_error_chunk(model, error_message, is_chat) -> Value
-// Creates a specific JSON chunk for streaming errors.
+### handlers/lmstudio.rs
+**Purpose**: Direct LM Studio API passthrough
 
-create_final_chunk(model, duration, chunk_count, is_chat) -> Value
-// Creates the final summary chunk for an Ollama stream.
-```
+#### Key Functions:
+- `handle_lmstudio_passthrough(server, method, endpoint, body, token)` - Direct API passthrough with:
+  - Request method conversion (GET/POST/PUT/DELETE)
+  - Streaming vs non-streaming detection
+  - Cancellation support throughout
+  - Auto-retry integration via `with_retry_and_cancellation`
 
-### 3. Response Helpers (`handlers/helpers.rs`)
+### handlers/ollama.rs
+**Purpose**: Ollama API handlers that translate to LM Studio format
 
-```
-json_response(value: &Value) -> warp::reply::Response
-// Convert JSON Value to proper HTTP Response with 200 OK status.
+#### Key Functions:
+- `handle_ollama_tags()` - GET /api/tags → /v1/models (lists available models)
+- `handle_ollama_chat()` - POST /api/chat → /v1/chat/completions (chat with streaming support)
+- `handle_ollama_generate()` - POST /api/generate → /v1/completions (text completion with streaming)
+- `handle_ollama_embeddings()` - POST /api/embeddings → /v1/embeddings (text embeddings)
+- `handle_ollama_show()` - POST /api/show (model info, static response)
+- `handle_ollama_ps()` - GET /api/ps (running models, returns empty list)
+- `handle_ollama_version()` - GET /api/version (version info)
+- `handle_unsupported()` - Handles unsupported endpoints (create, pull, push, delete, copy)
 
-determine_model_family(model_name: &str) -> (&'static str, Vec<&'static str>)
-// Detect model family (llama, mistral, qwen, etc.) from model name.
+#### Translation Process:
+1. Extract Ollama request parameters
+2. Clean and transform model names
+3. Convert request format to LM Studio API
+4. Make cancellable request to LM Studio
+5. Transform response back to Ollama format
+6. Handle streaming vs non-streaming appropriately
 
-determine_parameter_size(model_name: &str) -> &'static str
-// Extract parameter size (7B, 13B, 70B, etc.) from model name.
+### handlers/helpers.rs
+**Purpose**: Response transformation and utility functions
 
-estimate_model_size(parameter_size: &str) -> u64
-// Convert parameter size to estimated file size in bytes.
+#### Response Transformation:
+- `transform_chat_response()` - LM Studio chat → Ollama chat format
+- `transform_generate_response()` - LM Studio completion → Ollama generate format
+- `transform_embeddings_response()` - LM Studio embeddings → Ollama embeddings format
 
-determine_model_capabilities(model_name: &str) -> Vec<&'static str>
-// Determine model capabilities (chat, completion, embeddings, vision, tools).
-```
+#### Model Analysis:
+- `determine_model_family()` - Detects model family (llama, mistral, qwen, etc.)
+- `determine_parameter_size()` - Extracts parameter size (7B, 13B, etc.) from model name
+- `estimate_model_size()` - Estimates model size in bytes
+- `determine_model_capabilities()` - Determines model capabilities (chat, completion, embeddings, vision, tools)
 
-### 4. Ollama API Handlers (`handlers/ollama.rs`)
+#### Streaming Utilities:
+- `extract_content_from_chunk()` - Extracts text content from streaming chunks
+- `create_error_chunk()` - Creates error response chunks for streaming
+- `create_cancellation_chunk()` - Creates graceful cancellation response with partial content info
+- `create_final_chunk()` - Creates completion chunks for streaming responses
 
-Contains `CancellableRequest` struct (with `request_id`) for making cancellable HTTP calls.
+#### General Utilities:
+- `json_response()` - Creates JSON HTTP responses
 
-```
-handle_ollama_tags_with_cancellation(
-    server: Arc<ProxyServer>,
-    cancellation_token: CancellationToken
-) -> Result<warp::reply::Response, ProxyError>
-// GET /api/tags - List available models with Ollama-compatible metadata, cancellable.
+## Cancellation Architecture
 
-handle_ollama_chat_with_cancellation(
-    server: Arc<ProxyServer>,
-    body: Value,
-    cancellation_token: CancellationToken
-) -> Result<warp::reply::Response, ProxyError>
-// POST /api/chat - Chat completion with streaming/non-streaming support,
-// reasoning integration, and cancellation.
+The entire system is built around **CancellationToken** from `tokio_util::sync`:
 
-handle_non_streaming_chat_response_with_cancellation(
-    response: reqwest::Response,
-    model: &str,
-    messages: &[Value],
-    start_time: Instant,
-    cancellation_token: CancellationToken
-) -> Result<warp::reply::Response, ProxyError>
-// Process non-streaming chat responses, cancellable during response parsing.
+1. **Connection Tracking**: `ConnectionTracker` automatically cancels requests when dropped (client disconnect)
+2. **Request Cancellation**: All HTTP requests use `tokio::select!` to race between completion and cancellation
+3. **Streaming Cancellation**: Streaming handlers monitor cancellation token and send graceful termination
+4. **Retry Cancellation**: Retry logic checks cancellation at every step
+5. **Graceful Handling**: Cancelled requests return proper HTTP 499 responses
 
-handle_ollama_generate_with_cancellation(
-    server: Arc<ProxyServer>,
-    body: Value,
-    cancellation_token: CancellationToken
-) -> Result<warp::reply::Response, ProxyError>
-// POST /api/generate - Text completion with streaming/non-streaming support and cancellation.
+## Key Design Patterns
 
-handle_non_streaming_generate_response_with_cancellation(
-    response: reqwest::Response,
-    model: &str,
-    prompt: &str,
-    start_time: Instant,
-    cancellation_token: CancellationToken
-) -> Result<warp::reply::Response, ProxyError>
-// Process non-streaming completion responses, cancellable during response parsing.
+- **Unified Error Handling**: All functions return `Result<T, ProxyError>` with consistent error types
+- **Cancellation-First Design**: Every async operation can be cancelled cleanly
+- **Generic Retry Logic**: `with_retry_and_cancellation` wraps any operation with auto-retry
+- **Streaming Abstraction**: Common streaming utilities handle both chat and completion formats
+- **Model Name Normalization**: Consistent model name cleaning across all handlers
 
-handle_ollama_embeddings_with_cancellation(
-    server: Arc<ProxyServer>,
-    body: Value,
-    cancellation_token: CancellationToken
-) -> Result<warp::reply::Response, ProxyError>
-// POST /api/embed[dings] - Generate text embeddings, cancellable.
-
-// Also includes non-cancellable legacy versions and static handlers:
-handle_ollama_ps() -> Result<warp::reply::Response, ProxyError>
-handle_ollama_show(body: Value) -> Result<warp::reply::Response, ProxyError>
-handle_ollama_version() -> Result<warp::reply::Response, ProxyError>
-handle_unsupported(endpoint: &str) -> Result<warp::reply::Response, ProxyError>
-```
-
-### 5. LM Studio Passthrough (`handlers/lmstudio.rs`)
-
-Contains `CancellableRequest` struct for making cancellable HTTP calls.
-
-```
-handle_lmstudio_passthrough_with_cancellation(
-    server: Arc<ProxyServer>,
-    method: &str,
-    endpoint: &str,
-    body: Value,
-    cancellation_token: CancellationToken
-) -> Result<warp::reply::Response, ProxyError>
-// Direct passthrough for /v1/* endpoints with streaming/non-streaming support,
-// retry logic, and cancellation.
-
-handle_non_streaming_passthrough_response(
-    response: reqwest::Response,
-    cancellation_token: CancellationToken
-) -> Result<warp::reply::Response, ProxyError>
-// Handles non-streaming passthrough responses, cancellable during JSON parsing.
-```
-
-### 6. Utilities (`utils.rs`)
-
-```
-// ProxyError struct and related methods
-ProxyError::request_cancelled() -> Self // Creates a 499 error
-ProxyError::is_cancelled(&self) -> bool // Checks if error is due to cancellation
-
-clean_model_name(name: &str) -> String
-// Remove :latest suffix and numeric version tags (deepseek-r1:2 → deepseek-r1).
-
-is_no_models_loaded_error(message: &str) -> bool
-// Detect error messages indicating LM Studio needs model loading.
-
-format_duration(duration: Duration) -> String
-// Format Duration as human-readable string (1500ms → "1.50s").
-
-validate_model_name(name: &str) -> (bool, Option<String>)
-// Validate model name and return warnings for potential issues.
-```
-
-### 7. Server Core (`server.rs`)
-
-```
-// Config struct for CLI arguments
-
-// CancellationTokenFactory for creating CancellationToken instances per request
-CancellationTokenFactory::create_token(&self) -> CancellationToken
-
-// ProxyServer struct with client, config, logger, cancellation_factory
-ProxyServer::new(config: Config) -> Self
-ProxyServer::run(self) -> Result<(), Box<dyn std::error::Error>>
-
-// ConnectionTracker struct to monitor client connection and trigger cancellation on drop
-ConnectionTracker::new(token: CancellationToken) -> Self
-ConnectionTracker::mark_completed(&self) // Prevents cancellation if request finishes normally
-
-handle_request_with_cancellation(
-    server: Arc<ProxyServer>,
-    method: String,
-    path: String,
-    body: Value
-) -> Result<warp::reply::Response, Rejection>
-// Main request router. Sets up ConnectionTracker, passes CancellationToken to handlers,
-// and handles ProxyError::request_cancelled() specifically.
-
-handle_rejection(err: Rejection) -> Result<impl Reply, Infallible>
-// Convert rejections (including ProxyError) to proper HTTP error responses.
-```
-
-### 8. Response Enhancement Features
-
-- **Reasoning Integration**: Merges `reasoning_content` with main content in chat responses (if provided by LM Studio).
-- **Timing Estimates**: Calculates realistic `total_duration`, `eval_count`, `prompt_eval_count` for Ollama responses.
-- **Metadata Generation**: Provides consistent digests, sizes, and model details for `/api/tags` and `/api/show`.
-- **Format Translation**: Converts between LM Studio/OpenAI and Ollama response structures, including streaming chunks.
-- **Cancellation Information**: Includes `cancelled: true` and `partial_response: bool` fields in the final chunk of a
-  cancelled stream.
+## Dependencies
+- `tokio` - Async runtime
+- `warp` - HTTP server framework
+- `reqwest` - HTTP client
+- `serde_json` - JSON handling
+- `tokio-util` - Cancellation tokens
+- `clap` - CLI argument parsing
+- `chrono` - Timestamp handling
