@@ -1,12 +1,10 @@
-// src/handlers/mod.rs - Simplified module organization with unified cancellation support
+// src/handlers/mod.rs - Module organization
 
 pub mod retry;
 pub mod streaming;
 pub mod helpers;
 pub mod ollama;
 pub mod lmstudio;
-
-// Re-export unified handler functions (only cancellation-aware versions)
 
 // Ollama handlers
 pub use ollama::{

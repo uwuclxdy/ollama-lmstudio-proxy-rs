@@ -4,19 +4,21 @@ use serde_json::Value;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-use crate::utils::ProxyError;
+use crate::utils::{ProxyError, Logger};
 
 /// Unified wrapper for cancellable HTTP requests
 pub struct CancellableRequest {
     client: reqwest::Client,
     token: CancellationToken,
     request_id: String,
+    logger: Logger,
+    timeout_seconds: u64,
 }
 
 impl CancellableRequest {
-    pub fn new(client: reqwest::Client, token: CancellationToken) -> Self {
+    pub fn new(client: reqwest::Client, token: CancellationToken, logger: Logger, timeout_seconds: u64) -> Self {
         let request_id = format!("req_{}", chrono::Utc::now().timestamp_millis());
-        Self { client, token, request_id }
+        Self { client, token, request_id, logger, timeout_seconds }
     }
 
     /// Make a cancellable HTTP request that can be aborted mid-flight
@@ -34,32 +36,30 @@ impl CancellableRequest {
                 .json(&body);
         }
 
-        // Add a timeout to prevent hanging requests
-        request_builder = request_builder.timeout(Duration::from_secs(300)); // 5 minutes max
+        request_builder = request_builder.timeout(Duration::from_secs(self.timeout_seconds));
 
-        log::info!("🌐 [{}] Starting request to LM Studio: {}", self.request_id, url);
+        self.logger.log(&format!("🌐 [{}] Starting request to LM Studio: {}", self.request_id, url));
 
         let request_future = request_builder.send();
 
         // Use tokio::select to race between the request and cancellation
         tokio::select! {
-            // Request completes normally
             result = request_future => {
                 match result {
                     Ok(response) => {
-                        log::info!("✅ [{}] Request completed successfully", self.request_id);
+                        self.logger.log(&format!("✅ [{}] Request completed successfully", self.request_id));
                         Ok(response)
                     },
                     Err(err) => {
-                        log::warn!("❌ [{}] Request failed: {}", self.request_id, err);
+                        self.logger.log(&format!("❌ [{}] Request failed: {}", self.request_id, err));
                         Err(ProxyError::internal_server_error(&format!("Failed to reach LM Studio: {}", err)))
                     }
                 }
             }
-            // Request was cancelled - this is the key part!
+            
+            // Request was cancelled
             _ = self.token.cancelled() => {
-                log::warn!("🚫 [{}] HTTP request to LM Studio was cancelled by client disconnection", self.request_id);
-                // Return immediately - the HTTP request will be dropped and cancelled
+                self.logger.log(&format!("🚫 [{}] HTTP request to LM Studio was cancelled by client disconnection", self.request_id));
                 Err(ProxyError::request_cancelled())
             }
         }
@@ -67,11 +67,7 @@ impl CancellableRequest {
 }
 
 /// Generic helper for handling cancellable JSON responses
-pub async fn handle_cancellable_json_response(
-    response: reqwest::Response,
-    cancellation_token: CancellationToken,
-) -> Result<Value, ProxyError> {
-    // Check if cancelled before processing response
+pub async fn handle_json_response(response: reqwest::Response, cancellation_token: CancellationToken) -> Result<Value, ProxyError> {
     if cancellation_token.is_cancelled() {
         return Err(ProxyError::request_cancelled());
     }
@@ -89,11 +85,7 @@ pub async fn handle_cancellable_json_response(
 }
 
 /// Generic helper for handling cancellable text responses
-pub async fn handle_cancellable_text_response(
-    response: reqwest::Response,
-    cancellation_token: CancellationToken,
-) -> Result<String, ProxyError> {
-    // Check if cancelled before processing response
+pub async fn handle_text_response(response: reqwest::Response, cancellation_token: CancellationToken) -> Result<String, ProxyError> {
     if cancellation_token.is_cancelled() {
         return Err(ProxyError::request_cancelled());
     }

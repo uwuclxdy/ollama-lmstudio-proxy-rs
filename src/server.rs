@@ -27,6 +27,12 @@ pub struct Config {
 
     #[arg(long, default_value = "5")]
     pub load_timeout_seconds: u64,
+
+    #[arg(long, default_value = "300", help = "HTTP request timeout in seconds")]
+    pub request_timeout_seconds: u64,
+
+    #[arg(long, default_value = "60", help = "Streaming chunk timeout in seconds")]
+    pub stream_timeout_seconds: u64,
 }
 
 #[derive(Clone)]
@@ -118,6 +124,8 @@ impl ProxyServer {
             println!("🎯 LM Studio URL:     {}", self.config.lmstudio_url);
             println!("📝 Logging:           {}", if self.logger.enabled { "✅ Enabled" } else { "❌ Disabled" });
             println!("⏱️  Load Timeout:     {}s", self.config.load_timeout_seconds);
+            println!("🌐 Request Timeout:   {}s", self.config.request_timeout_seconds);
+            println!("🌊 Stream Timeout:    {}s", self.config.stream_timeout_seconds);
             println!("🚫 Cancellation:     ✅ Enabled (client disconnect detection)");
             println!();
             println!("🔌 Supported Endpoints:");
@@ -144,13 +152,13 @@ impl ConnectionTracker {
     }
 
     fn mark_completed(&self) {
-        self.completed.store(true, Ordering::Relaxed);
+        self.completed.store(true, Ordering::SeqCst);
     }
 }
 
 impl Drop for ConnectionTracker {
     fn drop(&mut self) {
-        if !self.completed.load(Ordering::Relaxed) {
+        if !self.completed.load(Ordering::SeqCst) {
             self.token.cancel();
             if std::env::var("RUST_LOG").is_ok() {
                 eprintln!("🚫 Client disconnected - cancelling LM Studio request");

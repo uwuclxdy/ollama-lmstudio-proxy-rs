@@ -6,7 +6,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments
     let config = Config::parse();
 
-    // Create and run the proxy server
+    // Run the proxy server
     let server = ProxyServer::new(config);
     server.run().await?;
 

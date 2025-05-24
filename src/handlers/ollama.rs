@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::server::ProxyServer;
 use crate::utils::{clean_model_name, format_duration, ProxyError};
-use crate::common::{CancellableRequest, handle_cancellable_json_response};
+use crate::common::{CancellableRequest, handle_json_response};
 use super::retry::with_retry_and_cancellation;
 use super::streaming::{is_streaming_request, handle_streaming_response};
 use super::helpers::{
@@ -30,21 +30,39 @@ pub async fn handle_ollama_tags(
             let server = server.clone();
             let cancellation_token = cancellation_token.clone();
             async move {
-                let request = CancellableRequest::new(server.client.clone(), cancellation_token.clone());
+                let request = CancellableRequest::new(
+                    server.client.clone(),
+                    cancellation_token.clone(),
+                    server.logger.clone(),
+                    server.config.request_timeout_seconds
+                );
                 let url = format!("{}/v1/models", server.config.lmstudio_url);
                 server.logger.log(&format!("Calling LM Studio: GET {}", url));
 
                 let response = request.make_request(reqwest::Method::GET, &url, None).await?;
 
+                // Handle different error types properly instead of always returning empty list
                 if !response.status().is_success() {
-                    server.logger.log(&format!("LM Studio not available ({}), returning empty model list", response.status()));
-                    let empty_response = json!({
-                        "models": []
-                    });
-                    return Ok(empty_response);
+                    let status = response.status();
+                    if status.as_u16() == 404 || status.as_u16() == 503 {
+                        // Service unavailable or not found - return empty list (LM Studio might be starting up)
+                        server.logger.log(&format!("LM Studio not available ({}), returning empty model list", status));
+                        let empty_response = json!({
+                            "models": []
+                        });
+                        return Ok(empty_response);
+                    } else {
+                        // Other errors - return proper error response
+                        let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+                        server.logger.log(&format!("LM Studio error ({}): {}", status, error_text));
+                        return Err(ProxyError::new(
+                            format!("LM Studio error: {}", error_text),
+                            status.as_u16()
+                        ));
+                    }
                 }
 
-                let lm_response = handle_cancellable_json_response(response, cancellation_token).await?;
+                let lm_response = handle_json_response(response, cancellation_token).await?;
 
                 // Transform LM Studio format to Ollama format with ALL required fields
                 let models = if let Some(data) = lm_response.get("data").and_then(|d| d.as_array()) {
@@ -86,20 +104,7 @@ pub async fn handle_ollama_tags(
         }
     };
 
-    let result = match with_retry_and_cancellation(&server, operation, cancellation_token).await {
-        Ok(result) => result,
-        Err(e) if e.is_cancelled() => {
-            server.logger.log("Tags request was cancelled");
-            return Err(ProxyError::request_cancelled());
-        }
-        Err(e) => {
-            server.logger.log(&format!("Error in handle_ollama_tags: {}", e.message));
-            json!({
-                "models": []
-            })
-        }
-    };
-
+    let result = with_retry_and_cancellation(&server, operation, cancellation_token).await?;
     let duration = start_time.elapsed();
     server.logger.log(&format!("Ollama tags response completed (took {})", format_duration(duration)));
     Ok(json_response(&result))
@@ -140,7 +145,12 @@ pub async fn handle_ollama_chat(
                     "max_tokens": body.get("options").and_then(|o| o.get("num_predict")).unwrap_or(&json!(2048))
                 });
 
-                let request = CancellableRequest::new(server.client.clone(), cancellation_token.clone());
+                let request = CancellableRequest::new(
+                    server.client.clone(),
+                    cancellation_token.clone(),
+                    server.logger.clone(),
+                    server.config.request_timeout_seconds
+                );
                 let url = format!("{}/v1/chat/completions", server.config.lmstudio_url);
                 server.logger.log(&format!("Calling LM Studio: POST {} (stream: {})", url, stream));
 
@@ -157,10 +167,18 @@ pub async fn handle_ollama_chat(
 
                 if stream {
                     // Handle streaming response with cancellation
-                    handle_streaming_response(response, true, model, start_time, cancellation_token.clone()).await
+                    handle_streaming_response(
+                        response,
+                        true,
+                        model,
+                        start_time,
+                        cancellation_token.clone(),
+                        server.logger.clone(),
+                        server.config.stream_timeout_seconds
+                    ).await
                 } else {
                     // Handle non-streaming response
-                    let lm_response = handle_cancellable_json_response(response, cancellation_token).await?;
+                    let lm_response = handle_json_response(response, cancellation_token).await?;
                     let ollama_response = transform_chat_response(&lm_response, model, messages, start_time);
                     Ok(json_response(&ollama_response))
                 }
@@ -206,10 +224,15 @@ pub async fn handle_ollama_generate(
                     "prompt": prompt,
                     "stream": stream,
                     "temperature": body.get("options").and_then(|o| o.get("temperature")).unwrap_or(&json!(0.7)),
-                    "max_tokens": body.get("options").and_then(|o| o.get("num_predict")).unwrap_or(&json!(2048))
+                    "max_tokens": body.get("options").and_then(|o| o.get("num_predict")).unwrap_or(&json!(4096))
                 });
 
-                let request = CancellableRequest::new(server.client.clone(), cancellation_token.clone());
+                let request = CancellableRequest::new(
+                    server.client.clone(),
+                    cancellation_token.clone(),
+                    server.logger.clone(),
+                    server.config.request_timeout_seconds
+                );
                 let url = format!("{}/v1/completions", server.config.lmstudio_url);
                 server.logger.log(&format!("Calling LM Studio: POST {} (stream: {})", url, stream));
 
@@ -225,9 +248,17 @@ pub async fn handle_ollama_generate(
                 }
 
                 if stream {
-                    handle_streaming_response(response, false, model, start_time, cancellation_token.clone()).await
+                    handle_streaming_response(
+                        response,
+                        false,
+                        model,
+                        start_time,
+                        cancellation_token.clone(),
+                        server.logger.clone(),
+                        server.config.stream_timeout_seconds
+                    ).await
                 } else {
-                    let lm_response = handle_cancellable_json_response(response, cancellation_token).await?;
+                    let lm_response = handle_json_response(response, cancellation_token).await?;
                     let ollama_response = transform_generate_response(&lm_response, model, prompt, start_time);
                     Ok(json_response(&ollama_response))
                 }
@@ -271,7 +302,12 @@ pub async fn handle_ollama_embeddings(
                     "input": input
                 });
 
-                let request = CancellableRequest::new(server.client.clone(), cancellation_token.clone());
+                let request = CancellableRequest::new(
+                    server.client.clone(),
+                    cancellation_token.clone(),
+                    server.logger.clone(),
+                    server.config.request_timeout_seconds
+                );
                 let url = format!("{}/v1/embeddings", server.config.lmstudio_url);
                 server.logger.log(&format!("Calling LM Studio: POST {}", url));
 
@@ -286,7 +322,7 @@ pub async fn handle_ollama_embeddings(
                     return Err(ProxyError::internal_server_error(&format!("LM Studio error: {}", error_text)));
                 }
 
-                let lm_response = handle_cancellable_json_response(response, cancellation_token).await?;
+                let lm_response = handle_json_response(response, cancellation_token).await?;
                 let ollama_response = transform_embeddings_response(&lm_response, model, start_time);
                 Ok(ollama_response)
             }
@@ -341,6 +377,15 @@ pub async fn handle_ollama_show(body: Value) -> Result<warp::reply::Response, Pr
         _ => ("llama", "7B"),
     };
 
+    let size_in_bytes = if let Some(num_str) = parameter_size.trim_end_matches(&['B', 'b']).parse::<f64>().ok() {
+        let billions = num_str;
+        let approx_bytes = billions * 600_000_000.0;
+        approx_bytes as u64
+    } else {
+        // Fallback
+        4_000_000_000u64
+    };
+
     let response = json!({
         "modelfile": format!("# Modelfile for {}\nFROM {}\nPARAMETER temperature 0.7\nPARAMETER top_p 0.9\nPARAMETER top_k 40", model, model),
         "parameters": "temperature 0.7\ntop_p 0.9\ntop_k 40\nrepeat_penalty 1.1",
@@ -356,9 +401,7 @@ pub async fn handle_ollama_show(body: Value) -> Result<warp::reply::Response, Pr
         "model_info": {
             "general.architecture": architecture,
             "general.name": cleaned_model,
-            "general.parameter_count": match parameter_size {
-                _ => 7000000000u64,
-            },
+            "general.parameter_count": size_in_bytes,
             "general.quantization_version": 2,
             "general.file_type": 2,
             "tokenizer.model": "llama",
@@ -368,20 +411,7 @@ pub async fn handle_ollama_show(body: Value) -> Result<warp::reply::Response, Pr
         "system": format!("You are a helpful AI assistant using the {} model.", model),
         "license": "Custom license for proxy model",
         "digest": format!("{:x}", md5::compute(model.as_bytes())),
-        "size": match parameter_size {
-            "1.5B" => 1000000000u64,
-            "2B" => 1500000000u64,
-            "7B" => 4000000000u64,
-            "8B" => 5000000000u64,
-            "9B" => 5500000000u64,
-            "13B" => 8000000000u64,
-            "14B" => 8500000000u64,
-            "27B" => 16000000000u64,
-            "30B" => 18000000000u64,
-            "32B" => 20000000000u64,
-            "70B" => 40000000000u64,
-            _ => 4000000000u64,
-        },
+        "size": size_in_bytes,
         "modified_at": chrono::Utc::now().to_rfc3339()
     });
 
@@ -391,8 +421,8 @@ pub async fn handle_ollama_show(body: Value) -> Result<warp::reply::Response, Pr
 /// Handle GET /api/version - return version info
 pub async fn handle_ollama_version() -> Result<warp::reply::Response, ProxyError> {
     let response = json!({
-        "version": "0.5.1-proxy-cancellable"
-    });
+            "version": crate::VERSION,
+        });
     Ok(json_response(&response))
 }
 

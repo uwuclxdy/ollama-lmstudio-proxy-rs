@@ -2,39 +2,43 @@
 
 use futures_util::StreamExt;
 use serde_json::{json, Value};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
-use crate::utils::ProxyError;
+use crate::utils::{ProxyError, Logger};
 use super::helpers::{
     extract_content_from_chunk, create_error_chunk, create_cancellation_chunk,
     create_final_chunk
 };
 
-/// Check if request has streaming enabled
+/// Check if streaming is enabled
 pub fn is_streaming_request(body: &Value) -> bool {
     body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false)
 }
 
-/// Handle streaming responses from LM Studio with proper cancellation support
+/// Handle streaming responses from LM Studio with cancellation support and timeouts
 pub async fn handle_streaming_response(
     response: reqwest::Response,
     is_chat: bool,
     model: &str,
     start_time: Instant,
     cancellation_token: CancellationToken,
+    logger: Logger,
+    stream_timeout_seconds: u64,
 ) -> Result<warp::reply::Response, ProxyError> {
     let model = model.to_string();
     let (tx, rx) = mpsc::unbounded_channel::<Result<bytes::Bytes, std::io::Error>>();
 
-    // Spawn task to process the stream with cancellation support
+    // Spawn task to process the stream
     let model_clone = model.clone();
     let token_clone = cancellation_token.clone();
+    let logger_clone = logger.clone();
     let stream_id = format!("stream_{}", chrono::Utc::now().timestamp_millis());
 
     tokio::spawn(async move {
-        log::info!("🌊 [{}] Starting stream processing for model: {}", stream_id, model_clone);
+        logger_clone.log(&format!("🌊 [{}] Starting stream processing for model: {}", stream_id, model_clone));
 
         let mut stream = response.bytes_stream();
         let mut buffer = String::new();
@@ -43,10 +47,11 @@ pub async fn handle_streaming_response(
 
         loop {
             tokio::select! {
-                // Handle incoming chunks from LM Studio
-                chunk_result = stream.next() => {
+                // Handle incoming chunks with timeout
+                chunk_result = timeout(Duration::from_secs(stream_timeout_seconds), stream.next()) => {
                     match chunk_result {
-                        Some(Ok(chunk)) => {
+                        // Chunk received within timeout
+                        Ok(Some(Ok(chunk))) => {
                             if let Ok(chunk_str) = std::str::from_utf8(&chunk) {
                                 buffer.push_str(chunk_str);
 
@@ -71,39 +76,46 @@ pub async fn handle_streaming_response(
                                         let chunk_with_newline = format!("{}\n", chunk_json);
 
                                         if tx.send(Ok(bytes::Bytes::from(chunk_with_newline))).is_err() {
-                                            // Client disconnected, stop processing
-                                            log::warn!("🚫 [{}] Client disconnected during streaming after {} chunks", stream_id, chunk_count);
+                                            // Client disconnected
+                                            logger_clone.log(&format!("🚫 [{}] Client disconnected during streaming after {} chunks", stream_id, chunk_count));
                                             return;
                                         }
                                     }
                                 }
                             }
                         }
-                        Some(Err(e)) => {
-                            // Network error during streaming - send error chunk and stop
-                            log::error!("❌ [{}] Streaming error: {}", stream_id, e);
+                        // Network error
+                        Ok(Some(Err(e))) => {
+                            logger_clone.log(&format!("❌ [{}] Streaming error: {}", stream_id, e));
                             let error_chunk = create_error_chunk(&model_clone, &format!("Streaming error: {}", e), is_chat);
-                            send_chunk_and_exit(&tx, error_chunk).await;
+                            send_chunk_and_close(&tx, error_chunk).await;
                             return;
                         }
-                        None => {
-                            // Stream ended naturally - send final chunk
-                            log::info!("✅ [{}] Stream ended naturally after {} chunks", stream_id, chunk_count);
+                        // Stream ended naturally
+                        Ok(None) => {
+                            logger_clone.log(&format!("✅ [{}] Stream ended naturally after {} chunks", stream_id, chunk_count));
                             break;
+                        }
+                        // Timeout
+                        Err(_timeout_err) => {
+                            logger_clone.log(&format!("⏰ [{}] Stream timeout after {}s - no data received", stream_id, stream_timeout_seconds));
+                            let error_chunk = create_error_chunk(&model_clone, &format!("Stream timeout after {}s", stream_timeout_seconds), is_chat);
+                            send_chunk_and_close(&tx, error_chunk).await;
+                            return;
                         }
                     }
                 }
-                // Handle cancellation gracefully - THIS IS THE KEY PART!
+                // Handle cancellation gracefully
                 _ = token_clone.cancelled() => {
-                    log::warn!("🚫 [{}] Stream cancelled by client disconnection after {} chunks with content: '{}'",
+                    logger_clone.log(&format!("🚫 [{}] Stream cancelled by client disconnection after {} chunks with content: '{}'",
                              stream_id, chunk_count,
                              if partial_content.len() > 50 {
                                  format!("{}...", &partial_content[..50])
                              } else {
                                  partial_content.clone()
-                             });
+                             }));
 
-                    // Send a graceful cancellation response
+                    // Send a cancellation response
                     let cancellation_chunk = create_cancellation_chunk(
                         &model_clone,
                         &partial_content,
@@ -111,12 +123,26 @@ pub async fn handle_streaming_response(
                         chunk_count,
                         is_chat,
                     );
-                    send_chunk_and_exit(&tx, cancellation_chunk).await;
+                    send_chunk_and_close(&tx, cancellation_chunk).await;
 
                     // Important: Return immediately to drop the stream and cancel the LM Studio request
                     return;
                 }
             }
+        }
+
+        // Add cancellation check before processing remaining buffer
+        if cancellation_token.is_cancelled() {
+            logger_clone.log(&format!("🚫 [{}] Cancelled before processing remaining buffer", stream_id));
+            let cancellation_chunk = create_cancellation_chunk(
+                &model_clone,
+                &partial_content,
+                start_time.elapsed(),
+                chunk_count,
+                is_chat,
+            );
+            send_chunk_and_close(&tx, cancellation_chunk).await;
+            return;
         }
 
         // Process any remaining buffer content
@@ -133,14 +159,12 @@ pub async fn handle_streaming_response(
             }
         }
 
-        // Add final completion chunk with statistics
         let final_chunk = create_final_chunk(&model_clone, start_time.elapsed(), chunk_count, is_chat);
-        send_chunk_and_exit(&tx, final_chunk).await;
+        send_chunk_and_close(&tx, final_chunk).await;
 
-        log::info!("🏁 [{}] Stream processing completed successfully", stream_id);
+        logger_clone.log(&format!("🏁 [{}] Stream processing completed successfully", stream_id));
     });
 
-    // Create stream from receiver
     let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
 
     // Create streaming response with proper headers for Ollama compatibility
@@ -158,45 +182,52 @@ pub async fn handle_streaming_response(
     Ok(response)
 }
 
-/// Handle direct streaming passthrough from LM Studio with cancellation support
+/// Handle direct streaming passthrough from LM Studio with cancellation support and timeouts
 pub async fn handle_passthrough_streaming_response(
     response: reqwest::Response,
     cancellation_token: CancellationToken,
+    logger: Logger,
+    stream_timeout_seconds: u64,
 ) -> Result<warp::reply::Response, ProxyError> {
     let (tx, rx) = mpsc::unbounded_channel::<Result<bytes::Bytes, std::io::Error>>();
 
     // Spawn task to forward the stream with cancellation and error handling
+    let logger_clone = logger.clone();
     tokio::spawn(async move {
         let mut stream = response.bytes_stream();
 
         loop {
             tokio::select! {
-                // Forward chunks from LM Studio
-                chunk_result = stream.next() => {
+                chunk_result = timeout(Duration::from_secs(stream_timeout_seconds), stream.next()) => {
                     match chunk_result {
-                        Some(Ok(chunk)) => {
+                        // Chunk received within timeout
+                        Ok(Some(Ok(chunk))) => {
                             if tx.send(Ok(chunk)).is_err() {
-                                // Client disconnected, stop forwarding
-                                log::info!("Client disconnected during passthrough streaming");
+                                logger_clone.log("Client disconnected during passthrough streaming");
                                 return;
                             }
                         }
-                        Some(Err(e)) => {
-                            // Send error as SSE data and stop
+                        // Network error
+                        Ok(Some(Err(e))) => {
                             let error_data = format!("data: {{\"error\": \"Streaming error: {}\"}}\n\n", e);
                             let _ = tx.send(Ok(bytes::Bytes::from(error_data)));
                             return;
                         }
-                        None => {
-                            // Stream ended naturally
+                        // Stream ended naturally
+                        Ok(None) => {
                             break;
+                        }
+                        Err(_timeout_err) => {
+                            logger_clone.log(&format!("Passthrough stream timeout after {}s", stream_timeout_seconds));
+                            let timeout_data = format!("data: {{\"error\": \"Stream timeout after {}s\"}}\n\n", stream_timeout_seconds);
+                            let _ = tx.send(Ok(bytes::Bytes::from(timeout_data)));
+                            return;
                         }
                     }
                 }
                 // Handle cancellation
                 _ = cancellation_token.cancelled() => {
-                    log::info!("Passthrough stream cancelled by client disconnection");
-                    // Send cancellation message and stop
+                    logger_clone.log("Passthrough stream cancelled by client disconnection");
                     let cancel_data = "data: {\"cancelled\": true, \"message\": \"Request cancelled by client\"}\n\n";
                     let _ = tx.send(Ok(bytes::Bytes::from(cancel_data)));
                     return;
@@ -223,8 +254,8 @@ pub async fn handle_passthrough_streaming_response(
     Ok(response)
 }
 
-/// Helper function to send a chunk and close the channel
-async fn send_chunk_and_exit(
+/// This function sends a final chunk and closes the channel, terminating the stream
+async fn send_chunk_and_close(
     tx: &mpsc::UnboundedSender<Result<bytes::Bytes, std::io::Error>>,
     chunk: Value,
 ) {

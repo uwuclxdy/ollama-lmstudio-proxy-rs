@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::server::ProxyServer;
 use crate::utils::{format_duration, ProxyError};
-use crate::common::{CancellableRequest, handle_cancellable_json_response};
+use crate::common::{CancellableRequest, handle_json_response};
 use super::retry::with_retry_and_cancellation;
 use super::streaming::{is_streaming_request, handle_passthrough_streaming_response};
 use super::helpers::json_response;
@@ -48,7 +48,13 @@ pub async fn handle_lmstudio_passthrough(
                     _ => return Err(ProxyError::bad_request(&format!("Unsupported method: {}", method))),
                 };
 
-                let request = CancellableRequest::new(server.client.clone(), cancellation_token.clone());
+                // Updated CancellableRequest constructor call with logger and timeout
+                let request = CancellableRequest::new(
+                    server.client.clone(),
+                    cancellation_token.clone(),
+                    server.logger.clone(),
+                    server.config.request_timeout_seconds
+                );
 
                 let request_body = if method == "GET" || method == "DELETE" {
                     None
@@ -66,11 +72,14 @@ pub async fn handle_lmstudio_passthrough(
                 }
 
                 if is_streaming {
-                    // For streaming requests, pass through the response directly with cancellation support
-                    handle_passthrough_streaming_response(response, cancellation_token.clone()).await
+                    handle_passthrough_streaming_response(
+                        response,
+                        cancellation_token.clone(),
+                        server.logger.clone(),
+                        server.config.stream_timeout_seconds
+                    ).await
                 } else {
-                    // Handle regular JSON response with cancellation support
-                    let json_data = handle_cancellable_json_response(response, cancellation_token).await?;
+                    let json_data = handle_json_response(response, cancellation_token).await?;
                     Ok(json_response(&json_data))
                 }
             }

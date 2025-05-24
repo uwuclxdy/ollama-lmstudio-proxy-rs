@@ -9,6 +9,7 @@ use crate::server::ProxyServer;
 use crate::utils::{is_no_models_loaded_error, ProxyError};
 
 /// Auto-retry infrastructure: trigger model loading by calling /v1/models with cancellation support
+/// todo: fix this
 pub async fn trigger_model_loading(
     server: &ProxyServer,
     cancellation_token: CancellationToken,

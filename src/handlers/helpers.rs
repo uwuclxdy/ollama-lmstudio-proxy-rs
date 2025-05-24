@@ -30,11 +30,36 @@ pub fn determine_model_family(model_name: &str) -> (&'static str, Vec<&'static s
     }
 }
 
+/// Parameter size detection lookup table
+/// todo: replace with a more efficient lookup mechanism
+pub const PARAMETER_SIZES: &[(&str, &str)] = &[
+    ("0.5b", "0.5B"),
+    ("1.5b", "1.5B"),
+    ("2b", "2B"),
+    ("3b", "3B"),
+    ("7b", "7B"),
+    ("8b", "8B"),
+    ("9b", "9B"),
+    ("13b", "13B"),
+    ("14b", "14B"),
+    ("27b", "27B"),
+    ("30b", "30B"),
+    ("32b", "32B"),
+    ("70b", "70B"),
+];
+
 /// Determine parameter size based on model name
 pub fn determine_parameter_size(model_name: &str) -> &'static str {
     let lower_name = model_name.to_lowercase();
 
-    if lower_name.contains("0.5b") { "0.5B" } else if lower_name.contains("1.5b") { "1.5B" } else if lower_name.contains("2b") { "2B" } else if lower_name.contains("3b") { "3B" } else if lower_name.contains("7b") { "7B" } else if lower_name.contains("8b") { "8B" } else if lower_name.contains("9b") { "9B" } else if lower_name.contains("13b") { "13B" } else if lower_name.contains("14b") { "14B" } else if lower_name.contains("27b") { "27B" } else if lower_name.contains("30b") { "30B" } else if lower_name.contains("32b") { "32B" } else if lower_name.contains("70b") { "70B" } else { "7B" }
+    // Use lookup table instead of long if-else chain
+    for (pattern, size) in PARAMETER_SIZES {
+        if lower_name.contains(pattern) {
+            return size;
+        }
+    }
+
+    "7B" // Fallback
 }
 
 /// Estimate model size in bytes based on parameter size
@@ -78,7 +103,6 @@ pub fn determine_model_capabilities(model_name: &str) -> Vec<&'static str> {
 }
 
 // ===== CHUNK CREATION UTILITIES =====
-// Consolidated from streaming.rs and cancellation.rs
 
 /// Extract content from a chunk for tracking partial responses
 pub fn extract_content_from_chunk(chunk: &Value) -> Option<String> {
@@ -122,18 +146,12 @@ pub fn create_error_chunk(model: &str, error_message: &str, is_chat: bool) -> Va
     }
 }
 
-/// Create a cancellation chunk with partial response info
-pub fn create_cancellation_chunk(
-    model: &str,
-    partial_content: &str,
-    duration: Duration,
-    tokens_generated: u64,
-    is_chat: bool,
-) -> Value {
+/// Create a clearer cancellation chunk that indicates cancellation, not generated content
+pub fn create_cancellation_chunk(model: &str, partial_content: &str, duration: Duration, tokens_generated: u64, is_chat: bool) -> Value {
     let cancellation_message = if partial_content.is_empty() {
-        "🚫 Request cancelled before content generation started".to_string()
+        "🚫 Request cancelled - no content was generated due to client disconnection".to_string()
     } else {
-        format!("🚫 Request cancelled after generating {} tokens", tokens_generated)
+        format!("🚫 Request cancelled - {} tokens were generated before client disconnection. This is a cancellation notice, not generated content.", tokens_generated)
     };
 
     if is_chat {
@@ -141,7 +159,7 @@ pub fn create_cancellation_chunk(
             "model": model,
             "created_at": chrono::Utc::now().to_rfc3339(),
             "message": {
-                "role": "assistant",
+                "role": "system",
                 "content": cancellation_message
             },
             "done": true,
@@ -174,12 +192,7 @@ pub fn create_cancellation_chunk(
 }
 
 /// Create final completion chunk for streaming responses
-pub fn create_final_chunk(
-    model: &str,
-    duration: Duration,
-    chunk_count: u64,
-    is_chat: bool,
-) -> Value {
+pub fn create_final_chunk(model: &str, duration: Duration, chunk_count: u64, is_chat: bool) -> Value {
     if is_chat {
         json!({
             "model": model,
@@ -216,12 +229,7 @@ pub fn create_final_chunk(
 // ===== RESPONSE TRANSFORMATION UTILITIES =====
 
 /// Transform LM Studio chat response to Ollama format
-pub fn transform_chat_response(
-    lm_response: &Value,
-    model: &str,
-    messages: &[Value],
-    start_time: Instant,
-) -> Value {
+pub fn transform_chat_response(lm_response: &Value, model: &str, messages: &[Value], start_time: Instant) -> Value {
     let content = if let Some(choices) = lm_response.get("choices").and_then(|c| c.as_array()) {
         if let Some(first_choice) = choices.first() {
             let mut content = first_choice.get("message")
@@ -231,6 +239,7 @@ pub fn transform_chat_response(
                 .to_string();
 
             // Merge reasoning_content if present
+            // todo: workaround until ollama supports reasoning_content
             if let Some(reasoning) = first_choice.get("message")
                 .and_then(|m| m.get("reasoning_content"))
                 .and_then(|r| r.as_str()) {
@@ -268,12 +277,7 @@ pub fn transform_chat_response(
 }
 
 /// Transform LM Studio completion response to Ollama format
-pub fn transform_generate_response(
-    lm_response: &Value,
-    model: &str,
-    prompt: &str,
-    start_time: Instant,
-) -> Value {
+pub fn transform_generate_response(lm_response: &Value, model: &str, prompt: &str, start_time: Instant) -> Value {
     let response_text = if let Some(choices) = lm_response.get("choices").and_then(|c| c.as_array()) {
         choices.first()
             .and_then(|choice| choice.get("text"))
@@ -304,11 +308,7 @@ pub fn transform_generate_response(
 }
 
 /// Transform LM Studio embeddings response to Ollama format
-pub fn transform_embeddings_response(
-    lm_response: &Value,
-    model: &str,
-    start_time: Instant,
-) -> Value {
+pub fn transform_embeddings_response(lm_response: &Value, model: &str, start_time: Instant) -> Value {
     let embeddings = if let Some(data) = lm_response.get("data").and_then(|d| d.as_array()) {
         data.iter()
             .filter_map(|item| item.get("embedding"))

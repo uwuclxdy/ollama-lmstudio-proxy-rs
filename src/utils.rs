@@ -91,19 +91,19 @@ impl Error for ProxyError {}
 
 impl Reject for ProxyError {}
 
-/// Logger utility for the proxy server
+/// Logger utility
 #[derive(Debug, Clone)]
 pub struct Logger {
     pub enabled: bool,
 }
 
 impl Logger {
-    /// Create a new Logger instance
+    /// Create new Logger instance
     pub fn new(enabled: bool) -> Self {
         Self { enabled }
     }
 
-    /// Log a message with [PROXY] prefix if logging is enabled
+    /// Log messages
     pub fn log(&self, message: &str) {
         if self.enabled {
             println!("[PROXY] {}", message);
@@ -118,37 +118,23 @@ impl Logger {
 /// - Removes pure numeric suffixes (e.g., `:2`, `:123`) but only if there's content before the colon
 /// - Preserves non-numeric suffixes (e.g., `:custom`, `:alpha`, `:v1.2`)
 /// - Handles multiple colons correctly - only processes the last segment for numeric removal
-///
-/// Examples:
-/// - "deepseek-r1-distill-qwen-14b:2" → "deepseek-r1-distill-qwen-14b"
-/// - "llama3.2:latest" → "llama3.2"
-/// - "model-name:3" → "model-name"
-/// - "namespace:model:tag:version" → "namespace:model:tag:version" (non-numeric preserved)
-/// - "namespace:model:tag:2" → "namespace:model:tag" (only last numeric removed)
-/// - ":123" → ":123" (preserved when no model name before colon)
-/// - "model:custom" → "model:custom" (non-numeric suffix preserved)
 pub fn clean_model_name(name: &str) -> String {
     if name.is_empty() {
         return name.to_string();
     }
 
-    // First remove :latest suffix if present
     let after_latest = if name.ends_with(":latest") {
-        &name[..name.len() - 7]  // ":latest" is 7 characters, not 8
+        &name[..name.len() - 7]
     } else {
         name
     };
 
-    // Then check if we should remove a numeric suffix
     if let Some(colon_pos) = after_latest.rfind(':') {
         let suffix = &after_latest[colon_pos + 1..];
 
-        // Only remove suffix if:
-        // 1. It's purely numeric (not empty, all digits)
-        // 2. There's actually content before the colon (not just removing everything)
         if !suffix.is_empty()
             && suffix.chars().all(|c| c.is_ascii_digit())
-            && colon_pos > 0 {  // Don't remove if it would result in empty string
+            && colon_pos > 0 {
             return after_latest[..colon_pos].to_string();
         }
     }
@@ -157,7 +143,6 @@ pub fn clean_model_name(name: &str) -> String {
 }
 
 /// Check if an error message indicates that no models are loaded
-/// This is used to detect when LM Studio needs to have a model loaded
 pub fn is_no_models_loaded_error(message: &str) -> bool {
     let lower_msg = message.to_lowercase();
     lower_msg.contains("no model")
@@ -168,11 +153,7 @@ pub fn is_no_models_loaded_error(message: &str) -> bool {
         || lower_msg.contains("model is not loaded")
 }
 
-/// Format a duration into a human-readable string
-/// Examples:
-/// - 1500ms → "1.50s"
-/// - 500ms → "500ms"
-/// - 2500ms → "2.50s"
+/// Format a duration into human-readable string
 pub fn format_duration(duration: std::time::Duration) -> String {
     let total_ms = duration.as_millis();
 
@@ -185,11 +166,6 @@ pub fn format_duration(duration: std::time::Duration) -> String {
 }
 
 /// Validate model name and return warnings for potentially malformed names
-///
-/// This function checks for common issues in model names that might indicate
-/// user error or unexpected input patterns.
-///
-/// Returns (is_valid, warning_message)
 pub fn validate_model_name(name: &str) -> (bool, Option<String>) {
     if name.is_empty() {
         return (false, Some("Model name cannot be empty".to_string()));
@@ -198,12 +174,10 @@ pub fn validate_model_name(name: &str) -> (bool, Option<String>) {
     // Check for suspicious patterns
     let mut warnings = Vec::new();
 
-    // Check for multiple consecutive colons
     if name.contains("::") {
         warnings.push("Multiple consecutive colons detected".to_string());
     }
 
-    // Check for colons at start/end (might be intentional but often indicates error)
     if name.starts_with(':') && name.len() > 1 {
         warnings.push("Model name starts with colon".to_string());
     }
@@ -212,22 +186,18 @@ pub fn validate_model_name(name: &str) -> (bool, Option<String>) {
         warnings.push("Model name ends with colon".to_string());
     }
 
-    // Check for extremely long names (might indicate pasted content)
     if name.len() > 200 {
         warnings.push("Model name is unusually long".to_string());
     }
 
-    // Check for whitespace (spaces/tabs) which are often copy-paste errors
     if name.contains(char::is_whitespace) {
         warnings.push("Model name contains whitespace characters".to_string());
     }
 
-    // Check for unusual characters that might indicate encoding issues
     if name.chars().any(|c| c.is_control() && c != '\t' && c != '\n' && c != '\r') {
         warnings.push("Model name contains control characters".to_string());
     }
 
-    // Too many colons might indicate confusion about format
     let colon_count = name.matches(':').count();
     if colon_count > 4 {
         warnings.push(format!("Model name has {} colons, which seems excessive", colon_count));
