@@ -173,16 +173,16 @@ async fn handle_request_with_cancellation(
 
     let result = match (method.as_str(), path.as_str()) {
         ("GET", "/api/tags") => {
-            handlers::handle_ollama_tags_with_cancellation(server.clone(), cancellation_token).await
+            handlers::handle_ollama_tags(server.clone(), cancellation_token).await
         },
         ("POST", "/api/chat") => {
-            handlers::handle_ollama_chat_with_cancellation(server.clone(), body.clone(), cancellation_token).await
+            handlers::handle_ollama_chat(server.clone(), body.clone(), cancellation_token).await
         },
         ("POST", "/api/generate") => {
-            handlers::handle_ollama_generate_with_cancellation(server.clone(), body.clone(), cancellation_token).await
+            handlers::handle_ollama_generate(server.clone(), body.clone(), cancellation_token).await
         },
         ("POST", "/api/embed") | ("POST", "/api/embeddings") => {
-            handlers::handle_ollama_embeddings_with_cancellation(server.clone(), body.clone(), cancellation_token).await
+            handlers::handle_ollama_embeddings(server.clone(), body.clone(), cancellation_token).await
         },
         ("POST", "/api/show") => handlers::handle_ollama_show(body).await,
         ("GET", "/api/ps") => handlers::handle_ollama_ps().await,
@@ -192,7 +192,7 @@ async fn handle_request_with_cancellation(
             handlers::handle_unsupported(&path).await,
         ("GET", "/v1/models") | ("POST", "/v1/chat/completions") |
         ("POST", "/v1/completions") | ("POST", "/v1/embeddings") => {
-            handlers::handle_lmstudio_passthrough_with_cancellation(server.clone(), &method, &path, body.clone(), cancellation_token).await
+            handlers::handle_lmstudio_passthrough(server.clone(), &method, &path, body.clone(), cancellation_token).await
         },
         _ => Err(ProxyError::not_found(&format!("Unknown endpoint: {} {}", method, path))),
     };

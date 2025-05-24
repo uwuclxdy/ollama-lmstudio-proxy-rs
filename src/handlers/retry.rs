@@ -1,3 +1,5 @@
+// src/handlers/retry.rs - Unified auto-retry infrastructure with cancellation support
+
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -7,7 +9,7 @@ use crate::server::ProxyServer;
 use crate::utils::{is_no_models_loaded_error, ProxyError};
 
 /// Auto-retry infrastructure: trigger model loading by calling /v1/models with cancellation support
-pub async fn trigger_model_loading_with_cancellation(
+pub async fn trigger_model_loading(
     server: &ProxyServer,
     cancellation_token: CancellationToken,
 ) -> Result<bool, ProxyError> {
@@ -44,7 +46,7 @@ pub async fn trigger_model_loading_with_cancellation(
 
 /// Generic retry wrapper with cancellation support
 pub async fn with_retry_and_cancellation<F, Fut, T>(
-    server: &ProxyServer,
+    server: &Arc<ProxyServer>,
     operation: F,
     cancellation_token: CancellationToken,
 ) -> Result<T, ProxyError>
@@ -73,7 +75,7 @@ where
                 }
 
                 // Trigger model loading with cancellation support
-                if trigger_model_loading_with_cancellation(server, cancellation_token.clone()).await.unwrap_or(false) {
+                if trigger_model_loading(server, cancellation_token.clone()).await.unwrap_or(false) {
                     server.logger.log("Waiting for model to load...");
 
                     // Wait for model loading with cancellation support
@@ -104,21 +106,4 @@ where
             Err(e)
         }
     }
-}
-
-// Backwards compatibility function without cancellation
-pub async fn trigger_model_loading(server: &ProxyServer) -> Result<bool, ProxyError> {
-    let token = CancellationToken::new(); // Never gets cancelled
-    trigger_model_loading_with_cancellation(server, token).await
-}
-
-// Backwards compatibility function without cancellation
-pub async fn with_retry<F, T, Fut>(server: &ProxyServer, operation: F) -> Result<T, ProxyError>
-where
-    F: Fn() -> Fut,
-    Fut: std::future::Future<Output=Result<T, ProxyError>>,
-{
-    let token = CancellationToken::new(); // Never gets cancelled
-    let server_arc = Arc::new(server.clone());
-    with_retry_and_cancellation(&server_arc, operation, token).await
 }

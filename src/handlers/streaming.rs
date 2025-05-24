@@ -1,3 +1,5 @@
+// src/handlers/streaming.rs - Unified streaming response handling
+
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::time::Instant;
@@ -5,6 +7,10 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::utils::ProxyError;
+use super::helpers::{
+    extract_content_from_chunk, create_error_chunk, create_cancellation_chunk,
+    create_final_chunk
+};
 
 /// Check if request has streaming enabled
 pub fn is_streaming_request(body: &Value) -> bool {
@@ -12,7 +18,7 @@ pub fn is_streaming_request(body: &Value) -> bool {
 }
 
 /// Handle streaming responses from LM Studio with proper cancellation support
-pub async fn handle_streaming_response_with_cancellation(
+pub async fn handle_streaming_response(
     response: reqwest::Response,
     is_chat: bool,
     model: &str,
@@ -153,7 +159,7 @@ pub async fn handle_streaming_response_with_cancellation(
 }
 
 /// Handle direct streaming passthrough from LM Studio with cancellation support
-pub async fn handle_passthrough_streaming_response_with_cancellation(
+pub async fn handle_passthrough_streaming_response(
     response: reqwest::Response,
     cancellation_token: CancellationToken,
 ) -> Result<warp::reply::Response, ProxyError> {
@@ -217,27 +223,6 @@ pub async fn handle_passthrough_streaming_response_with_cancellation(
     Ok(response)
 }
 
-/// Backwards compatibility: streaming without cancellation
-pub async fn handle_streaming_response(
-    response: reqwest::Response,
-    is_chat: bool,
-    model: &str,
-    start_time: Instant,
-) -> Result<warp::reply::Response, ProxyError> {
-    // Create a token that never gets cancelled for backwards compatibility
-    let token = CancellationToken::new();
-    handle_streaming_response_with_cancellation(response, is_chat, model, start_time, token).await
-}
-
-/// Backwards compatibility: passthrough streaming without cancellation
-pub async fn handle_passthrough_streaming_response(
-    response: reqwest::Response,
-) -> Result<warp::reply::Response, ProxyError> {
-    // Create a token that never gets cancelled for backwards compatibility
-    let token = CancellationToken::new();
-    handle_passthrough_streaming_response_with_cancellation(response, token).await
-}
-
 /// Helper function to send a chunk and close the channel
 async fn send_chunk_and_exit(
     tx: &mpsc::UnboundedSender<Result<bytes::Bytes, std::io::Error>>,
@@ -246,139 +231,6 @@ async fn send_chunk_and_exit(
     let chunk_json = serde_json::to_string(&chunk).unwrap_or_default();
     let chunk_with_newline = format!("{}\n", chunk_json);
     let _ = tx.send(Ok(bytes::Bytes::from(chunk_with_newline)));
-}
-
-/// Extract content from a chunk for tracking partial responses
-fn extract_content_from_chunk(chunk: &Value) -> Option<String> {
-    // For chat format
-    if let Some(content) = chunk.get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str()) {
-        return Some(content.to_string());
-    }
-
-    // For generate format
-    if let Some(content) = chunk.get("response")
-        .and_then(|r| r.as_str()) {
-        return Some(content.to_string());
-    }
-
-    None
-}
-
-/// Create an error chunk
-fn create_error_chunk(model: &str, error_message: &str, is_chat: bool) -> Value {
-    if is_chat {
-        json!({
-            "model": model,
-            "created_at": chrono::Utc::now().to_rfc3339(),
-            "message": {
-                "role": "assistant",
-                "content": ""
-            },
-            "done": true,
-            "error": error_message
-        })
-    } else {
-        json!({
-            "model": model,
-            "created_at": chrono::Utc::now().to_rfc3339(),
-            "response": "",
-            "done": true,
-            "error": error_message
-        })
-    }
-}
-
-/// Create a cancellation chunk with partial response info
-fn create_cancellation_chunk(
-    model: &str,
-    partial_content: &str,
-    duration: std::time::Duration,
-    tokens_generated: u64,
-    is_chat: bool,
-) -> Value {
-    let cancellation_message = if partial_content.is_empty() {
-        "🚫 Request cancelled before content generation started".to_string()
-    } else {
-        format!("🚫 Request cancelled after generating {} tokens", tokens_generated)
-    };
-
-    if is_chat {
-        json!({
-            "model": model,
-            "created_at": chrono::Utc::now().to_rfc3339(),
-            "message": {
-                "role": "assistant",
-                "content": cancellation_message
-            },
-            "done": true,
-            "total_duration": duration.as_nanos() as u64,
-            "load_duration": 1000000u64,
-            "prompt_eval_count": 10,
-            "prompt_eval_duration": duration.as_nanos() as u64 / 4,
-            "eval_count": tokens_generated,
-            "eval_duration": duration.as_nanos() as u64 / 2,
-            "cancelled": true,
-            "partial_response": !partial_content.is_empty()
-        })
-    } else {
-        json!({
-            "model": model,
-            "created_at": chrono::Utc::now().to_rfc3339(),
-            "response": cancellation_message,
-            "done": true,
-            "context": [1, 2, 3],
-            "total_duration": duration.as_nanos() as u64,
-            "load_duration": 1000000u64,
-            "prompt_eval_count": 10,
-            "prompt_eval_duration": duration.as_nanos() as u64 / 4,
-            "eval_count": tokens_generated,
-            "eval_duration": duration.as_nanos() as u64 / 2,
-            "cancelled": true,
-            "partial_response": !partial_content.is_empty()
-        })
-    }
-}
-
-/// Create final completion chunk
-fn create_final_chunk(
-    model: &str,
-    duration: std::time::Duration,
-    chunk_count: u64,
-    is_chat: bool,
-) -> Value {
-    if is_chat {
-        json!({
-            "model": model,
-            "created_at": chrono::Utc::now().to_rfc3339(),
-            "message": {
-                "role": "assistant",
-                "content": ""
-            },
-            "done": true,
-            "total_duration": duration.as_nanos() as u64,
-            "load_duration": 1000000u64,
-            "prompt_eval_count": 10,
-            "prompt_eval_duration": duration.as_nanos() as u64 / 4,
-            "eval_count": chunk_count.max(1),
-            "eval_duration": duration.as_nanos() as u64 / 2
-        })
-    } else {
-        json!({
-            "model": model,
-            "created_at": chrono::Utc::now().to_rfc3339(),
-            "response": "",
-            "done": true,
-            "context": [1, 2, 3],
-            "total_duration": duration.as_nanos() as u64,
-            "load_duration": 1000000u64,
-            "prompt_eval_count": 10,
-            "prompt_eval_duration": duration.as_nanos() as u64 / 4,
-            "eval_count": chunk_count.max(1),
-            "eval_duration": duration.as_nanos() as u64 / 2
-        })
-    }
 }
 
 /// Convert SSE message to Ollama chat format

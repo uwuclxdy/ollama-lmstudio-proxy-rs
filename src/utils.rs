@@ -13,13 +13,21 @@ pub struct ProxyError {
 #[derive(Debug, Clone)]
 pub enum ProxyErrorKind {
     RequestCancelled,
-    // ...existing variants...
+    InternalServerError,
+    BadRequest,
+    NotFound,
+    NotImplemented,
+    Custom,
 }
 
 impl ProxyError {
     /// Create a new ProxyError with custom message and status code
     pub fn new(message: String, status_code: u16) -> Self {
-        Self { message, status_code, kind: ProxyErrorKind::RequestCancelled }
+        Self {
+            message,
+            status_code,
+            kind: ProxyErrorKind::Custom
+        }
     }
 
     /// Create an internal server error (500)
@@ -27,7 +35,7 @@ impl ProxyError {
         Self {
             message: message.to_string(),
             status_code: 500,
-            kind: ProxyErrorKind::RequestCancelled,
+            kind: ProxyErrorKind::InternalServerError,
         }
     }
 
@@ -36,7 +44,7 @@ impl ProxyError {
         Self {
             message: message.to_string(),
             status_code: 400,
-            kind: ProxyErrorKind::RequestCancelled,
+            kind: ProxyErrorKind::BadRequest,
         }
     }
 
@@ -45,7 +53,7 @@ impl ProxyError {
         Self {
             message: message.to_string(),
             status_code: 404,
-            kind: ProxyErrorKind::RequestCancelled,
+            kind: ProxyErrorKind::NotFound,
         }
     }
 
@@ -54,11 +62,11 @@ impl ProxyError {
         Self {
             message: message.to_string(),
             status_code: 501,
-            kind: ProxyErrorKind::RequestCancelled,
+            kind: ProxyErrorKind::NotImplemented,
         }
     }
 
-    /// NEW: Create a request cancelled error (499 - Client Closed Request)
+    /// Create a request cancelled error (499 - Client Closed Request)
     pub fn request_cancelled() -> Self {
         Self {
             message: "Request was cancelled".to_string(),
@@ -67,12 +75,11 @@ impl ProxyError {
         }
     }
 
-    /// NEW: Check if this error represents a cancellation
+    /// Check if this error represents a cancellation
     pub fn is_cancelled(&self) -> bool {
         matches!(self.kind, ProxyErrorKind::RequestCancelled)
     }
 }
-
 
 impl fmt::Display for ProxyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

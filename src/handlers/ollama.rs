@@ -1,3 +1,5 @@
+// src/handlers/ollama.rs - Unified Ollama API handlers with cancellation support
+
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Instant;
@@ -5,75 +7,17 @@ use tokio_util::sync::CancellationToken;
 
 use crate::server::ProxyServer;
 use crate::utils::{clean_model_name, format_duration, ProxyError};
+use crate::common::{CancellableRequest, handle_cancellable_json_response};
 use super::retry::with_retry_and_cancellation;
-use super::streaming::{is_streaming_request, handle_streaming_response_with_cancellation};
+use super::streaming::{is_streaming_request, handle_streaming_response};
 use super::helpers::{
     json_response, determine_model_family, determine_parameter_size,
     estimate_model_size, determine_model_capabilities,
+    transform_chat_response, transform_generate_response, transform_embeddings_response
 };
 
-/// Wrapper for cancellable HTTP requests with proper cancellation
-pub struct CancellableRequest {
-    client: reqwest::Client,
-    token: CancellationToken,
-    request_id: String,
-}
-
-impl CancellableRequest {
-    pub fn new(client: reqwest::Client, token: CancellationToken) -> Self {
-        let request_id = format!("req_{}", chrono::Utc::now().timestamp_millis());
-        Self { client, token, request_id }
-    }
-
-    /// Make a cancellable HTTP request that can be aborted mid-flight
-    pub async fn make_request(
-        &self,
-        method: reqwest::Method,
-        url: &str,
-        body: Option<Value>,
-    ) -> Result<reqwest::Response, ProxyError> {
-        let mut request_builder = self.client.request(method, url);
-
-        if let Some(body) = body {
-            request_builder = request_builder
-                .header("Content-Type", "application/json")
-                .json(&body);
-        }
-
-        // Add a timeout to prevent hanging requests
-        request_builder = request_builder.timeout(std::time::Duration::from_secs(300)); // 5 minutes max
-
-        log::info!("🌐 [{}] Starting request to LM Studio: {}", self.request_id, url);
-
-        let request_future = request_builder.send();
-
-        // Use tokio::select to race between the request and cancellation
-        tokio::select! {
-            // Request completes normally
-            result = request_future => {
-                match result {
-                    Ok(response) => {
-                        log::info!("✅ [{}] Request completed successfully", self.request_id);
-                        Ok(response)
-                    },
-                    Err(err) => {
-                        log::warn!("❌ [{}] Request failed: {}", self.request_id, err);
-                        Err(ProxyError::internal_server_error(&format!("Failed to reach LM Studio: {}", err)))
-                    }
-                }
-            }
-            // Request was cancelled - this is the key part!
-            _ = self.token.cancelled() => {
-                log::warn!("🚫 [{}] HTTP request to LM Studio was cancelled by client disconnection", self.request_id);
-                // Return immediately - the HTTP request will be dropped and cancelled
-                Err(ProxyError::request_cancelled())
-            }
-        }
-    }
-}
-
 /// Handle GET /api/tags - list available models with cancellation support
-pub async fn handle_ollama_tags_with_cancellation(
+pub async fn handle_ollama_tags(
     server: Arc<ProxyServer>,
     cancellation_token: CancellationToken
 ) -> Result<warp::reply::Response, ProxyError> {
@@ -100,10 +44,7 @@ pub async fn handle_ollama_tags_with_cancellation(
                     return Ok(empty_response);
                 }
 
-                let lm_response: Value = response.json().await
-                    .map_err(|_e| {
-                        ProxyError::internal_server_error("LM Studio response parsing failed")
-                    })?;
+                let lm_response = handle_cancellable_json_response(response, cancellation_token).await?;
 
                 // Transform LM Studio format to Ollama format with ALL required fields
                 let models = if let Some(data) = lm_response.get("data").and_then(|d| d.as_array()) {
@@ -165,7 +106,7 @@ pub async fn handle_ollama_tags_with_cancellation(
 }
 
 /// Handle POST /api/chat - chat completion with streaming support and cancellation
-pub async fn handle_ollama_chat_with_cancellation(
+pub async fn handle_ollama_chat(
     server: Arc<ProxyServer>,
     body: Value,
     cancellation_token: CancellationToken
@@ -216,10 +157,12 @@ pub async fn handle_ollama_chat_with_cancellation(
 
                 if stream {
                     // Handle streaming response with cancellation
-                    handle_streaming_response_with_cancellation(response, true, model, start_time, cancellation_token.clone()).await
+                    handle_streaming_response(response, true, model, start_time, cancellation_token.clone()).await
                 } else {
                     // Handle non-streaming response
-                    handle_non_streaming_chat_response_with_cancellation(response, model, messages, start_time, cancellation_token.clone()).await
+                    let lm_response = handle_cancellable_json_response(response, cancellation_token).await?;
+                    let ollama_response = transform_chat_response(&lm_response, model, messages, start_time);
+                    Ok(json_response(&ollama_response))
                 }
             }
         }
@@ -232,80 +175,8 @@ pub async fn handle_ollama_chat_with_cancellation(
     Ok(result)
 }
 
-/// Handle non-streaming chat response with cancellation
-async fn handle_non_streaming_chat_response_with_cancellation(
-    response: reqwest::Response,
-    model: &str,
-    messages: &[Value],
-    start_time: Instant,
-    cancellation_token: CancellationToken,
-) -> Result<warp::reply::Response, ProxyError> {
-    // Check if cancelled before processing response
-    if cancellation_token.is_cancelled() {
-        return Err(ProxyError::request_cancelled());
-    }
-
-    let response_future = response.json::<Value>();
-
-    let lm_response: Value = tokio::select! {
-        result = response_future => {
-            result.map_err(|e| ProxyError::internal_server_error(&format!("Failed to parse LM Studio response: {}", e)))?
-        }
-        _ = cancellation_token.cancelled() => {
-            return Err(ProxyError::request_cancelled());
-        }
-    };
-
-    // Transform response to Ollama format
-    let content = if let Some(choices) = lm_response.get("choices").and_then(|c| c.as_array()) {
-        if let Some(first_choice) = choices.first() {
-            let mut content = first_choice.get("message")
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            // Merge reasoning_content if present
-            if let Some(reasoning) = first_choice.get("message")
-                .and_then(|m| m.get("reasoning_content"))
-                .and_then(|r| r.as_str()) {
-                content = format!("**Reasoning:**\n{}\n\n**Answer:**\n{}", reasoning, content);
-            }
-
-            content
-        } else {
-            String::new()
-        }
-    } else {
-        String::new()
-    };
-
-    // Calculate timing estimates
-    let total_duration = start_time.elapsed().as_nanos() as u64;
-    let prompt_eval_count = messages.len() as u64 * 10;
-    let eval_count = content.len() as u64 / 4;
-
-    let ollama_response = json!({
-        "model": model,
-        "created_at": chrono::Utc::now().to_rfc3339(),
-        "message": {
-            "role": "assistant",
-            "content": content
-        },
-        "done": true,
-        "total_duration": total_duration,
-        "load_duration": 1000000u64,
-        "prompt_eval_count": prompt_eval_count,
-        "prompt_eval_duration": total_duration / 4,
-        "eval_count": eval_count,
-        "eval_duration": total_duration / 2
-    });
-
-    Ok(json_response(&ollama_response))
-}
-
 /// Handle POST /api/generate - text completion with streaming support and cancellation
-pub async fn handle_ollama_generate_with_cancellation(
+pub async fn handle_ollama_generate(
     server: Arc<ProxyServer>,
     body: Value,
     cancellation_token: CancellationToken
@@ -354,9 +225,11 @@ pub async fn handle_ollama_generate_with_cancellation(
                 }
 
                 if stream {
-                    handle_streaming_response_with_cancellation(response, false, model, start_time, cancellation_token.clone()).await
+                    handle_streaming_response(response, false, model, start_time, cancellation_token.clone()).await
                 } else {
-                    handle_non_streaming_generate_response_with_cancellation(response, model, prompt, start_time, cancellation_token.clone()).await
+                    let lm_response = handle_cancellable_json_response(response, cancellation_token).await?;
+                    let ollama_response = transform_generate_response(&lm_response, model, prompt, start_time);
+                    Ok(json_response(&ollama_response))
                 }
             }
         }
@@ -369,63 +242,8 @@ pub async fn handle_ollama_generate_with_cancellation(
     Ok(result)
 }
 
-/// Handle non-streaming generate response with cancellation
-async fn handle_non_streaming_generate_response_with_cancellation(
-    response: reqwest::Response,
-    model: &str,
-    prompt: &str,
-    start_time: Instant,
-    cancellation_token: CancellationToken,
-) -> Result<warp::reply::Response, ProxyError> {
-    // Check if cancelled before processing response
-    if cancellation_token.is_cancelled() {
-        return Err(ProxyError::request_cancelled());
-    }
-
-    let response_future = response.json::<Value>();
-
-    let lm_response: Value = tokio::select! {
-        result = response_future => {
-            result.map_err(|e| ProxyError::internal_server_error(&format!("Failed to parse LM Studio response: {}", e)))?
-        }
-        _ = cancellation_token.cancelled() => {
-            return Err(ProxyError::request_cancelled());
-        }
-    };
-
-    let response_text = if let Some(choices) = lm_response.get("choices").and_then(|c| c.as_array()) {
-        choices.first()
-            .and_then(|choice| choice.get("text"))
-            .and_then(|text| text.as_str())
-            .unwrap_or("")
-            .to_string()
-    } else {
-        String::new()
-    };
-
-    let total_duration = start_time.elapsed().as_nanos() as u64;
-    let prompt_eval_count = prompt.len() as u64 / 4;
-    let eval_count = response_text.len() as u64 / 4;
-
-    let ollama_response = json!({
-        "model": model,
-        "created_at": chrono::Utc::now().to_rfc3339(),
-        "response": response_text,
-        "done": true,
-        "context": [1, 2, 3],
-        "total_duration": total_duration,
-        "load_duration": 1000000u64,
-        "prompt_eval_count": prompt_eval_count,
-        "prompt_eval_duration": total_duration / 4,
-        "eval_count": eval_count,
-        "eval_duration": total_duration / 2
-    });
-
-    Ok(json_response(&ollama_response))
-}
-
 /// Handle POST /api/embed or /api/embeddings - generate embeddings with cancellation
-pub async fn handle_ollama_embeddings_with_cancellation(
+pub async fn handle_ollama_embeddings(
     server: Arc<ProxyServer>,
     body: Value,
     cancellation_token: CancellationToken
@@ -468,35 +286,8 @@ pub async fn handle_ollama_embeddings_with_cancellation(
                     return Err(ProxyError::internal_server_error(&format!("LM Studio error: {}", error_text)));
                 }
 
-                let response_future = response.json::<Value>();
-
-                let lm_response: Value = tokio::select! {
-                    result = response_future => {
-                        result.map_err(|e| ProxyError::internal_server_error(&format!("Failed to parse LM Studio response: {}", e)))?
-                    }
-                    _ = cancellation_token.cancelled() => {
-                        return Err(ProxyError::request_cancelled());
-                    }
-                };
-
-                let embeddings = if let Some(data) = lm_response.get("data").and_then(|d| d.as_array()) {
-                    data.iter()
-                        .filter_map(|item| item.get("embedding"))
-                        .collect::<Vec<_>>()
-                } else {
-                    vec![]
-                };
-
-                let total_duration = start_time.elapsed().as_nanos() as u64;
-
-                let ollama_response = json!({
-                    "model": model,
-                    "embeddings": embeddings,
-                    "total_duration": total_duration,
-                    "load_duration": 1000000u64,
-                    "prompt_eval_count": 1
-                });
-
+                let lm_response = handle_cancellable_json_response(response, cancellation_token).await?;
+                let ollama_response = transform_embeddings_response(&lm_response, model, start_time);
                 Ok(ollama_response)
             }
         }
@@ -507,27 +298,6 @@ pub async fn handle_ollama_embeddings_with_cancellation(
 
     server.logger.log(&format!("Ollama embeddings response completed (took {})", format_duration(duration)));
     Ok(json_response(&result))
-}
-
-// Backwards compatibility functions that create non-cancelling tokens
-pub async fn handle_ollama_tags(server: ProxyServer) -> Result<warp::reply::Response, ProxyError> {
-    let token = CancellationToken::new(); // Never gets cancelled
-    handle_ollama_tags_with_cancellation(Arc::new(server), token).await
-}
-
-pub async fn handle_ollama_chat(server: ProxyServer, body: Value) -> Result<warp::reply::Response, ProxyError> {
-    let token = CancellationToken::new(); // Never gets cancelled
-    handle_ollama_chat_with_cancellation(Arc::new(server), body, token).await
-}
-
-pub async fn handle_ollama_generate(server: ProxyServer, body: Value) -> Result<warp::reply::Response, ProxyError> {
-    let token = CancellationToken::new(); // Never gets cancelled
-    handle_ollama_generate_with_cancellation(Arc::new(server), body, token).await
-}
-
-pub async fn handle_ollama_embeddings(server: ProxyServer, body: Value) -> Result<warp::reply::Response, ProxyError> {
-    let token = CancellationToken::new(); // Never gets cancelled
-    handle_ollama_embeddings_with_cancellation(Arc::new(server), body, token).await
 }
 
 /// Handle GET /api/ps - list running models

@@ -1,6 +1,7 @@
-// src/handlers/helpers.rs - Basic helper functions for handlers
+// src/handlers/helpers.rs - Consolidated helper functions and utilities
 
-use serde_json::Value;
+use serde_json::{json, Value};
+use std::time::{Duration, Instant};
 use warp::Reply;
 
 /// Helper function to convert JSON to Response
@@ -74,4 +75,255 @@ pub fn determine_model_capabilities(model_name: &str) -> Vec<&'static str> {
     }
 
     capabilities
+}
+
+// ===== CHUNK CREATION UTILITIES =====
+// Consolidated from streaming.rs and cancellation.rs
+
+/// Extract content from a chunk for tracking partial responses
+pub fn extract_content_from_chunk(chunk: &Value) -> Option<String> {
+    // For chat format
+    if let Some(content) = chunk.get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str()) {
+        return Some(content.to_string());
+    }
+
+    // For generate format
+    if let Some(content) = chunk.get("response")
+        .and_then(|r| r.as_str()) {
+        return Some(content.to_string());
+    }
+
+    None
+}
+
+/// Create an error chunk for streaming responses
+pub fn create_error_chunk(model: &str, error_message: &str, is_chat: bool) -> Value {
+    if is_chat {
+        json!({
+            "model": model,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "message": {
+                "role": "assistant",
+                "content": ""
+            },
+            "done": true,
+            "error": error_message
+        })
+    } else {
+        json!({
+            "model": model,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "response": "",
+            "done": true,
+            "error": error_message
+        })
+    }
+}
+
+/// Create a cancellation chunk with partial response info
+pub fn create_cancellation_chunk(
+    model: &str,
+    partial_content: &str,
+    duration: Duration,
+    tokens_generated: u64,
+    is_chat: bool,
+) -> Value {
+    let cancellation_message = if partial_content.is_empty() {
+        "🚫 Request cancelled before content generation started".to_string()
+    } else {
+        format!("🚫 Request cancelled after generating {} tokens", tokens_generated)
+    };
+
+    if is_chat {
+        json!({
+            "model": model,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "message": {
+                "role": "assistant",
+                "content": cancellation_message
+            },
+            "done": true,
+            "total_duration": duration.as_nanos() as u64,
+            "load_duration": 1000000u64,
+            "prompt_eval_count": 10,
+            "prompt_eval_duration": duration.as_nanos() as u64 / 4,
+            "eval_count": tokens_generated,
+            "eval_duration": duration.as_nanos() as u64 / 2,
+            "cancelled": true,
+            "partial_response": !partial_content.is_empty()
+        })
+    } else {
+        json!({
+            "model": model,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "response": cancellation_message,
+            "done": true,
+            "context": [1, 2, 3],
+            "total_duration": duration.as_nanos() as u64,
+            "load_duration": 1000000u64,
+            "prompt_eval_count": 10,
+            "prompt_eval_duration": duration.as_nanos() as u64 / 4,
+            "eval_count": tokens_generated,
+            "eval_duration": duration.as_nanos() as u64 / 2,
+            "cancelled": true,
+            "partial_response": !partial_content.is_empty()
+        })
+    }
+}
+
+/// Create final completion chunk for streaming responses
+pub fn create_final_chunk(
+    model: &str,
+    duration: Duration,
+    chunk_count: u64,
+    is_chat: bool,
+) -> Value {
+    if is_chat {
+        json!({
+            "model": model,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "message": {
+                "role": "assistant",
+                "content": ""
+            },
+            "done": true,
+            "total_duration": duration.as_nanos() as u64,
+            "load_duration": 1000000u64,
+            "prompt_eval_count": 10,
+            "prompt_eval_duration": duration.as_nanos() as u64 / 4,
+            "eval_count": chunk_count.max(1),
+            "eval_duration": duration.as_nanos() as u64 / 2
+        })
+    } else {
+        json!({
+            "model": model,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "response": "",
+            "done": true,
+            "context": [1, 2, 3],
+            "total_duration": duration.as_nanos() as u64,
+            "load_duration": 1000000u64,
+            "prompt_eval_count": 10,
+            "prompt_eval_duration": duration.as_nanos() as u64 / 4,
+            "eval_count": chunk_count.max(1),
+            "eval_duration": duration.as_nanos() as u64 / 2
+        })
+    }
+}
+
+// ===== RESPONSE TRANSFORMATION UTILITIES =====
+
+/// Transform LM Studio chat response to Ollama format
+pub fn transform_chat_response(
+    lm_response: &Value,
+    model: &str,
+    messages: &[Value],
+    start_time: Instant,
+) -> Value {
+    let content = if let Some(choices) = lm_response.get("choices").and_then(|c| c.as_array()) {
+        if let Some(first_choice) = choices.first() {
+            let mut content = first_choice.get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            // Merge reasoning_content if present
+            if let Some(reasoning) = first_choice.get("message")
+                .and_then(|m| m.get("reasoning_content"))
+                .and_then(|r| r.as_str()) {
+                content = format!("**Reasoning:**\n{}\n\n**Answer:**\n{}", reasoning, content);
+            }
+
+            content
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    // Calculate timing estimates
+    let total_duration = start_time.elapsed().as_nanos() as u64;
+    let prompt_eval_count = messages.len() as u64 * 10;
+    let eval_count = content.len() as u64 / 4;
+
+    json!({
+        "model": model,
+        "created_at": chrono::Utc::now().to_rfc3339(),
+        "message": {
+            "role": "assistant",
+            "content": content
+        },
+        "done": true,
+        "total_duration": total_duration,
+        "load_duration": 1000000u64,
+        "prompt_eval_count": prompt_eval_count,
+        "prompt_eval_duration": total_duration / 4,
+        "eval_count": eval_count,
+        "eval_duration": total_duration / 2
+    })
+}
+
+/// Transform LM Studio completion response to Ollama format
+pub fn transform_generate_response(
+    lm_response: &Value,
+    model: &str,
+    prompt: &str,
+    start_time: Instant,
+) -> Value {
+    let response_text = if let Some(choices) = lm_response.get("choices").and_then(|c| c.as_array()) {
+        choices.first()
+            .and_then(|choice| choice.get("text"))
+            .and_then(|text| text.as_str())
+            .unwrap_or("")
+            .to_string()
+    } else {
+        String::new()
+    };
+
+    let total_duration = start_time.elapsed().as_nanos() as u64;
+    let prompt_eval_count = prompt.len() as u64 / 4;
+    let eval_count = response_text.len() as u64 / 4;
+
+    json!({
+        "model": model,
+        "created_at": chrono::Utc::now().to_rfc3339(),
+        "response": response_text,
+        "done": true,
+        "context": [1, 2, 3],
+        "total_duration": total_duration,
+        "load_duration": 1000000u64,
+        "prompt_eval_count": prompt_eval_count,
+        "prompt_eval_duration": total_duration / 4,
+        "eval_count": eval_count,
+        "eval_duration": total_duration / 2
+    })
+}
+
+/// Transform LM Studio embeddings response to Ollama format
+pub fn transform_embeddings_response(
+    lm_response: &Value,
+    model: &str,
+    start_time: Instant,
+) -> Value {
+    let embeddings = if let Some(data) = lm_response.get("data").and_then(|d| d.as_array()) {
+        data.iter()
+            .filter_map(|item| item.get("embedding"))
+            .collect::<Vec<_>>()
+    } else {
+        vec![]
+    };
+
+    let total_duration = start_time.elapsed().as_nanos() as u64;
+
+    json!({
+        "model": model,
+        "embeddings": embeddings,
+        "total_duration": total_duration,
+        "load_duration": 1000000u64,
+        "prompt_eval_count": 1
+    })
 }
