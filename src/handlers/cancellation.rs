@@ -1,22 +1,70 @@
-use futures_util::StreamExt;
-use serde_json::{json, Value};
-use std::time::Instant;
-use tokio::sync::mpsc;
+// src/handlers/cancellation.rs - Core cancellation functionality
+// This file adds the cancellation layer on top of your existing handlers
+
+use serde_json::Value;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+use futures_util::StreamExt;
+use tokio::sync::mpsc;
 
+use crate::server::ProxyServer;
 use crate::utils::ProxyError;
+use crate::handlers::streaming::{
+    convert_sse_to_ollama_chat, convert_sse_to_ollama_generate, is_streaming_request,
+};
 
-/// Check if request has streaming enabled
-pub fn is_streaming_request(body: &Value) -> bool {
-    body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false)
+/// Wrapper for cancellable HTTP requests
+pub struct CancellableRequest {
+    client: reqwest::Client,
+    token: CancellationToken,
 }
 
-/// Handle streaming responses from LM Studio with proper cancellation support
+impl CancellableRequest {
+    pub fn new(client: reqwest::Client, token: CancellationToken) -> Self {
+        Self { client, token }
+    }
+
+    /// Make a cancellable HTTP request
+    pub async fn make_request(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        body: Option<Value>,
+    ) -> Result<reqwest::Response, ProxyError> {
+        let mut request_builder = self.client.request(method, url);
+
+        if let Some(body) = body {
+            request_builder = request_builder
+                .header("Content-Type", "application/json")
+                .json(&body);
+        }
+
+        let request_future = request_builder.send();
+
+        // Use tokio::select to race between the request and cancellation
+        tokio::select! {
+            // Request completes normally
+            result = request_future => {
+                match result {
+                    Ok(response) => Ok(response),
+                    Err(err) => Err(ProxyError::internal_server_error(&format!("Failed to reach LM Studio: {}", err))),
+                }
+            }
+            // Request was cancelled
+            _ = self.token.cancelled() => {
+                log::info!("HTTP request to LM Studio was cancelled");
+                Err(ProxyError::request_cancelled())
+            }
+        }
+    }
+}
+
+/// Enhanced streaming response handler with cancellation support
 pub async fn handle_streaming_response_with_cancellation(
     response: reqwest::Response,
     is_chat: bool,
     model: &str,
-    start_time: Instant,
+    start_time: std::time::Instant,
     cancellation_token: CancellationToken,
 ) -> Result<warp::reply::Response, ProxyError> {
     let model = model.to_string();
@@ -25,11 +73,7 @@ pub async fn handle_streaming_response_with_cancellation(
     // Spawn task to process the stream with cancellation support
     let model_clone = model.clone();
     let token_clone = cancellation_token.clone();
-    let stream_id = format!("stream_{}", chrono::Utc::now().timestamp_millis());
-
     tokio::spawn(async move {
-        log::info!("🌊 [{}] Starting stream processing for model: {}", stream_id, model_clone);
-
         let mut stream = response.bytes_stream();
         let mut buffer = String::new();
         let mut chunk_count = 0u64;
@@ -55,18 +99,18 @@ pub async fn handle_streaming_response_with_cancellation(
                                         convert_sse_to_ollama_generate(&message, &model_clone)
                                     } {
                                         chunk_count += 1;
-
+                                        
                                         // Track partial content for graceful cancellation
                                         if let Some(content) = extract_content_from_chunk(&ollama_chunk) {
                                             partial_content.push_str(&content);
                                         }
-
+                                        
                                         let chunk_json = serde_json::to_string(&ollama_chunk).unwrap_or_default();
                                         let chunk_with_newline = format!("{}\n", chunk_json);
 
                                         if tx.send(Ok(bytes::Bytes::from(chunk_with_newline))).is_err() {
                                             // Client disconnected, stop processing
-                                            log::warn!("🚫 [{}] Client disconnected during streaming after {} chunks", stream_id, chunk_count);
+                                            log::info!("Client disconnected during streaming");
                                             return;
                                         }
                                     }
@@ -75,28 +119,20 @@ pub async fn handle_streaming_response_with_cancellation(
                         }
                         Some(Err(e)) => {
                             // Network error during streaming - send error chunk and stop
-                            log::error!("❌ [{}] Streaming error: {}", stream_id, e);
                             let error_chunk = create_error_chunk(&model_clone, &format!("Streaming error: {}", e), is_chat);
                             send_chunk_and_exit(&tx, error_chunk).await;
                             return;
                         }
                         None => {
                             // Stream ended naturally - send final chunk
-                            log::info!("✅ [{}] Stream ended naturally after {} chunks", stream_id, chunk_count);
                             break;
                         }
                     }
                 }
-                // Handle cancellation gracefully - THIS IS THE KEY PART!
+                // Handle cancellation gracefully
                 _ = token_clone.cancelled() => {
-                    log::warn!("🚫 [{}] Stream cancelled by client disconnection after {} chunks with content: '{}'",
-                             stream_id, chunk_count,
-                             if partial_content.len() > 50 {
-                                 format!("{}...", &partial_content[..50])
-                             } else {
-                                 partial_content.clone()
-                             });
-
+                    log::info!("Stream cancelled by client disconnection");
+                    
                     // Send a graceful cancellation response
                     let cancellation_chunk = create_cancellation_chunk(
                         &model_clone,
@@ -106,8 +142,6 @@ pub async fn handle_streaming_response_with_cancellation(
                         is_chat,
                     );
                     send_chunk_and_exit(&tx, cancellation_chunk).await;
-
-                    // Important: Return immediately to drop the stream and cancel the LM Studio request
                     return;
                 }
             }
@@ -130,8 +164,6 @@ pub async fn handle_streaming_response_with_cancellation(
         // Add final completion chunk with statistics
         let final_chunk = create_final_chunk(&model_clone, start_time.elapsed(), chunk_count, is_chat);
         send_chunk_and_exit(&tx, final_chunk).await;
-
-        log::info!("🏁 [{}] Stream processing completed successfully", stream_id);
     });
 
     // Create stream from receiver
@@ -152,7 +184,7 @@ pub async fn handle_streaming_response_with_cancellation(
     Ok(response)
 }
 
-/// Handle direct streaming passthrough from LM Studio with cancellation support
+/// Enhanced passthrough streaming with cancellation support
 pub async fn handle_passthrough_streaming_response_with_cancellation(
     response: reqwest::Response,
     cancellation_token: CancellationToken,
@@ -217,31 +249,12 @@ pub async fn handle_passthrough_streaming_response_with_cancellation(
     Ok(response)
 }
 
-/// Backwards compatibility: streaming without cancellation
-pub async fn handle_streaming_response(
-    response: reqwest::Response,
-    is_chat: bool,
-    model: &str,
-    start_time: Instant,
-) -> Result<warp::reply::Response, ProxyError> {
-    // Create a token that never gets cancelled for backwards compatibility
-    let token = CancellationToken::new();
-    handle_streaming_response_with_cancellation(response, is_chat, model, start_time, token).await
-}
-
-/// Backwards compatibility: passthrough streaming without cancellation
-pub async fn handle_passthrough_streaming_response(
-    response: reqwest::Response,
-) -> Result<warp::reply::Response, ProxyError> {
-    // Create a token that never gets cancelled for backwards compatibility
-    let token = CancellationToken::new();
-    handle_passthrough_streaming_response_with_cancellation(response, token).await
-}
+// Helper functions
 
 /// Helper function to send a chunk and close the channel
 async fn send_chunk_and_exit(
     tx: &mpsc::UnboundedSender<Result<bytes::Bytes, std::io::Error>>,
-    chunk: Value,
+    chunk: serde_json::Value,
 ) {
     let chunk_json = serde_json::to_string(&chunk).unwrap_or_default();
     let chunk_with_newline = format!("{}\n", chunk_json);
@@ -269,7 +282,7 @@ fn extract_content_from_chunk(chunk: &Value) -> Option<String> {
 /// Create an error chunk
 fn create_error_chunk(model: &str, error_message: &str, is_chat: bool) -> Value {
     if is_chat {
-        json!({
+        serde_json::json!({
             "model": model,
             "created_at": chrono::Utc::now().to_rfc3339(),
             "message": {
@@ -280,7 +293,7 @@ fn create_error_chunk(model: &str, error_message: &str, is_chat: bool) -> Value 
             "error": error_message
         })
     } else {
-        json!({
+        serde_json::json!({
             "model": model,
             "created_at": chrono::Utc::now().to_rfc3339(),
             "response": "",
@@ -299,13 +312,13 @@ fn create_cancellation_chunk(
     is_chat: bool,
 ) -> Value {
     let cancellation_message = if partial_content.is_empty() {
-        "🚫 Request cancelled before content generation started".to_string()
+        "[Request cancelled before any content was generated]".to_string()
     } else {
-        format!("🚫 Request cancelled after generating {} tokens", tokens_generated)
+        format!("[Request cancelled after {} tokens]", tokens_generated)
     };
 
     if is_chat {
-        json!({
+        serde_json::json!({
             "model": model,
             "created_at": chrono::Utc::now().to_rfc3339(),
             "message": {
@@ -319,11 +332,10 @@ fn create_cancellation_chunk(
             "prompt_eval_duration": duration.as_nanos() as u64 / 4,
             "eval_count": tokens_generated,
             "eval_duration": duration.as_nanos() as u64 / 2,
-            "cancelled": true,
-            "partial_response": !partial_content.is_empty()
+            "cancelled": true
         })
     } else {
-        json!({
+        serde_json::json!({
             "model": model,
             "created_at": chrono::Utc::now().to_rfc3339(),
             "response": cancellation_message,
@@ -335,8 +347,7 @@ fn create_cancellation_chunk(
             "prompt_eval_duration": duration.as_nanos() as u64 / 4,
             "eval_count": tokens_generated,
             "eval_duration": duration.as_nanos() as u64 / 2,
-            "cancelled": true,
-            "partial_response": !partial_content.is_empty()
+            "cancelled": true
         })
     }
 }
@@ -349,7 +360,7 @@ fn create_final_chunk(
     is_chat: bool,
 ) -> Value {
     if is_chat {
-        json!({
+        serde_json::json!({
             "model": model,
             "created_at": chrono::Utc::now().to_rfc3339(),
             "message": {
@@ -365,7 +376,7 @@ fn create_final_chunk(
             "eval_duration": duration.as_nanos() as u64 / 2
         })
     } else {
-        json!({
+        serde_json::json!({
             "model": model,
             "created_at": chrono::Utc::now().to_rfc3339(),
             "response": "",
@@ -379,75 +390,4 @@ fn create_final_chunk(
             "eval_duration": duration.as_nanos() as u64 / 2
         })
     }
-}
-
-/// Convert SSE message to Ollama chat format
-pub fn convert_sse_to_ollama_chat(sse_message: &str, model: &str) -> Option<Value> {
-    for line in sse_message.lines() {
-        if let Some(data) = line.strip_prefix("data: ") {
-            if data.trim() == "[DONE]" {
-                return None; // Will be handled by final chunk
-            }
-
-            if let Ok(json_data) = serde_json::from_str::<Value>(data) {
-                if let Some(choices) = json_data.get("choices").and_then(|c| c.as_array()) {
-                    if let Some(first_choice) = choices.first() {
-                        if let Some(delta) = first_choice.get("delta") {
-                            let content = delta.get("content")
-                                .and_then(|c| c.as_str())
-                                .unwrap_or("")
-                                .to_string();
-
-                            // Only return chunks with actual content
-                            if !content.is_empty() {
-                                return Some(json!({
-                                    "model": model,
-                                    "created_at": chrono::Utc::now().to_rfc3339(),
-                                    "message": {
-                                        "role": "assistant",
-                                        "content": content
-                                    },
-                                    "done": false
-                                }));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Convert SSE message to Ollama generate format
-pub fn convert_sse_to_ollama_generate(sse_message: &str, model: &str) -> Option<Value> {
-    for line in sse_message.lines() {
-        if let Some(data) = line.strip_prefix("data: ") {
-            if data.trim() == "[DONE]" {
-                return None; // Will be handled by final chunk
-            }
-
-            if let Ok(json_data) = serde_json::from_str::<Value>(data) {
-                if let Some(choices) = json_data.get("choices").and_then(|c| c.as_array()) {
-                    if let Some(first_choice) = choices.first() {
-                        let content = first_choice.get("text")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or("")
-                            .to_string();
-
-                        // Only return chunks with actual content
-                        if !content.is_empty() {
-                            return Some(json!({
-                                "model": model,
-                                "created_at": chrono::Utc::now().to_rfc3339(),
-                                "response": content,
-                                "done": false
-                            }));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
 }

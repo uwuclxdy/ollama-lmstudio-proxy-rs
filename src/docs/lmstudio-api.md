@@ -25,7 +25,7 @@ See below for more info about each endpoint
 
 > 💡 **Pro Tip**
 >
-> You can reuse existing OpenAI clients (in Python, JS, C#, etc) by switching up the "base URL" property to point to
+> You can reuse existing OpenAI clients (in Python, JS, C#, etc.) by switching up the "base URL" property to point to
 > your LM Studio instead of OpenAI's servers.
 
 ### Switching up the `base url` to point to LM Studio

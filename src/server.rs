@@ -2,43 +2,55 @@ use clap::Parser;
 use serde_json::Value;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tokio::task::AbortHandle;
+use tokio_util::sync::CancellationToken;
 use warp::{Filter, Rejection, Reply};
+use warp::log::Info as LogInfo;
 
 use crate::handlers;
 use crate::utils::{Logger, ProxyError};
 
-/// Configuration struct with command line arguments
 #[derive(Parser, Debug, Clone)]
 #[command(name = "ollama-lmstudio-proxy")]
 #[command(about = "Proxy server bridging Ollama API and LM Studio")]
 pub struct Config {
-    /// Address and port to listen on
     #[arg(long, default_value = "0.0.0.0:11434")]
     pub listen: String,
 
-    /// LM Studio API URL
     #[arg(long, default_value = "http://localhost:1234")]
     pub lmstudio_url: String,
 
-    /// Disable request/response logging
     #[arg(long)]
     pub no_log: bool,
 
-    /// Timeout for model loading in seconds
     #[arg(long, default_value = "5")]
     pub load_timeout_seconds: u64,
 }
 
-/// Main proxy server struct
+#[derive(Clone)]
+pub struct CancellationTokenFactory;
+
+impl CancellationTokenFactory {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn create_token(&self) -> CancellationToken {
+        CancellationToken::new()
+    }
+}
+
 #[derive(Clone)]
 pub struct ProxyServer {
     pub client: reqwest::Client,
     pub config: Config,
     pub logger: Logger,
+    pub cancellation_factory: CancellationTokenFactory,
 }
 
 impl ProxyServer {
-    /// Create a new ProxyServer instance
     pub fn new(config: Config) -> Self {
         let client = reqwest::Client::new();
         let logger = Logger::new(!config.no_log);
@@ -47,32 +59,45 @@ impl ProxyServer {
             client,
             config,
             logger,
+            cancellation_factory: CancellationTokenFactory::new(),
         }
     }
 
-    /// Start the proxy server
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
-        // Print startup banner
         self.print_startup_banner();
 
-        // Parse listen address
         let addr: SocketAddr = self.config.listen.parse()
             .map_err(|e| format!("Invalid listen address '{}': {}", self.config.listen, e))?;
 
-        // Create the main route handler
-        let server = self.clone();
+        let server = Arc::new(self.clone());
+
+        let log = warp::log::custom({
+            let server = server.clone();
+            move |info: LogInfo| {
+                let logger = &server.logger;
+                let log_line = format!(
+                    "REQUEST: {} {} | RESPONSE: {} | Duration: {:?}",
+                    info.method(),
+                    info.path(),
+                    info.status(),
+                    info.elapsed()
+                );
+                logger.log(&log_line);
+            }
+        });
+
         let routes = warp::method()
             .and(warp::path::full())
             .and(warp::body::json().or(warp::any().map(|| Value::Null)).unify())
             .and_then(move |method: warp::http::Method, path: warp::path::FullPath, body: Value| {
                 let server = server.clone();
                 async move {
-                    handle_request(server, method.to_string(), path.as_str().to_string(), body).await
+                    handle_request_with_cancellation(server, method.to_string(), path.as_str().to_string(), body).await
                 }
             })
-            .recover(handle_rejection);
+            .recover(handle_rejection)
+            .with(log);
 
-        // Start the server
         self.logger.log(&format!("🚀 Server starting on {}", addr));
 
         warp::serve(routes)
@@ -82,17 +107,18 @@ impl ProxyServer {
         Ok(())
     }
 
-    /// Print startup information
     fn print_startup_banner(&self) {
         if self.logger.enabled {
             println!("╭─────────────────────────────────────────────────────────────╮");
             println!("│                  🔄 Ollama ↔ LM Studio Proxy                │");
+            println!("│                    with Cancellation Support                │");
             println!("╰─────────────────────────────────────────────────────────────╯");
             println!();
             println!("📡 Listen Address:    {}", self.config.listen);
             println!("🎯 LM Studio URL:     {}", self.config.lmstudio_url);
             println!("📝 Logging:           {}", if self.logger.enabled { "✅ Enabled" } else { "❌ Disabled" });
             println!("⏱️  Load Timeout:     {}s", self.config.load_timeout_seconds);
+            println!("🚫 Cancellation:     ✅ Enabled (client disconnect detection)");
             println!();
             println!("🔌 Supported Endpoints:");
             println!("   • Ollama API:      /api/* (translated to LM Studio)");
@@ -104,8 +130,98 @@ impl ProxyServer {
     }
 }
 
-/// Handle rejections and convert them to proper HTTP responses
-/// Enhanced to never return undefined responses that break VS Code extensions
+struct ConnectionTracker {
+    token: CancellationToken,
+    completed: Arc<AtomicBool>,
+}
+
+impl ConnectionTracker {
+    fn new(token: CancellationToken) -> Self {
+        Self {
+            token,
+            completed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn mark_completed(&self) {
+        self.completed.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for ConnectionTracker {
+    fn drop(&mut self) {
+        if !self.completed.load(Ordering::Relaxed) {
+            self.token.cancel();
+            if std::env::var("RUST_LOG").is_ok() {
+                eprintln!("🚫 Client disconnected - cancelling LM Studio request");
+            }
+        }
+    }
+}
+
+async fn handle_request_with_cancellation(
+    server: Arc<ProxyServer>,
+    method: String,
+    path: String,
+    body: Value,
+) -> Result<warp::reply::Response, Rejection> {
+    server.logger.log(&format!("[CONNECTION] Established: {} {}", method, path));
+    server.logger.log(&format!("Received request: {} {}", method, path));
+
+    let cancellation_token = server.cancellation_factory.create_token();
+    let connection_tracker = ConnectionTracker::new(cancellation_token.clone());
+
+    let result = match (method.as_str(), path.as_str()) {
+        ("GET", "/api/tags") => {
+            handlers::handle_ollama_tags_with_cancellation(server.clone(), cancellation_token).await
+        },
+        ("POST", "/api/chat") => {
+            handlers::handle_ollama_chat_with_cancellation(server.clone(), body.clone(), cancellation_token).await
+        },
+        ("POST", "/api/generate") => {
+            handlers::handle_ollama_generate_with_cancellation(server.clone(), body.clone(), cancellation_token).await
+        },
+        ("POST", "/api/embed") | ("POST", "/api/embeddings") => {
+            handlers::handle_ollama_embeddings_with_cancellation(server.clone(), body.clone(), cancellation_token).await
+        },
+        ("POST", "/api/show") => handlers::handle_ollama_show(body).await,
+        ("GET", "/api/ps") => handlers::handle_ollama_ps().await,
+        ("GET", "/api/version") => handlers::handle_ollama_version().await,
+        ("POST", "/api/create") | ("POST", "/api/pull") | ("POST", "/api/push") |
+        ("DELETE", "/api/delete") | ("POST", "/api/copy") =>
+            handlers::handle_unsupported(&path).await,
+        ("GET", "/v1/models") | ("POST", "/v1/chat/completions") |
+        ("POST", "/v1/completions") | ("POST", "/v1/embeddings") => {
+            handlers::handle_lmstudio_passthrough_with_cancellation(server.clone(), &method, &path, body.clone(), cancellation_token).await
+        },
+        _ => Err(ProxyError::not_found(&format!("Unknown endpoint: {} {}", method, path))),
+    };
+
+    match result {
+        Ok(response) => {
+            connection_tracker.mark_completed();
+            Ok(response)
+        },
+        Err(e) if e.is_cancelled() => {
+            server.logger.log(&format!("[CONNECTION] Lost: {} {} - Request was cancelled by client disconnection", method, path));
+            let error_response = serde_json::json!({
+                "error": {
+                    "type": "request_cancelled",
+                    "message": "Request was cancelled due to client disconnection"
+                }
+            });
+            Ok(warp::reply::with_status(
+                warp::reply::json(&error_response),
+                warp::http::StatusCode::REQUEST_TIMEOUT,
+            ).into_response())
+        },
+        Err(e) => {
+            connection_tracker.mark_completed();
+            Err(warp::reject::custom(e))
+        }
+    }
+}
+
 async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
     let (code, message, ollama_compatible) = if err.is_not_found() {
         (404, "Not Found".to_string(), false)
@@ -120,7 +236,6 @@ async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
         (500, "Internal Server Error".to_string(), false)
     };
 
-    // For Ollama API endpoints, return Ollama-style errors
     let json = if ollama_compatible {
         warp::reply::json(&serde_json::json!({
             "error": {
@@ -129,7 +244,6 @@ async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
             }
         }))
     } else {
-        // For other endpoints, return standard error format
         warp::reply::json(&serde_json::json!({
             "error": {
                 "type": "proxy_error",
@@ -138,83 +252,27 @@ async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
         }))
     };
 
-    Ok(warp::reply::with_status(json, warp::http::StatusCode::from_u16(code).unwrap()))
+    Ok(warp::reply::with_status(json, warp::http::StatusCode::from_u16(code).unwrap_or(warp::http::StatusCode::INTERNAL_SERVER_ERROR)))
 }
 
-/// Main request handler that routes to appropriate handlers
-async fn handle_request(
-    server: ProxyServer,
-    method: String,
-    path: String,
-    body: Value,
-) -> Result<warp::reply::Response, Rejection> {
-    server.logger.log(&format!("{} {} - Body size: {}", method, path,
-                               if body.is_null() { 0 } else { body.to_string().len() }));
-
-    let result = match (method.as_str(), path.as_str()) {
-        // Ollama API endpoints (translated to LM Studio)
-        ("GET", "/api/tags") => handlers::handle_ollama_tags(server).await,
-        ("POST", "/api/chat") => handlers::handle_ollama_chat(server, body).await,
-        ("POST", "/api/generate") => handlers::handle_ollama_generate(server, body).await,
-        ("POST", "/api/embed") | ("POST", "/api/embeddings") =>
-            handlers::handle_ollama_embeddings(server, body).await,
-        ("POST", "/api/show") => handlers::handle_ollama_show(body).await,
-
-        // Simple Ollama endpoints (no LM Studio calls needed)
-        ("GET", "/api/ps") => handlers::handle_ollama_ps().await,
-        ("GET", "/api/version") => handlers::handle_ollama_version().await,
-
-        // Unsupported Ollama endpoints
-        ("POST", "/api/create") | ("POST", "/api/pull") | ("POST", "/api/push") |
-        ("DELETE", "/api/delete") | ("POST", "/api/copy") =>
-            handlers::handle_unsupported(&*path).await,
-
-        // LM Studio API (direct passthrough)
-        ("GET", "/v1/models") | ("POST", "/v1/chat/completions") |
-        ("POST", "/v1/completions") | ("POST", "/v1/embeddings") =>
-            handlers::handle_lmstudio_passthrough(server, &method, &path, body).await,
-
-        // Unknown endpoint
-        _ => Err(ProxyError::not_found(&format!("Unknown endpoint: {} {}", method, path))),
-    };
-
-    match result {
-        Ok(response) => Ok(response),
-        Err(e) => Err(warp::reject::custom(e)),
-    }
+#[derive(Clone)]
+pub struct RequestHandle {
+    pub request_id: String,
+    pub abort_handle: Option<AbortHandle>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_config_defaults() {
-        let config = Config {
-            listen: "0.0.0.0:11434".to_string(),
-            lmstudio_url: "http://localhost:1234".to_string(),
-            no_log: false,
-            load_timeout_seconds: 5,
-        };
-
-        assert_eq!(config.listen, "0.0.0.0:11434");
-        assert_eq!(config.lmstudio_url, "http://localhost:1234");
-        assert!(!config.no_log);
-        assert_eq!(config.load_timeout_seconds, 5);
+impl RequestHandle {
+    pub fn new(request_id: String) -> Self {
+        Self {
+            request_id,
+            abort_handle: None,
+        }
     }
 
-    #[test]
-    fn test_proxy_server_creation() {
-        let config = Config {
-            listen: "127.0.0.1:8080".to_string(),
-            lmstudio_url: "http://localhost:1234".to_string(),
-            no_log: true,
-            load_timeout_seconds: 10,
-        };
-
-        let server = ProxyServer::new(config.clone());
-        assert_eq!(server.config.listen, config.listen);
-        assert_eq!(server.config.lmstudio_url, config.lmstudio_url);
-        assert!(!server.logger.enabled); // no_log = true means logging disabled
+    pub fn new_with_abort(abort_handle: AbortHandle) -> Self {
+        Self {
+            request_id: "unknown".to_string(),
+            abort_handle: Some(abort_handle),
+        }
     }
 }

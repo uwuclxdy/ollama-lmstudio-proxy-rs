@@ -18,8 +18,5 @@ chrono = { version = "0.4", features = ["serde"] }
 md5 = "0.7"
 bytes = "1.0"
 futures-util = "0.3.31"
-
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
+tokio-util = "0.7"
+log = "0.4.27"

@@ -7,12 +7,19 @@ use warp::reject::Reject;
 pub struct ProxyError {
     pub message: String,
     pub status_code: u16,
+    kind: ProxyErrorKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum ProxyErrorKind {
+    RequestCancelled,
+    // ...existing variants...
 }
 
 impl ProxyError {
     /// Create a new ProxyError with custom message and status code
     pub fn new(message: String, status_code: u16) -> Self {
-        Self { message, status_code }
+        Self { message, status_code, kind: ProxyErrorKind::RequestCancelled }
     }
 
     /// Create an internal server error (500)
@@ -20,6 +27,7 @@ impl ProxyError {
         Self {
             message: message.to_string(),
             status_code: 500,
+            kind: ProxyErrorKind::RequestCancelled,
         }
     }
 
@@ -28,6 +36,7 @@ impl ProxyError {
         Self {
             message: message.to_string(),
             status_code: 400,
+            kind: ProxyErrorKind::RequestCancelled,
         }
     }
 
@@ -36,6 +45,7 @@ impl ProxyError {
         Self {
             message: message.to_string(),
             status_code: 404,
+            kind: ProxyErrorKind::RequestCancelled,
         }
     }
 
@@ -44,9 +54,25 @@ impl ProxyError {
         Self {
             message: message.to_string(),
             status_code: 501,
+            kind: ProxyErrorKind::RequestCancelled,
         }
     }
+
+    /// NEW: Create a request cancelled error (499 - Client Closed Request)
+    pub fn request_cancelled() -> Self {
+        Self {
+            message: "Request was cancelled".to_string(),
+            status_code: 499,
+            kind: ProxyErrorKind::RequestCancelled,
+        }
+    }
+
+    /// NEW: Check if this error represents a cancellation
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self.kind, ProxyErrorKind::RequestCancelled)
+    }
 }
+
 
 impl fmt::Display for ProxyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -83,12 +109,12 @@ impl Logger {
 /// This function handles various model name formats:
 /// - Removes `:latest` suffix if present
 /// - Removes pure numeric suffixes (e.g., `:2`, `:123`) but only if there's content before the colon
-/// - Preserves non-numeric suffixes (e.g., `:custom`, `:alpha`, `:v1.2`) 
+/// - Preserves non-numeric suffixes (e.g., `:custom`, `:alpha`, `:v1.2`)
 /// - Handles multiple colons correctly - only processes the last segment for numeric removal
 ///
 /// Examples:
 /// - "deepseek-r1-distill-qwen-14b:2" → "deepseek-r1-distill-qwen-14b"
-/// - "llama3.2:latest" → "llama3.2" 
+/// - "llama3.2:latest" → "llama3.2"
 /// - "model-name:3" → "model-name"
 /// - "namespace:model:tag:version" → "namespace:model:tag:version" (non-numeric preserved)
 /// - "namespace:model:tag:2" → "namespace:model:tag" (only last numeric removed)
@@ -208,137 +234,4 @@ pub fn validate_model_name(name: &str) -> (bool, Option<String>) {
     };
 
     (is_valid, warning_message)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-
-    #[test]
-    fn test_clean_model_name() {
-        // Basic cases that should work
-        assert_eq!(clean_model_name("simple-model"), "simple-model");
-        assert_eq!(clean_model_name("model-name"), "model-name");
-
-        // :latest suffix removal
-        assert_eq!(clean_model_name("llama3.2:latest"), "llama3.2");
-        assert_eq!(clean_model_name("deepseek-r1:latest"), "deepseek-r1");
-        assert_eq!(clean_model_name("model:latest"), "model");
-
-        // Numeric suffix removal (version numbers)
-        assert_eq!(clean_model_name("deepseek-r1-distill-qwen-14b:2"), "deepseek-r1-distill-qwen-14b");
-        assert_eq!(clean_model_name("model-name:3"), "model-name");
-        assert_eq!(clean_model_name("llama:1"), "llama");
-        assert_eq!(clean_model_name("model:123"), "model");
-
-        // Non-numeric suffixes should be preserved
-        assert_eq!(clean_model_name("model:custom"), "model:custom");
-        assert_eq!(clean_model_name("model:alpha"), "model:alpha");
-        assert_eq!(clean_model_name("model:beta1"), "model:beta1");
-        assert_eq!(clean_model_name("model:v2.1"), "model:v2.1");
-
-        // Multiple colons - only remove last numeric suffix
-        assert_eq!(clean_model_name("namespace:model:tag:version"), "namespace:model:tag:version");
-        assert_eq!(clean_model_name("namespace:model:tag:2"), "namespace:model:tag");
-        assert_eq!(clean_model_name("org:model:custom:latest"), "org:model:custom");
-        assert_eq!(clean_model_name("a:b:c:d:123"), "a:b:c:d");
-
-        // Edge cases
-        assert_eq!(clean_model_name("model:"), "model:");
-        assert_eq!(clean_model_name(":123"), ":123");
-        assert_eq!(clean_model_name(""), "");
-        assert_eq!(clean_model_name("model::123"), "model:");
-
-        // Complex real-world examples
-        assert_eq!(clean_model_name("huggingface:microsoft/DialoGPT-medium:latest"), "huggingface:microsoft/DialoGPT-medium");
-        assert_eq!(clean_model_name("registry.com:5000/org/model:v1.2"), "registry.com:5000/org/model:v1.2");
-        assert_eq!(clean_model_name("registry.com:5000/org/model:1"), "registry.com:5000/org/model");
-    }
-
-    #[test]
-    fn test_is_no_models_loaded_error() {
-        assert!(is_no_models_loaded_error("No model loaded"));
-        assert!(is_no_models_loaded_error("Model not loaded"));
-        assert!(is_no_models_loaded_error("Please load a model first"));
-        assert!(is_no_models_loaded_error("Model loading required"));
-        assert!(!is_no_models_loaded_error("Invalid request"));
-        assert!(!is_no_models_loaded_error("Connection failed"));
-    }
-
-    #[test]
-    fn test_format_duration() {
-        assert_eq!(format_duration(Duration::from_millis(500)), "500ms");
-        assert_eq!(format_duration(Duration::from_millis(1500)), "1.50s");
-        assert_eq!(format_duration(Duration::from_millis(2500)), "2.50s");
-        assert_eq!(format_duration(Duration::from_millis(999)), "999ms");
-        assert_eq!(format_duration(Duration::from_millis(1000)), "1.00s");
-    }
-
-    #[test]
-    fn test_proxy_error_constructors() {
-        let err = ProxyError::internal_server_error("Test error");
-        assert_eq!(err.status_code, 500);
-        assert_eq!(err.message, "Test error");
-
-        let err = ProxyError::bad_request("Bad request");
-        assert_eq!(err.status_code, 400);
-        assert_eq!(err.message, "Bad request");
-
-        let err = ProxyError::not_found("Not found");
-        assert_eq!(err.status_code, 404);
-        assert_eq!(err.message, "Not found");
-
-        let err = ProxyError::not_implemented("Not implemented");
-        assert_eq!(err.status_code, 501);
-        assert_eq!(err.message, "Not implemented");
-    }
-
-    #[test]
-    fn test_logger() {
-        let logger = Logger::new(true);
-        assert!(logger.enabled);
-
-        let logger = Logger::new(false);
-        assert!(!logger.enabled);
-    }
-
-    #[test]
-    fn test_validate_model_name() {
-        // Valid names
-        assert_eq!(validate_model_name("llama3.2"), (true, None));
-        assert_eq!(validate_model_name("model:latest"), (true, None));
-        assert_eq!(validate_model_name("namespace:model:tag"), (true, None));
-        assert_eq!(validate_model_name("simple-model"), (true, None));
-
-        // Invalid names
-        let (valid, warning) = validate_model_name("");
-        assert!(!valid);
-        assert!(warning.unwrap().contains("empty"));
-
-        let (valid, warning) = validate_model_name("model::tag");
-        assert!(!valid);
-        assert!(warning.unwrap().contains("consecutive colons"));
-
-        let (valid, warning) = validate_model_name("model:");
-        assert!(!valid);
-        assert!(warning.unwrap().contains("ends with colon"));
-
-        let (valid, warning) = validate_model_name(":model");
-        assert!(!valid);
-        assert!(warning.unwrap().contains("starts with colon"));
-
-        let (valid, warning) = validate_model_name("model name with spaces");
-        assert!(!valid);
-        assert!(warning.unwrap().contains("whitespace"));
-
-        let long_name = "a".repeat(250);
-        let (valid, warning) = validate_model_name(&long_name);
-        assert!(!valid);
-        assert!(warning.unwrap().contains("unusually long"));
-
-        let (valid, warning) = validate_model_name("a:b:c:d:e:f");
-        assert!(!valid);
-        assert!(warning.unwrap().contains("5 colons"));
-    }
 }

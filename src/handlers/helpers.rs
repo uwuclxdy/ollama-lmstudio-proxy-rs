@@ -1,3 +1,5 @@
+// src/handlers/helpers.rs - Basic helper functions for handlers
+
 use serde_json::Value;
 use warp::Reply;
 
