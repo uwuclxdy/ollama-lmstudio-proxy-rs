@@ -1,286 +1,260 @@
-# Ollama-LMStudio Proxy Server
+# 🔄 Ollama ↔ LM Studio Proxy Server
 
-A Rust-based proxy server that bridges between Ollama API and LM Studio, supporting **both directions**:
-- Ollama clients → LM Studio backend (with API translation)
-- Direct LM Studio/OpenAI clients → LM Studio backend (passthrough)
+**A powerful Rust-based proxy server that seamlessly bridges Ollama API and LM Studio, enabling bidirectional
+communication and universal compatibility.**
 
-## Features
+---
 
-- **Bidirectional API Support**: Handles both Ollama format (`/api/*`) and LM Studio format (`/v1/*`) endpoints
-- **Full API Translation**: Converts Ollama API requests to LM Studio format and responses back to Ollama format
-- **Direct Passthrough**: Forwards LM Studio/OpenAI API calls directly to LM Studio
-- **Streaming Support**: Handles both streaming and non-streaming responses
-- **Smart Model Mapping**: Automatically cleans model names (removes `:2` suffixes, etc.)
-- **Comprehensive Logging**: Detailed request/response logging with toggle option
-- **Timing Estimation**: Computes approximate timing values for Ollama compatibility
-- **Error Handling**: Graceful handling of unsupported endpoints with informative messages
-- **VS Code/Copilot Compatible**: Works with Visual Studio Code, GitHub Copilot, and other OpenAI-compatible clients
+## ✨ What This Does
 
-## Supported Endpoints
+Transform your LM Studio setup into a **universal AI backend** that works with:
 
-### Ollama API Endpoints (Translated)
-| Ollama Endpoint      | LM Studio Equivalent        | Status          |
-|----------------------|-----------------------------|-----------------|
-| `GET /api/tags`      | `GET /v1/models`            | ✅ Supported     |
-| `POST /api/chat`     | `POST /v1/chat/completions` | ✅ Supported     |
-| `POST /api/generate` | `POST /v1/completions`      | ✅ Supported     |
-| `POST /api/embed`    | `POST /v1/embeddings`       | ✅ Supported     |
-| `GET /api/ps`        | `GET /v1/models` (mapped)   | ✅ Supported     |
-| `POST /api/show`     | Combined requests           | ✅ Supported     |
-| `GET /api/version`   | Hardcoded response          | ✅ Supported     |
-| `POST /api/create`   | Not supported               | ❌ Returns error |
-| `POST /api/pull`     | Not supported               | ❌ Returns error |
-| `POST /api/push`     | Not supported               | ❌ Returns error |
-| `DELETE /api/delete` | Not supported               | ❌ Returns error |
-| `POST /api/copy`     | Not supported               | ❌ Returns error |
+- 🦙 **Ollama clients** (with full API translation)
+- 🤖 **OpenAI-compatible tools** (VS Code, GitHub Copilot, etc.)
+- 🛠️ **Any HTTP client** expecting either API format
 
-### Direct LM Studio API Endpoints (Passthrough)
-| LM Studio Endpoint          | Status      | Notes              |
-|-----------------------------|-------------|--------------------|
-| `GET /v1/models`            | ✅ Supported | Direct passthrough |
-| `POST /v1/chat/completions` | ✅ Supported | Direct passthrough |
-| `POST /v1/completions`      | ✅ Supported | Direct passthrough |
-| `POST /v1/embeddings`       | ✅ Supported | Direct passthrough |
+## 🚀 Key Features
 
-## Installation
+### 🎯 **Dual API Support**
 
-### Prerequisites
+- **Ollama API** (`/api/*`) - Full translation to LM Studio format
+- **OpenAI API** (`/v1/*`) - Direct passthrough to LM Studio
+- **Smart Routing** - Automatically detects and handles both formats
 
-- Rust 1.70+ installed
-- LM Studio running with a model loaded
-- Access to the internet for downloading dependencies
+### 🧠 **Intelligent Model Management**
 
-### Build from Source
+- **Auto-Retry Logic** - Automatically loads models when needed
+- **Smart Name Mapping** - Handles model name variations (`model:2` → `model`)
+- **Format Translation** - Seamless conversion between API formats
+
+### 🎨 **Enhanced Responses**
+
+- **Reasoning Integration** - Merges LM Studio's reasoning content
+- **Timing Estimates** - Provides Ollama-compatible performance metrics
+- **Token Counting** - Accurate usage statistics
+- **Error Handling** - Graceful degradation with helpful messages
+
+### ⚡ **Performance & Reliability**
+
+- **Built in Rust** - Memory-safe, fast, and reliable
+- **Concurrent Handling** - Multiple requests simultaneously
+- **Comprehensive Logging** - Detailed request/response tracking
+- **Configurable Timeouts** - Customizable retry behavior
+
+---
+
+## 🎪 **Supported Endpoints**
+
+| **Ollama API**       | **LM Studio Equivalent**    | **Status**            |
+|----------------------|-----------------------------|-----------------------|
+| `GET /api/tags`      | `GET /v1/models`            | ✅ **Full Support**    |
+| `POST /api/chat`     | `POST /v1/chat/completions` | ✅ **Full Support**    |
+| `POST /api/generate` | `POST /v1/completions`      | ✅ **Full Support**    |
+| `POST /api/embed`    | `POST /v1/embeddings`       | ✅ **Full Support**    |
+| `GET /api/ps`        | *(simulated)*               | ✅ **Simulated**       |
+| `POST /api/show`     | *(simulated)*               | ✅ **Simulated**       |
+| `GET /api/version`   | *(hardcoded)*               | ✅ **Static Response** |
+
+| **OpenAI/LM Studio API**    | **Handling**              |
+|-----------------------------|---------------------------|
+| `GET /v1/models`            | 🔄 **Direct Passthrough** |
+| `POST /v1/chat/completions` | 🔄 **Direct Passthrough** |
+| `POST /v1/completions`      | 🔄 **Direct Passthrough** |
+| `POST /v1/embeddings`       | 🔄 **Direct Passthrough** |
+
+---
+
+## 🏃‍♂️ **Quick Start**
+
+### **1. Prerequisites**
+
+- 🦀 Rust 1.70+ installed
+- 🧠 LM Studio running with a model loaded
+- 🌐 Network access between components
+
+### **2. Installation**
 
 ```bash
-# Clone the repository
-git clone <repository-url>
-cd ollama-lmstudio-proxy-rust
-
-# Build the project
+# Clone and build
+git clone <your-repo-url>
+cd ollama-lmstudio-proxy
 cargo build --release
 
-# Run the proxy
-./target/release/ollama-lmstudio-proxy-rust
+# Run with defaults
+./target/release/ollama-lmstudio-proxy
 ```
 
-## Usage
-
-### Basic Usage
+### **3. Configuration**
 
 ```bash
-# Start with default settings
-./ollama-lmstudio-proxy-rust
-
-# The proxy will:
-# - Listen on 0.0.0.0:11434 (Ollama's default port)
-# - Forward requests to http://localhost:1234 (LM Studio's default)
-# - Enable logging by default
-# - Support both Ollama (/api/*) and LM Studio (/v1/*) endpoints
-```
-
-### Configuration Options
-
-```bash
-# Custom addresses
-./ollama-lmstudio-proxy-rust --listen 127.0.0.1:8080 --lmstudio-url http://192.168.1.100:1234
+# Custom configuration
+./target/release/ollama-lmstudio-proxy \
+  --listen 0.0.0.0:11434 \
+  --lmstudio-url http://localhost:1234 \
+  --load-timeout-seconds 10
 
 # Disable logging
-./ollama-lmstudio-proxy-rust --no-log
+./target/release/ollama-lmstudio-proxy --no-log
 
 # Help
-./ollama-lmstudio-proxy-rust --help
+./target/release/ollama-lmstudio-proxy --help
 ```
 
-### Command Line Arguments
+---
 
-- `--listen <ADDRESS:PORT>`: Address and port to listen on (default: `0.0.0.0:11434`)
-- `--lmstudio-url <URL>`: LM Studio API URL (default: `http://localhost:1234`)
-- `--no-log`: Disable request/response logging
-- `--help`: Show help information
+## 🧪 **Usage Examples**
 
-## Example Usage
-
-### With Ollama Clients
-
-Once the proxy is running, you can use any Ollama-compatible client:
+### **With Ollama Clients**
 
 ```bash
-# List available models
+# List models (Ollama format)
 curl http://localhost:11434/api/tags
 
-# Chat with a model
+# Chat completion (Ollama format)
 curl http://localhost:11434/api/chat -d '{
-  "model": "deepseek-r1-distill-qwen-14b",
+  "model": "your-model-name",
   "messages": [
-    {"role": "user", "content": "Hello!"}
+    {"role": "user", "content": "Explain quantum computing"}
   ]
 }'
 
-# Generate text completion
+# Text generation (Ollama format)
 curl http://localhost:11434/api/generate -d '{
-  "model": "deepseek-r1-distill-qwen-14b",
-  "prompt": "The capital of France is"
+  "model": "your-model-name",
+  "prompt": "The future of AI is"
 }'
 ```
 
-### With OpenAI/LM Studio Clients
-
-You can also use the proxy as a drop-in replacement for LM Studio:
+### **With OpenAI/VS Code**
 
 ```bash
-# List available models (OpenAI format)
+# List models (OpenAI format)
 curl http://localhost:11434/v1/models
 
 # Chat completion (OpenAI format)
 curl http://localhost:11434/v1/chat/completions -d '{
-  "model": "codero1-deepseekr1-coder-14b-preview",
+  "model": "your-model-name",
   "messages": [
-    {"role": "user", "content": "Hello!"}
+    {"role": "user", "content": "Write a Python function"}
   ],
-  "temperature": 0.1,
-  "stream": true
-}'
-
-# Text completion (OpenAI format)
-curl http://localhost:11434/v1/completions -d '{
-  "model": "codero1-deepseekr1-coder-14b-preview",
-  "prompt": "The capital of France is",
   "temperature": 0.7,
-  "max_tokens": 100
+  "max_tokens": 1000
 }'
 ```
 
-### With Visual Studio Code
+### **VS Code Integration**
 
-Configure VS Code or your IDE to use the proxy as the API endpoint:
+1. Install an OpenAI-compatible extension
+2. Set API endpoint to: `http://localhost:11434`
+3. Use any model name from your LM Studio
+4. Start coding with AI assistance! 🎉
 
-1. In VS Code settings, set the API endpoint to `http://localhost:11434`
-2. The proxy will automatically handle the `/v1/*` endpoints that VS Code expects
-3. Your requests will be forwarded directly to LM Studio
+---
 
-## API Translation vs Passthrough
+## 🎛️ **Configuration Options**
 
-### Translation Mode (`/api/*` endpoints)
-- **Input**: Ollama format requests
-- **Processing**: Converts request format, cleans model names, transforms responses
-- **Output**: Ollama format responses with timing estimates and metadata
+| **Flag**                 | **Default**             | **Description**                  |
+|--------------------------|-------------------------|----------------------------------|
+| `--listen`               | `0.0.0.0:11434`         | Address and port to listen on    |
+| `--lmstudio-url`         | `http://localhost:1234` | LM Studio API endpoint           |
+| `--no-log`               | `false`                 | Disable request/response logging |
+| `--load-timeout-seconds` | `5`                     | Model loading retry timeout      |
 
-### Passthrough Mode (`/v1/*` endpoints)
-- **Input**: OpenAI/LM Studio format requests
-- **Processing**: Direct forwarding to LM Studio (minimal processing)
-- **Output**: Native LM Studio responses
+---
 
-## Model Name Mapping
+## 🔧 **Troubleshooting**
 
-The proxy automatically cleans model names:
-- `deepseek-r1-distill-qwen-14b:2` → `deepseek-r1-distill-qwen-14b`
-- Adds `:latest` suffix for Ollama compatibility when needed
+### **Common Issues**
 
-## Response Enhancement (Translation Mode Only)
+**🔌 "Connection Refused"**
 
-- **Reasoning Content**: LM Studio's `reasoning_content` is merged with main `content`
-- **Timing Data**: Estimates `total_duration`, `load_duration`, `prompt_eval_duration`, etc.
-- **Context**: Provides placeholder context arrays for compatibility
-- **Token Counts**: Preserves usage statistics from LM Studio
+- Ensure LM Studio is running and accessible
+- Check firewall settings
+- Verify the `--lmstudio-url` parameter
 
-## Error Handling
+**🤖 "Model Not Found"**
 
-- **Model Not Found**: Returns appropriate format-specific error responses
-- **Unsupported Endpoints**: Returns HTTP 501 with descriptive error messages
-- **LM Studio Errors**: Forwards and translates error responses appropriately
+- Load a model in LM Studio first
+- Check available models: `curl http://localhost:11434/api/tags`
+- Verify model names match between tools
 
-## Logging
+**📝 "VS Code Not Working"**
 
-When logging is enabled (default), the proxy logs:
+- Ensure you're using `/v1/*` endpoints in VS Code settings
+- Check that the API endpoint is set to `http://localhost:11434`
+- Verify the model name exists in LM Studio
 
-```
-[PROXY] POST /v1/chat/completions - Body: {...}
-[PROXY] POST http://localhost:1234/v1/chat/completions - Request: {...}
-[PROXY] LM Studio response: {...} (took 45ms)
-[PROXY] GET /api/tags
-[PROXY] Ollama response: {...} (took 32ms)
-```
+**⏱️ "Slow Responses"**
 
-## Troubleshooting
+- Increase `--load-timeout-seconds` for slow model loading
+- Check LM Studio performance and hardware resources
+- Monitor logs for retry attempts
 
-### Visual Studio Code Issues
+---
 
-1. **"Unknown endpoint" errors**
-   - ✅ **Fixed in this version** - VS Code calls are now supported via `/v1/*` endpoints
-   - Make sure you're using the updated proxy code
+## 🌟 **Why This Proxy?**
 
-2. **Model not found in VS Code**
-   - Check that your model name in VS Code matches what's loaded in LM Studio
-   - Use `curl http://localhost:11434/v1/models` to see available models
+### **🎯 Universal Compatibility**
 
-### Common Issues
+- Works with **any Ollama client** without modification
+- Compatible with **VS Code, GitHub Copilot, and OpenAI tools**
+- **Single endpoint** for multiple API formats
 
-1. **Connection Refused**
-   - Ensure LM Studio is running and accessible
-   - Check the `--lmstudio-url` parameter
-   - Verify no firewall is blocking the connection
+### **🧠 Smart Translation**
 
-2. **Model Not Found**
-   - Make sure a model is loaded in LM Studio
-   - Check model names with `curl http://localhost:11434/api/tags` or `curl http://localhost:11434/v1/models`
+- **Preserves reasoning** from advanced models
+- **Accurate timing** and token counting
+- **Proper error handling** with helpful messages
 
-3. **Embedding Errors**
-   - LM Studio model must support embeddings
-   - Load an embedding model like `text-embedding-nomic-embed-text-v1.5`
+### **⚡ Performance**
 
-4. **Port Already in Use**
-   - Use `--listen` to specify a different port
-   - Kill any existing Ollama/proxy processes
+- **Rust-powered** for maximum speed and safety
+- **Automatic retries** for seamless experience
+- **Concurrent processing** for multiple clients
 
-### Debug Mode
+### **🛠️ Developer Friendly**
 
-Enable verbose logging to see all request/response details:
+- **Comprehensive logging** for debugging
+- **Flexible configuration** for any setup
+- **Open source** and easily extendable
 
-```bash
-# Logging is enabled by default
-./ollama-lmstudio-proxy-rust
+---
 
-# To disable logging
-./ollama-lmstudio-proxy-rust --no-log
-```
+## 📊 **Performance**
 
-## Development
+- **🚀 Low Latency**: Minimal overhead between client and LM Studio
+- **🔄 Auto-Recovery**: Intelligent retry logic for model loading
+- **📈 Scalable**: Handles multiple concurrent connections
+- **💾 Memory Efficient**: Rust's zero-cost abstractions
 
-### Project Structure
+---
 
-```
-src/
-├── main.rs          # Main proxy server implementation
-├── lib.rs           # Library functions (if needed)
-└── ...
-Cargo.toml           # Dependencies and project config
-README.md            # This file
-```
+## 🤝 **Contributing**
 
-### Key Components
+We welcome contributions! Whether it's:
 
-- **ProxyServer**: Main struct handling API translation and passthrough
-- **Translation Handlers**: Functions for Ollama → LM Studio conversion
-- **Passthrough Handler**: Direct forwarding for `/v1/*` endpoints
-- **Response Transformers**: Convert LM Studio responses to Ollama format
-- **Error Handling**: Graceful error responses and logging
+- 🐛 Bug fixes
+- ✨ New features
+- 📚 Documentation improvements
+- 🧪 Test coverage
 
-### Contributing
+---
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests if applicable
-5. Submit a pull request
+## 📜 **License**
 
-## License
+This project is licensed under the MIT License - see the [LICENSE]() file for details.
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+---
 
-## Acknowledgments
+## 🙏 **Acknowledgments**
 
-- [Anthropic](https://www.anthropic.com/) for creating Claude that coded this entire thing lol
-- [Ollama](https://ollama.ai/)
-- [LM Studio](https://lmstudio.ai/)
-- The Rust community
+- **[Ollama](https://ollama.ai/)** - For the excellent API design
+- **[LM Studio](https://lmstudio.ai/)** - For the powerful local LLM platform
+- **[Rust Community](https://www.rust-lang.org/)** - For the amazing ecosystem
+- **[Anthropic](https://www.anthropic.com/)** - For Claude's development assistance
+
+---
+
+**🎉 Transform your LM Studio into a universal AI backend today!**
+
+[⭐ Star this repo](https://github.com/your-username/ollama-lmstudio-proxy) • [🐛 Report Bug](https://github.com/your-username/ollama-lmstudio-proxy/issues) • [💡 Request Feature](https://github.com/your-username/ollama-lmstudio-proxy/issues)
