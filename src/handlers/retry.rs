@@ -132,7 +132,6 @@ where
 
 /// Simple retry wrapper for endpoints without specific models (like /api/tags)
 pub async fn with_simple_retry<F, Fut, T>(
-    server: &Arc<ProxyServer>,
     operation: F,
     cancellation_token: CancellationToken,
 ) -> Result<T, ProxyError>

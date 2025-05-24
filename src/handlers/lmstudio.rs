@@ -98,7 +98,7 @@ pub async fn handle_lmstudio_passthrough(
         with_retry_and_cancellation(&server, &model, operation, cancellation_token).await?
     } else {
         server.logger.log("Using simple retry for passthrough (no model specified)");
-        with_simple_retry(&server, operation, cancellation_token).await?
+        with_simple_retry(operation, cancellation_token).await?
     };
 
     let duration = start_time.elapsed();

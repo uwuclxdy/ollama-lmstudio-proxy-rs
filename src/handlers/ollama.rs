@@ -105,7 +105,7 @@ pub async fn handle_ollama_tags(
         }
     };
 
-    let result = with_simple_retry(&server, operation, cancellation_token).await?;
+    let result = with_simple_retry(operation, cancellation_token).await?;
     let duration = start_time.elapsed();
     server.logger.log(&format!("Ollama tags response completed (took {})", format_duration(duration)));
     Ok(json_response(&result))
