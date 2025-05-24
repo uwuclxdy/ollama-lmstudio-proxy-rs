@@ -6,8 +6,9 @@ use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::server::ProxyServer;
-use crate::utils::{format_duration, ProxyError};
+use crate::utils::{format_duration, ProxyError, clean_model_name};
 use crate::common::{CancellableRequest, handle_json_response};
+use crate::handlers::retry::with_simple_retry;
 use super::retry::with_retry_and_cancellation;
 use super::streaming::{is_streaming_request, handle_passthrough_streaming_response};
 use super::helpers::json_response;
@@ -21,6 +22,11 @@ pub async fn handle_lmstudio_passthrough(
     cancellation_token: CancellationToken,
 ) -> Result<warp::reply::Response, ProxyError> {
     let start_time = Instant::now();
+
+    // Try to extract model name from request body for retry logic
+    let model_name = body.get("model")
+        .and_then(|m| m.as_str())
+        .map(|m| clean_model_name(m));
 
     let operation = {
         let server = server.clone();
@@ -86,9 +92,16 @@ pub async fn handle_lmstudio_passthrough(
         }
     };
 
-    let result = with_retry_and_cancellation(&server, operation, cancellation_token).await?;
-    let duration = start_time.elapsed();
+    // Use model-specific retry if we have a model name, otherwise use simple retry
+    let result = if let Some(model) = model_name {
+        server.logger.log(&format!("Using model-specific retry for passthrough with model: {}", model));
+        with_retry_and_cancellation(&server, &model, operation, cancellation_token).await?
+    } else {
+        server.logger.log("Using simple retry for passthrough (no model specified)");
+        with_simple_retry(&server, operation, cancellation_token).await?
+    };
 
+    let duration = start_time.elapsed();
     server.logger.log(&format!("LM Studio passthrough completed (took {})", format_duration(duration)));
     Ok(result)
 }

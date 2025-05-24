@@ -6,6 +6,7 @@ use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::server::ProxyServer;
+use crate::handlers::retry::with_simple_retry;
 use crate::utils::{clean_model_name, format_duration, ProxyError};
 use crate::common::{CancellableRequest, handle_json_response};
 use super::retry::with_retry_and_cancellation;
@@ -44,21 +45,21 @@ pub async fn handle_ollama_tags(
                 // Handle different error types properly instead of always returning empty list
                 if !response.status().is_success() {
                     let status = response.status();
-                    if status.as_u16() == 404 || status.as_u16() == 503 {
+                    return if status.as_u16() == 404 || status.as_u16() == 503 {
                         // Service unavailable or not found - return empty list (LM Studio might be starting up)
                         server.logger.log(&format!("LM Studio not available ({}), returning empty model list", status));
                         let empty_response = json!({
                             "models": []
                         });
-                        return Ok(empty_response);
+                        Ok(empty_response)
                     } else {
                         // Other errors - return proper error response
                         let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
                         server.logger.log(&format!("LM Studio error ({}): {}", status, error_text));
-                        return Err(ProxyError::new(
+                        Err(ProxyError::new(
                             format!("LM Studio error: {}", error_text),
                             status.as_u16()
-                        ));
+                        ))
                     }
                 }
 
@@ -104,7 +105,7 @@ pub async fn handle_ollama_tags(
         }
     };
 
-    let result = with_retry_and_cancellation(&server, operation, cancellation_token).await?;
+    let result = with_simple_retry(&server, operation, cancellation_token).await?;
     let duration = start_time.elapsed();
     server.logger.log(&format!("Ollama tags response completed (took {})", format_duration(duration)));
     Ok(json_response(&result))
@@ -117,6 +118,10 @@ pub async fn handle_ollama_chat(
     cancellation_token: CancellationToken
 ) -> Result<warp::reply::Response, ProxyError> {
     let start_time = Instant::now();
+
+    // Extract model name early for retry logic
+    let model = body.get("model").and_then(|m| m.as_str())
+        .ok_or_else(|| ProxyError::bad_request("Missing 'model' field"))?;
 
     let operation = {
         let server = server.clone();
@@ -186,7 +191,7 @@ pub async fn handle_ollama_chat(
         }
     };
 
-    let result = with_retry_and_cancellation(&server, operation, cancellation_token).await?;
+    let result = with_retry_and_cancellation(&server, model, operation, cancellation_token).await?;
     let duration = start_time.elapsed();
 
     server.logger.log(&format!("Ollama chat response completed (took {})", format_duration(duration)));
@@ -200,6 +205,10 @@ pub async fn handle_ollama_generate(
     cancellation_token: CancellationToken
 ) -> Result<warp::reply::Response, ProxyError> {
     let start_time = Instant::now();
+
+    // Extract model name early for retry logic
+    let model = body.get("model").and_then(|m| m.as_str())
+        .ok_or_else(|| ProxyError::bad_request("Missing 'model' field"))?;
 
     let operation = {
         let server = server.clone();
@@ -266,7 +275,7 @@ pub async fn handle_ollama_generate(
         }
     };
 
-    let result = with_retry_and_cancellation(&server, operation, cancellation_token).await?;
+    let result = with_retry_and_cancellation(&server, model, operation, cancellation_token).await?;
     let duration = start_time.elapsed();
 
     server.logger.log(&format!("Ollama generate response completed (took {})", format_duration(duration)));
@@ -280,6 +289,10 @@ pub async fn handle_ollama_embeddings(
     cancellation_token: CancellationToken
 ) -> Result<warp::reply::Response, ProxyError> {
     let start_time = Instant::now();
+
+    // Extract model name early for retry logic
+    let model = body.get("model").and_then(|m| m.as_str())
+        .ok_or_else(|| ProxyError::bad_request("Missing 'model' field"))?;
 
     let operation = {
         let server = server.clone();
@@ -329,7 +342,7 @@ pub async fn handle_ollama_embeddings(
         }
     };
 
-    let result = with_retry_and_cancellation(&server, operation, cancellation_token).await?;
+    let result = with_retry_and_cancellation(&server, model, operation, cancellation_token).await?;
     let duration = start_time.elapsed();
 
     server.logger.log(&format!("Ollama embeddings response completed (took {})", format_duration(duration)));
