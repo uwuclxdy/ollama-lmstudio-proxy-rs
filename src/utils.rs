@@ -201,9 +201,15 @@ pub fn is_model_loading_error(message: &str) -> bool {
 
 /// Fast duration formatting
 pub fn format_duration(duration: Duration) -> String {
-    let total_ms = duration.as_micros() as f64 / 1000.0;
+    let total_micros = duration.as_micros();
 
-    format!("{:.3}ms", total_ms)
+    if total_micros < 1_000 { // Less than 1ms
+        format!("{}µs", total_micros)
+    } else if total_micros < 1_000_000 { // Less than 1s
+        format!("{:.3}ms", total_micros as f64 / 1_000.0)
+    } else { // 1s or more
+        format!("{:.3}s", total_micros as f64 / 1_000_000.0)
+    }
 }
 
 /// Validate model name and return warnings for potentially malformed names
