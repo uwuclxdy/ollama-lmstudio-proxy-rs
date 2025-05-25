@@ -1,4 +1,4 @@
-// src/handlers/lmstudio.rs - LM Studio passthrough with model name resolution
+// src/handlers/lmstudio.rs - LM Studio passthrough with centralized model resolution
 
 use serde_json::Value;
 use std::sync::Arc;
@@ -6,72 +6,12 @@ use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::server::ProxyServer;
-use crate::utils::{format_duration, ProxyError, clean_model_name};
+use crate::utils::{format_duration, ProxyError, ModelResolver};
 use crate::common::{CancellableRequest, handle_json_response};
 use crate::handlers::retry::with_simple_retry;
-use crate::handlers::helpers::find_best_model_match;
 use super::retry::with_retry_and_cancellation;
 use super::streaming::{is_streaming_request, handle_passthrough_streaming_response};
 use super::helpers::json_response;
-
-/// Resolve model name for LM Studio passthrough (same logic as in ollama.rs)
-async fn resolve_model_name_for_passthrough(
-    server: &ProxyServer,
-    ollama_model: &str,
-    cancellation_token: CancellationToken,
-) -> Result<String, ProxyError> {
-    let cleaned_ollama = clean_model_name(ollama_model);
-
-    // Get available models from LM Studio
-    let url = format!("{}/v1/models", server.config.lmstudio_url);
-
-    let request = CancellableRequest::new(
-        server.client.clone(),
-        cancellation_token,
-        server.logger.clone(),
-        server.config.request_timeout_seconds
-    );
-
-    let response = match request.make_request(reqwest::Method::GET, &url, None).await {
-        Ok(response) => response,
-        Err(_) => {
-            // If we can't fetch models, use cleaned name as fallback
-            server.logger.log(&format!("⚠️  Cannot fetch LM Studio models for passthrough, using fallback: '{}'", cleaned_ollama));
-            return Ok(cleaned_ollama);
-        }
-    };
-
-    if !response.status().is_success() {
-        server.logger.log(&format!("⚠️  LM Studio models endpoint returned {} for passthrough, using fallback: '{}'", response.status(), cleaned_ollama));
-        return Ok(cleaned_ollama);
-    }
-
-    let models_response: Value = match response.json().await {
-        Ok(json) => json,
-        Err(_) => {
-            server.logger.log(&format!("⚠️  Cannot parse LM Studio models response for passthrough, using fallback: '{}'", cleaned_ollama));
-            return Ok(cleaned_ollama);
-        }
-    };
-
-    let mut available_models = Vec::new();
-    if let Some(data) = models_response.get("data").and_then(|d| d.as_array()) {
-        for model in data {
-            if let Some(model_id) = model.get("id").and_then(|id| id.as_str()) {
-                available_models.push(model_id.to_string());
-            }
-        }
-    }
-
-    // Find the best match (same logic as in ollama.rs)
-    if let Some(matched_model) = find_best_model_match(&cleaned_ollama, &available_models) {
-        server.logger.log(&format!("✅ Resolved passthrough '{}' -> '{}'", ollama_model, matched_model));
-        Ok(matched_model)
-    } else {
-        server.logger.log(&format!("⚠️  No passthrough match found for '{}', using cleaned name '{}'", ollama_model, cleaned_ollama));
-        Ok(cleaned_ollama)
-    }
-}
 
 /// Handle direct LM Studio API passthrough with streaming, cancellation, and model name resolution
 pub async fn handle_lmstudio_passthrough(
@@ -105,9 +45,10 @@ pub async fn handle_lmstudio_passthrough(
             let original_model_name = original_model_name.clone();
 
             async move {
-                // 🔑 KEY FIX: Resolve model name if present in passthrough request
+                // Resolve model name if present in passthrough request
                 if let Some(ref model_name) = original_model_name {
-                    let resolved_model = resolve_model_name_for_passthrough(&server, model_name, cancellation_token.clone()).await?;
+                    let resolver = ModelResolver::new(server.clone());
+                    let resolved_model = resolver.resolve_model_name(model_name, cancellation_token.clone()).await?;
 
                     // Update the request body with the resolved model name
                     if let Some(body_obj) = body.as_object_mut() {
@@ -139,8 +80,7 @@ pub async fn handle_lmstudio_passthrough(
                 let request_body = if method == "GET" || method == "DELETE" {
                     None
                 } else {
-                    // 🎯 PARAMETER FIX: Pass request body as-is for passthrough
-                    // LM Studio will use its GUI defaults for any missing parameters
+                    // Pass request body as-is for passthrough - LM Studio will use its GUI defaults
                     Some(body.clone())
                 };
 

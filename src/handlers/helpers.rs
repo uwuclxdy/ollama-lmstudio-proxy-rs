@@ -1,6 +1,8 @@
-// src/handlers/helpers.rs - Consolidated helper functions and utilities
+// src/handlers/helpers.rs - Helper functions and utilities
 
-use serde_json::{json, Value};
+use once_cell::sync::Lazy;
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use warp::Reply;
 
@@ -12,74 +14,60 @@ pub fn json_response(value: &Value) -> warp::reply::Response {
     ).into_response()
 }
 
+// ===== OPTIMIZED MODEL METADATA LOOKUPS =====
+
+/// Model family lookup table for O(1) access
+static MODEL_FAMILIES: Lazy<HashMap<&'static str, (&'static str, Vec<&'static str>)>> = Lazy::new(|| {
+    let mut map = HashMap::new();
+    map.insert("llama", ("llama", vec!["llama"]));
+    map.insert("mistral", ("mistral", vec!["mistral"]));
+    map.insert("qwen", ("qwen2", vec!["qwen2"]));
+    map.insert("deepseek", ("llama", vec!["llama"]));
+    map.insert("gemma", ("gemma", vec!["gemma"]));
+    map.insert("phi", ("phi", vec!["phi"]));
+    map.insert("codellama", ("llama", vec!["llama"]));
+    map.insert("vicuna", ("llama", vec!["llama"]));
+    map.insert("alpaca", ("llama", vec!["llama"]));
+    map
+});
+
+/// Model size estimates for parameter counts
+static SIZE_ESTIMATES: Lazy<HashMap<&'static str, u64>> = Lazy::new(|| {
+    let mut map = HashMap::new();
+    map.insert("0.5B", 500_000_000);
+    map.insert("1.5B", 1_000_000_000);
+    map.insert("2B", 1_500_000_000);
+    map.insert("3B", 2_000_000_000);
+    map.insert("7B", 4_000_000_000);
+    map.insert("8B", 5_000_000_000);
+    map.insert("9B", 5_500_000_000);
+    map.insert("13B", 8_000_000_000);
+    map.insert("14B", 8_500_000_000);
+    map.insert("27B", 16_000_000_000);
+    map.insert("30B", 18_000_000_000);
+    map.insert("32B", 20_000_000_000);
+    map.insert("70B", 40_000_000_000);
+    map
+});
+
+// ===== MODEL METADATA FUNCTIONS =====
+
 /// Determine model family and families array based on model name
 pub fn determine_model_family(model_name: &str) -> (&'static str, Vec<&'static str>) {
     let lower_name = model_name.to_lowercase();
 
-    match lower_name {
-        name if name.contains("llama") => ("llama", vec!["llama"]),
-        name if name.contains("mistral") => ("mistral", vec!["mistral"]),
-        name if name.contains("qwen") => ("qwen2", vec!["qwen2"]),
-        name if name.contains("deepseek") => ("llama", vec!["llama"]),
-        name if name.contains("gemma") => ("gemma", vec!["gemma"]),
-        name if name.contains("phi") => ("phi", vec!["phi"]),
-        name if name.contains("codellama") => ("llama", vec!["llama"]),
-        name if name.contains("vicuna") => ("llama", vec!["llama"]),
-        name if name.contains("alpaca") => ("llama", vec!["llama"]),
-        _ => ("llama", vec!["llama"]),
-    }
-}
-
-/// Parameter size detection lookup table
-/// todo: replace with a more efficient lookup mechanism
-pub const PARAMETER_SIZES: &[(&str, &str)] = &[
-    ("0.5b", "0.5B"),
-    ("1.5b", "1.5B"),
-    ("2b", "2B"),
-    ("3b", "3B"),
-    ("7b", "7B"),
-    ("8b", "8B"),
-    ("9b", "9B"),
-    ("13b", "13B"),
-    ("14b", "14B"),
-    ("27b", "27B"),
-    ("30b", "30B"),
-    ("32b", "32B"),
-    ("70b", "70B"),
-];
-
-/// Determine parameter size based on model name
-pub fn determine_parameter_size(model_name: &str) -> &'static str {
-    let lower_name = model_name.to_lowercase();
-
-    // Use lookup table instead of long if-else chain
-    for (pattern, size) in PARAMETER_SIZES {
+    for (pattern, (family, families)) in MODEL_FAMILIES.iter() {
         if lower_name.contains(pattern) {
-            return size;
+            return (*family, families.clone());
         }
     }
 
-    "7B" // Fallback
+    ("llama", vec!["llama"]) // Default fallback
 }
 
 /// Estimate model size in bytes based on parameter size
 pub fn estimate_model_size(parameter_size: &str) -> u64 {
-    match parameter_size {
-        "0.5B" => 500_000_000,
-        "1.5B" => 1_000_000_000,
-        "2B" => 1_500_000_000,
-        "3B" => 2_000_000_000,
-        "7B" => 4_000_000_000,
-        "8B" => 5_000_000_000,
-        "9B" => 5_500_000_000,
-        "13B" => 8_000_000_000,
-        "14B" => 8_500_000_000,
-        "27B" => 16_000_000_000,
-        "30B" => 18_000_000_000,
-        "32B" => 20_000_000_000,
-        "70B" => 40_000_000_000,
-        _ => 4_000_000_000,
-    }
+    SIZE_ESTIMATES.get(parameter_size).copied().unwrap_or(4_000_000_000)
 }
 
 /// Determine model capabilities based on model name
@@ -102,79 +90,63 @@ pub fn determine_model_capabilities(model_name: &str) -> Vec<&'static str> {
     capabilities
 }
 
-/// Find the best matching LM Studio model for an Ollama model name (duplicate from ollama.rs)
-pub fn find_best_model_match(ollama_name: &str, available_models: &[String]) -> Option<String> {
-    let lower_ollama = ollama_name.to_lowercase();
+// ===== REQUEST BUILDING UTILITIES =====
 
-    // Direct match first
-    for model in available_models {
-        if model.to_lowercase() == lower_ollama {
-            return Some(model.clone());
+/// Simplified request builder for LM Studio API calls
+/// Only includes parameters that were explicitly provided by the client
+pub fn build_lm_studio_request(base_params: Map<String, Value>, ollama_options: Option<&Value>) -> Value {
+    let mut request = base_params;
+
+    if let Some(options) = ollama_options {
+        // Temperature
+        if let Some(temp) = options.get("temperature") {
+            request.insert("temperature".to_string(), temp.clone());
+        }
+
+        // Max tokens (Ollama uses "num_predict", LM Studio uses "max_tokens")
+        if let Some(max_tokens) = options.get("num_predict") {
+            request.insert("max_tokens".to_string(), max_tokens.clone());
+        }
+
+        // Top-p
+        if let Some(top_p) = options.get("top_p") {
+            request.insert("top_p".to_string(), top_p.clone());
+        }
+
+        // Top-k
+        if let Some(top_k) = options.get("top_k") {
+            request.insert("top_k".to_string(), top_k.clone());
+        }
+
+        // Presence penalty
+        if let Some(presence_penalty) = options.get("presence_penalty") {
+            request.insert("presence_penalty".to_string(), presence_penalty.clone());
+        }
+
+        // Frequency penalty
+        if let Some(frequency_penalty) = options.get("frequency_penalty") {
+            request.insert("frequency_penalty".to_string(), frequency_penalty.clone());
+        }
+
+        // Repeat penalty (Ollama-specific, map to frequency_penalty if not already set)
+        if let Some(repeat_penalty) = options.get("repeat_penalty") {
+            if !request.contains_key("frequency_penalty") {
+                request.insert("frequency_penalty".to_string(), repeat_penalty.clone());
+            }
+        }
+
+        // Seed
+        if let Some(seed) = options.get("seed") {
+            request.insert("seed".to_string(), seed.clone());
+        }
+
+        // Stop sequences
+        if let Some(stop) = options.get("stop") {
+            request.insert("stop".to_string(), stop.clone());
         }
     }
 
-    // Pattern matching for common model families
-    for model in available_models {
-        let lower_model = model.to_lowercase();
-
-        // Llama family matching
-        if lower_ollama.contains("llama") && lower_model.contains("llama") {
-            if models_match_size(&lower_ollama, &lower_model) {
-                return Some(model.clone());
-            }
-        }
-
-        // Qwen family matching
-        else if lower_ollama.contains("qwen") && lower_model.contains("qwen") {
-            if models_match_size(&lower_ollama, &lower_model) {
-                return Some(model.clone());
-            }
-        }
-
-        // Mistral family matching
-        else if lower_ollama.contains("mistral") && lower_model.contains("mistral") {
-            if models_match_size(&lower_ollama, &lower_model) {
-                return Some(model.clone());
-            }
-        }
-
-        // Gemma family matching
-        else if lower_ollama.contains("gemma") && lower_model.contains("gemma") {
-            if models_match_size(&lower_ollama, &lower_model) {
-                return Some(model.clone());
-            }
-        }
-
-        // Phi family matching
-        else if lower_ollama.contains("phi") && lower_model.contains("phi") {
-            if models_match_size(&lower_ollama, &lower_model) {
-                return Some(model.clone());
-            }
-        }
-
-        // DeepSeek family matching
-        else if lower_ollama.contains("deepseek") && lower_model.contains("deepseek") {
-            if models_match_size(&lower_ollama, &lower_model) {
-                return Some(model.clone());
-            }
-        }
-    }
-
-    None
-}
-
-/// Check if two model names refer to the same model size (duplicate from ollama.rs)
-pub fn models_match_size(name1: &str, name2: &str) -> bool {
-    let sizes = ["0.5b", "1.5b", "2b", "3b", "7b", "8b", "9b", "11b", "13b", "14b", "27b", "30b", "32b", "70b"];
-
-    for size in &sizes {
-        if name1.contains(size) && name2.contains(size) {
-            return true;
-        }
-    }
-
-    // If no size found in either, consider them matching (size unknown)
-    true
+    Value::Object(request)
 }
 
 // ===== CHUNK CREATION UTILITIES =====
@@ -221,7 +193,7 @@ pub fn create_error_chunk(model: &str, error_message: &str, is_chat: bool) -> Va
     }
 }
 
-/// Create a clearer cancellation chunk that indicates cancellation, not generated content
+/// Create a cancellation chunk that indicates cancellation, not generated content
 pub fn create_cancellation_chunk(model: &str, partial_content: &str, duration: Duration, tokens_generated: u64, is_chat: bool) -> Value {
     let cancellation_message = if partial_content.is_empty() {
         "🚫 Request cancelled - no content was generated due to client disconnection".to_string()
@@ -314,7 +286,7 @@ pub fn transform_chat_response(lm_response: &Value, model: &str, messages: &[Val
                 .to_string();
 
             // Merge reasoning_content if present
-            // todo: workaround until ollama supports reasoning_content
+            // todo: implement reasoning_content once ollama officially supports it
             if let Some(reasoning) = first_choice.get("message")
                 .and_then(|m| m.get("reasoning_content"))
                 .and_then(|r| r.as_str()) {

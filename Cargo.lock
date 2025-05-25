@@ -1005,6 +1005,7 @@ dependencies = [
  "clap",
  "futures-util",
  "md5",
+ "once_cell",
  "reqwest",
  "serde_json",
  "tokio",

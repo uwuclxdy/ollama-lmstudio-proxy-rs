@@ -1,8 +1,4 @@
-// src/handlers/ollama.rs - Fixed Ollama API handlers with proper model name resolution
-//
-// KEY FIX: Instead of complex retry/switching logic, we now simply resolve
-// Ollama model names to actual LM Studio model names before sending requests.
-// LM Studio will automatically switch models when we send the correct name.
+// src/handlers/ollama.rs - Simplified Ollama API handlers using centralized model resolver
 
 use serde_json::{json, Value, Map};
 use std::sync::Arc;
@@ -11,136 +7,16 @@ use tokio_util::sync::CancellationToken;
 
 use crate::server::ProxyServer;
 use crate::handlers::retry::with_simple_retry;
-use crate::utils::{clean_model_name, format_duration, ProxyError};
+use crate::utils::{clean_model_name, determine_parameter_size, format_duration, ProxyError, ModelResolver};
 use crate::common::{CancellableRequest, handle_json_response};
 use super::retry::with_retry_and_cancellation;
 use super::streaming::{is_streaming_request, handle_streaming_response};
 use super::helpers::{
-    json_response, determine_model_family, determine_parameter_size,
+    json_response, determine_model_family,
     estimate_model_size, determine_model_capabilities,
-    transform_chat_response, transform_generate_response, transform_embeddings_response, find_best_model_match
+    transform_chat_response, transform_generate_response, transform_embeddings_response,
+    build_lm_studio_request
 };
-
-/// Helper function to build LM Studio request with only provided parameters
-fn build_lm_request_object(base_params: Map<String, Value>, ollama_options: Option<&Value>) -> Value {
-    let mut request = Map::new();
-
-    // Add base parameters (model, messages/prompt, stream)
-    for (key, value) in base_params {
-        request.insert(key, value);
-    }
-
-    // Only add optional parameters if they were provided by the Ollama client
-    if let Some(options) = ollama_options {
-        // Temperature
-        if let Some(temp) = options.get("temperature") {
-            request.insert("temperature".to_string(), temp.clone());
-        }
-
-        // Max tokens (Ollama uses "num_predict", LM Studio uses "max_tokens")
-        if let Some(max_tokens) = options.get("num_predict") {
-            request.insert("max_tokens".to_string(), max_tokens.clone());
-        }
-
-        // Top-p
-        if let Some(top_p) = options.get("top_p") {
-            request.insert("top_p".to_string(), top_p.clone());
-        }
-
-        // Top-k
-        if let Some(top_k) = options.get("top_k") {
-            request.insert("top_k".to_string(), top_k.clone());
-        }
-
-        // Presence penalty
-        if let Some(presence_penalty) = options.get("presence_penalty") {
-            request.insert("presence_penalty".to_string(), presence_penalty.clone());
-        }
-
-        // Frequency penalty
-        if let Some(frequency_penalty) = options.get("frequency_penalty") {
-            request.insert("frequency_penalty".to_string(), frequency_penalty.clone());
-        }
-
-        // Repeat penalty (Ollama-specific, map to frequency_penalty if not already set)
-        if let Some(repeat_penalty) = options.get("repeat_penalty") {
-            if !request.contains_key("frequency_penalty") {
-                request.insert("frequency_penalty".to_string(), repeat_penalty.clone());
-            }
-        }
-
-        // Seed
-        if let Some(seed) = options.get("seed") {
-            request.insert("seed".to_string(), seed.clone());
-        }
-
-        // Stop sequences
-        if let Some(stop) = options.get("stop") {
-            request.insert("stop".to_string(), stop.clone());
-        }
-    }
-
-    Value::Object(request)
-}
-
-/// Resolve Ollama model name to actual LM Studio model name
-async fn resolve_model_name(
-    server: &ProxyServer,
-    ollama_model: &str,
-    cancellation_token: CancellationToken,
-) -> Result<String, ProxyError> {
-    let cleaned_ollama = clean_model_name(ollama_model);
-
-    // Get available models from LM Studio
-    let url = format!("{}/v1/models", server.config.lmstudio_url);
-
-    let request = CancellableRequest::new(
-        server.client.clone(),
-        cancellation_token,
-        server.logger.clone(),
-        server.config.request_timeout_seconds
-    );
-
-    let response = match request.make_request(reqwest::Method::GET, &url, None).await {
-        Ok(response) => response,
-        Err(_) => {
-            // If we can't fetch models, use cleaned name as fallback
-            server.logger.log(&format!("⚠️  Cannot fetch LM Studio models, using fallback: '{}'", cleaned_ollama));
-            return Ok(cleaned_ollama);
-        }
-    };
-
-    if !response.status().is_success() {
-        server.logger.log(&format!("⚠️  LM Studio models endpoint returned {}, using fallback: '{}'", response.status(), cleaned_ollama));
-        return Ok(cleaned_ollama);
-    }
-
-    let models_response: Value = match response.json().await {
-        Ok(json) => json,
-        Err(_) => {
-            server.logger.log(&format!("⚠️  Cannot parse LM Studio models response, using fallback: '{}'", cleaned_ollama));
-            return Ok(cleaned_ollama);
-        }
-    };
-
-    let mut available_models = Vec::new();
-    if let Some(data) = models_response.get("data").and_then(|d| d.as_array()) {
-        for model in data {
-            if let Some(model_id) = model.get("id").and_then(|id| id.as_str()) {
-                available_models.push(model_id.to_string());
-            }
-        }
-    }
-
-    // Find the best match
-    if let Some(matched_model) = find_best_model_match(&cleaned_ollama, &available_models) {
-        server.logger.log(&format!("✅ Resolved '{}' -> '{}'", ollama_model, matched_model));
-        Ok(matched_model)
-    } else {
-        server.logger.log(&format!("⚠️  No match found for '{}', using cleaned name '{}'", ollama_model, cleaned_ollama));
-        Ok(cleaned_ollama)
-    }
-}
 
 /// Handle GET /api/tags - list available models with cancellation support
 pub async fn handle_ollama_tags(
@@ -261,16 +137,17 @@ pub async fn handle_ollama_chat(
                     .ok_or_else(|| ProxyError::bad_request("Missing 'messages' field"))?;
                 let stream = is_streaming_request(&body);
 
-                // 🔑 KEY FIX: Resolve to actual LM Studio model name
-                let lmstudio_model = resolve_model_name(&server, model, cancellation_token.clone()).await?;
+                // Use centralized model resolver
+                let resolver = ModelResolver::new(server.clone());
+                let lmstudio_model = resolver.resolve_model_name(model, cancellation_token.clone()).await?;
 
-                // 🎯 PARAMETER FIX: Build request with only provided parameters
+                // Build request with only provided parameters
                 let mut base_params = Map::new();
                 base_params.insert("model".to_string(), json!(lmstudio_model));
                 base_params.insert("messages".to_string(), json!(messages));
                 base_params.insert("stream".to_string(), json!(stream));
 
-                let lm_request = build_lm_request_object(base_params, body.get("options"));
+                let lm_request = build_lm_studio_request(base_params, body.get("options"));
 
                 let request = CancellableRequest::new(
                     server.client.clone(),
@@ -347,16 +224,17 @@ pub async fn handle_ollama_generate(
                     .ok_or_else(|| ProxyError::bad_request("Missing 'prompt' field"))?;
                 let stream = is_streaming_request(&body);
 
-                // 🔑 KEY FIX: Resolve to actual LM Studio model name
-                let lmstudio_model = resolve_model_name(&server, model, cancellation_token.clone()).await?;
+                // Use centralized model resolver
+                let resolver = ModelResolver::new(server.clone());
+                let lmstudio_model = resolver.resolve_model_name(model, cancellation_token.clone()).await?;
 
-                // 🎯 PARAMETER FIX: Build request with only provided parameters
+                // Build request with only provided parameters
                 let mut base_params = Map::new();
                 base_params.insert("model".to_string(), json!(lmstudio_model));
                 base_params.insert("prompt".to_string(), json!(prompt));
                 base_params.insert("stream".to_string(), json!(stream));
 
-                let lm_request = build_lm_request_object(base_params, body.get("options"));
+                let lm_request = build_lm_studio_request(base_params, body.get("options"));
 
                 let request = CancellableRequest::new(
                     server.client.clone(),
@@ -430,10 +308,11 @@ pub async fn handle_ollama_embeddings(
                 let input = body.get("input").or_else(|| body.get("prompt"))
                     .ok_or_else(|| ProxyError::bad_request("Missing 'input' or 'prompt' field"))?;
 
-                // 🔑 KEY FIX: Resolve to actual LM Studio model name
-                let lmstudio_model = resolve_model_name(&server, model, cancellation_token.clone()).await?;
+                // Use centralized model resolver
+                let resolver = ModelResolver::new(server.clone());
+                let lmstudio_model = resolver.resolve_model_name(model, cancellation_token.clone()).await?;
 
-                // 🎯 PARAMETER FIX: Minimal request for embeddings (no optional parameters needed)
+                // Minimal request for embeddings (no optional parameters needed)
                 let lm_request = json!({
                     "model": lmstudio_model,
                     "input": input
@@ -514,13 +393,7 @@ pub async fn handle_ollama_show(body: Value) -> Result<warp::reply::Response, Pr
         _ => ("llama", "7B"),
     };
 
-    let size_in_bytes = if let Some(num_str) = parameter_size.trim_end_matches(&['B', 'b']).parse::<f64>().ok() {
-        let billions = num_str;
-        let approx_bytes = billions * 600_000_000.0;
-        approx_bytes as u64
-    } else {
-        4_000_000_000u64
-    };
+    let size_in_bytes = estimate_model_size(parameter_size);
 
     let response = json!({
         "modelfile": format!("# Modelfile for {}\nFROM {}\nPARAMETER temperature 0.7\nPARAMETER top_p 0.9\nPARAMETER top_k 40", model, model),
@@ -557,8 +430,8 @@ pub async fn handle_ollama_show(body: Value) -> Result<warp::reply::Response, Pr
 /// Handle GET /api/version - return version info
 pub async fn handle_ollama_version() -> Result<warp::reply::Response, ProxyError> {
     let response = json!({
-            "version": crate::VERSION,
-        });
+        "version": crate::VERSION,
+    });
     Ok(json_response(&response))
 }
 

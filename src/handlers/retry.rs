@@ -1,6 +1,4 @@
-// src/handlers/retry.rs - Simplified retry logic with minimal test requests
-//
-// PARAMETER FIX: Remove hardcoded parameter defaults from model loading triggers
+// src/handlers/retry.rs - Simplified retry logic with minimal test requests and no hardcoded parameters
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,7 +11,7 @@ use crate::utils::{is_model_loading_error, ProxyError, clean_model_name};
 use crate::common::CancellableRequest;
 
 /// Simple model loading trigger with truly minimal request
-/// This is now much simpler since model name resolution handles the main switching
+/// No hardcoded parameters - let LM Studio use its GUI defaults
 pub async fn trigger_model_loading(
     server: &ProxyServer,
     model_name: &str,
@@ -22,7 +20,7 @@ pub async fn trigger_model_loading(
     let cleaned_model = clean_model_name(model_name);
     server.logger.log(&format!("Attempting to trigger loading for model: {}", cleaned_model));
 
-    // 🎯 PARAMETER FIX: Make truly minimal chat completion request 
+    // Make truly minimal chat completion request
     // Let LM Studio use its GUI-configured defaults for all parameters
     let url = format!("{}/v1/chat/completions", server.config.lmstudio_url);
 
@@ -34,7 +32,7 @@ pub async fn trigger_model_loading(
                 "content": "hi"
             }
         ]
-        // 🔑 NO other parameters - let LM Studio use GUI defaults
+        // NO other parameters - let LM Studio use GUI defaults
         // This includes: temperature, max_tokens, top_p, top_k, etc.
     });
 
@@ -78,7 +76,7 @@ pub async fn trigger_model_loading(
     }
 }
 
-/// Simplified retry wrapper - now mainly for handling LM Studio startup issues
+/// Simplified retry wrapper - mainly for handling LM Studio startup issues
 /// Since we resolve model names properly, most model switching issues are eliminated
 pub async fn with_retry_and_cancellation<F, Fut, T>(
     server: &Arc<ProxyServer>,
