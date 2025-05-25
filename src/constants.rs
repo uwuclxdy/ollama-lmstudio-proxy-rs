@@ -1,9 +1,47 @@
-// src/constants.rs - Optimized constants for single-client use
+// src/constants.rs - Runtime configurable constants
 
-/// Buffer and streaming limits
-pub const MAX_BUFFER_SIZE: usize = 64 * 1024; // 64KB max buffer for streaming
-pub const MAX_CHUNK_COUNT: u64 = 5_000; // Maximum chunks per stream
-pub const MAX_PARTIAL_CONTENT_SIZE: usize = 5_000; // Max partial content tracking
+use std::sync::OnceLock;
+
+/// Global configuration that can be set at runtime
+#[derive(Debug, Clone)]
+pub struct RuntimeConfig {
+    pub max_buffer_size: usize,
+    pub max_chunk_count: u64,
+    pub max_partial_content_size: usize,
+    pub max_request_size_bytes: usize,
+    pub string_buffer_size: usize,
+    pub enable_metrics: bool,
+    pub enable_chunk_recovery: bool,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            max_buffer_size: 256 * 1024, // 256KB default
+            max_chunk_count: 50_000,
+            max_partial_content_size: 50_000,
+            max_request_size_bytes: 500 * 1024 * 1024, // 500MB default
+            string_buffer_size: 2048,
+            enable_metrics: true,
+            enable_chunk_recovery: true,
+        }
+    }
+}
+
+static RUNTIME_CONFIG: OnceLock<RuntimeConfig> = OnceLock::new();
+
+/// Initialize runtime configuration
+pub fn init_runtime_config(config: RuntimeConfig) {
+    RUNTIME_CONFIG.set(config).ok();
+}
+
+/// Get current runtime configuration
+pub fn get_runtime_config() -> &'static RuntimeConfig {
+    RUNTIME_CONFIG.get().unwrap_or_else(|| {
+        static DEFAULT: OnceLock<RuntimeConfig> = OnceLock::new();
+        DEFAULT.get_or_init(RuntimeConfig::default)
+    })
+}
 
 /// Timing and performance constants
 pub const TOKEN_TO_CHAR_RATIO: f64 = 0.25;
@@ -11,11 +49,8 @@ pub const DEFAULT_LOAD_DURATION_NS: u64 = 1_000_000;
 pub const TIMING_EVAL_RATIO: u64 = 2;
 pub const TIMING_PROMPT_RATIO: u64 = 4;
 
-/// Model size estimates in bytes
+/// Default model size estimate
 pub const DEFAULT_MODEL_SIZE_BYTES: u64 = 4_000_000_000;
-
-/// Request limits
-pub const MAX_REQUEST_SIZE_BYTES: usize = 100 * 1024 * 1024; // 100MB
 
 /// Response headers
 pub const CONTENT_TYPE_JSON: &str = "application/json; charset=utf-8";
@@ -42,8 +77,9 @@ pub const ERROR_CHUNK_LIMIT: &str = "Stream exceeded maximum chunk limit";
 pub const ERROR_TIMEOUT: &str = "Stream timeout";
 pub const ERROR_CANCELLED: &str = "Request cancelled by client";
 pub const ERROR_LM_STUDIO_UNAVAILABLE: &str = "LM Studio not available";
+pub const ERROR_REQUEST_TOO_LARGE: &str = "Request body too large";
 
-/// SSE parsing
+/// SSE parsing constants
 pub const SSE_DATA_PREFIX: &str = "data: ";
 pub const SSE_DONE_MESSAGE: &str = "[DONE]";
 pub const SSE_MESSAGE_BOUNDARY: &str = "\n\n";
@@ -54,9 +90,7 @@ pub const LOG_PREFIX_SUCCESS: &str = "✅";
 pub const LOG_PREFIX_ERROR: &str = "❌";
 pub const LOG_PREFIX_WARNING: &str = "⚠️";
 pub const LOG_PREFIX_CANCEL: &str = "🚫";
+pub const LOG_PREFIX_METRICS: &str = "📊";
 
 /// Default context array for generate responses
 pub const DEFAULT_CONTEXT: [u32; 3] = [1, 2, 3];
-
-/// String buffer size for reusable operations
-pub const STRING_BUFFER_SIZE: usize = 512;

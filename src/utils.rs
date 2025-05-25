@@ -1,4 +1,4 @@
-// src/utils.rs - Optimized utilities with macros and efficient string handling
+// src/utils.rs - Consolidated utilities with enhanced error handling
 
 use std::cell::RefCell;
 use std::error::Error;
@@ -6,9 +6,11 @@ use std::fmt::{self, Write};
 use std::time::{Duration, Instant};
 use warp::reject::Reject;
 
+use crate::constants::*;
+
 // Thread-local string buffer for reuse
 thread_local! {
-    static STRING_BUFFER: RefCell<String> = RefCell::new(String::with_capacity(crate::constants::STRING_BUFFER_SIZE));
+    static STRING_BUFFER: RefCell<String> = RefCell::new(String::with_capacity(get_runtime_config().string_buffer_size));
 }
 
 /// Macro for efficient error handling in handlers
@@ -51,7 +53,7 @@ macro_rules! log_with_timing {
     };
 }
 
-/// Custom error type for the proxy server
+/// Enhanced error type for the proxy server
 #[derive(Debug, Clone)]
 pub struct ProxyError {
     pub message: String,
@@ -66,6 +68,7 @@ enum ProxyErrorKind {
     BadRequest,
     NotFound,
     NotImplemented,
+    LMStudioUnavailable,
     Custom,
 }
 
@@ -112,14 +115,26 @@ impl ProxyError {
 
     pub fn request_cancelled() -> Self {
         Self {
-            message: "Request was cancelled".to_string(),
+            message: ERROR_CANCELLED.to_string(),
             status_code: 499,
             kind: ProxyErrorKind::RequestCancelled,
         }
     }
 
+    pub fn lm_studio_unavailable(message: &str) -> Self {
+        Self {
+            message: message.to_string(),
+            status_code: 503,
+            kind: ProxyErrorKind::LMStudioUnavailable,
+        }
+    }
+
     pub fn is_cancelled(&self) -> bool {
         matches!(self.kind, ProxyErrorKind::RequestCancelled)
+    }
+
+    pub fn is_lm_studio_unavailable(&self) -> bool {
+        matches!(self.kind, ProxyErrorKind::LMStudioUnavailable)
     }
 }
 
@@ -132,7 +147,7 @@ impl fmt::Display for ProxyError {
 impl Error for ProxyError {}
 impl Reject for ProxyError {}
 
-/// Simplified logger for single-client use
+/// Enhanced logger with metrics integration
 #[derive(Debug, Clone)]
 pub struct Logger {
     pub enabled: bool,
@@ -143,7 +158,7 @@ impl Logger {
         Self { enabled }
     }
 
-    /// Log with timing information (efficient implementation)
+    /// Log with timing information using efficient string buffer
     pub fn log_timed(&self, prefix: &str, operation: &str, start: Instant) {
         if self.enabled {
             let duration = start.elapsed();
@@ -170,8 +185,8 @@ impl Logger {
                 let mut buffer = buf.borrow_mut();
                 buffer.clear();
                 match model {
-                    Some(m) => write!(buffer, "🔄 {} {} (model: {})", method, path, m).unwrap(),
-                    None => write!(buffer, "🔄 {} {}", method, path).unwrap(),
+                    Some(m) => write!(buffer, "{} {} {} (model: {})", LOG_PREFIX_REQUEST, method, path, m).unwrap(),
+                    None => write!(buffer, "{} {} {}", LOG_PREFIX_REQUEST, method, path).unwrap(),
                 }
                 println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), buffer);
             });
@@ -184,83 +199,85 @@ impl Logger {
             STRING_BUFFER.with(|buf| {
                 let mut buffer = buf.borrow_mut();
                 buffer.clear();
-                write!(buffer, "❌ {} failed: {}", operation, error).unwrap();
+                write!(buffer, "{} {} failed: {}", LOG_PREFIX_ERROR, operation, error).unwrap();
+                println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), buffer);
+            });
+        }
+    }
+
+    /// Log warning message
+    pub fn log_warning(&self, operation: &str, warning: &str) {
+        if self.enabled {
+            STRING_BUFFER.with(|buf| {
+                let mut buffer = buf.borrow_mut();
+                buffer.clear();
+                write!(buffer, "{} {} warning: {}", LOG_PREFIX_WARNING, operation, warning).unwrap();
                 println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), buffer);
             });
         }
     }
 }
 
-/// Simplified model loading error detection (no regex for performance)
+/// Enhanced model loading error detection
 pub fn is_model_loading_error(message: &str) -> bool {
     let lower = message.to_lowercase();
-    (lower.contains("no") || lower.contains("not") || lower.contains("missing") ||
-        lower.contains("invalid") || lower.contains("unknown") || lower.contains("failed")) &&
-        (lower.contains("model") || lower.contains("load") || lower.contains("available"))
+
+    // More comprehensive error pattern matching
+    let error_indicators = [
+        "no model", "not loaded", "model not found", "model unavailable",
+        "model not available", "invalid model", "unknown model",
+        "failed to load", "loading failed", "model error"
+    ];
+
+    error_indicators.iter().any(|&pattern| lower.contains(pattern)) ||
+        ((lower.contains("no") || lower.contains("not") || lower.contains("missing") ||
+            lower.contains("invalid") || lower.contains("unknown") || lower.contains("failed")) &&
+            (lower.contains("model") || lower.contains("load") || lower.contains("available")))
 }
 
-/// Fast duration formatting
+/// Fast duration formatting with better precision
 pub fn format_duration(duration: Duration) -> String {
-    let total_micros = duration.as_micros();
+    let total_nanos = duration.as_nanos();
 
-    if total_micros < 1_000 { // Less than 1ms
-        format!("{}µs", total_micros)
-    } else if total_micros < 1_000_000 { // Less than 1s
-        format!("{:.3}ms", total_micros as f64 / 1_000.0)
+    if total_nanos < 1_000 { // Less than 1µs
+        format!("{}ns", total_nanos)
+    } else if total_nanos < 1_000_000 { // Less than 1ms
+        format!("{:.1}µs", total_nanos as f64 / 1_000.0)
+    } else if total_nanos < 1_000_000_000 { // Less than 1s
+        format!("{:.2}ms", total_nanos as f64 / 1_000_000.0)
     } else { // 1s or more
-        format!("{:.3}s", total_micros as f64 / 1_000_000.0)
+        format!("{:.3}s", total_nanos as f64 / 1_000_000_000.0)
     }
 }
 
-/// Validate model name and return warnings for potentially malformed names
-pub fn validate_model_name(name: &str) -> (bool, Option<String>) {
+/// Consolidated model name validation
+pub fn validate_model_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
-        return (false, Some("Model name cannot be empty".to_string()));
-    }
-
-    let mut warnings = Vec::new();
-
-    // Check for common issues
-    if name.contains("::") {
-        warnings.push("Multiple consecutive colons".to_string());
-    }
-
-    if name.starts_with(':') && name.len() > 1 {
-        warnings.push("Starts with colon".to_string());
-    }
-
-    if name.ends_with(':') {
-        warnings.push("Ends with colon".to_string());
+        return Err("Model name cannot be empty".to_string());
     }
 
     if name.len() > 200 {
-        warnings.push("Unusually long name".to_string());
+        return Err("Model name too long (max: 200 characters)".to_string());
     }
 
-    if name.contains(char::is_whitespace) {
-        warnings.push("Contains whitespace".to_string());
+    // Check for control characters (except common whitespace)
+    if name.chars().any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r')) {
+        return Err("Model name contains invalid control characters".to_string());
     }
 
-    if name.chars().any(|c| c.is_control() && c != '\t' && c != '\n' && c != '\r') {
-        warnings.push("Contains control characters".to_string());
+    // Check for suspicious patterns
+    if name.contains("::") {
+        return Err("Model name contains multiple consecutive colons".to_string());
     }
 
-    let colon_count = name.matches(':').count();
-    if colon_count > 4 {
-        warnings.push(format!("Too many colons ({})", colon_count));
+    if name.matches(':').count() > 4 {
+        return Err("Model name contains too many colons".to_string());
     }
 
-    let is_valid = warnings.is_empty();
-    let warning_message = if warnings.is_empty() {
-        None
-    } else {
-        Some(warnings.join("; "))
-    };
-
-    (is_valid, warning_message)
+    Ok(())
 }
 
-/// Optimized config validation for single client
+/// Enhanced config validation
 pub fn validate_config(config: &crate::server::Config) -> Result<(), String> {
     if config.request_timeout_seconds == 0 {
         return Err("Request timeout must be greater than 0".to_string());
@@ -274,23 +291,81 @@ pub fn validate_config(config: &crate::server::Config) -> Result<(), String> {
         return Err("Load timeout must be greater than 0".to_string());
     }
 
-    // Parse listen address
+    // Validate listen address
     if config.listen.parse::<std::net::SocketAddr>().is_err() {
         return Err(format!("Invalid listen address: {}", config.listen));
     }
 
-    // Basic URL validation
+    // Enhanced URL validation
     if !config.lmstudio_url.starts_with("http://") && !config.lmstudio_url.starts_with("https://") {
-        return Err(format!("Invalid LM Studio URL: {}", config.lmstudio_url));
+        return Err(format!("Invalid LM Studio URL (must start with http:// or https://): {}", config.lmstudio_url));
+    }
+
+    // Validate URL format more thoroughly
+    if let Err(e) = url::Url::parse(&config.lmstudio_url) {
+        return Err(format!("Invalid LM Studio URL format: {}", e));
+    }
+
+    // Validate buffer sizes
+    if config.max_buffer_size == 0 {
+        return Err("Max buffer size must be greater than 0".to_string());
+    }
+
+    if config.max_chunk_count == 0 {
+        return Err("Max chunk count must be greater than 0".to_string());
+    }
+
+    if config.max_request_size == 0 {
+        return Err("Max request size must be greater than 0".to_string());
+    }
+
+    // Reasonable limits validation
+    if config.max_buffer_size > 100 * 1024 * 1024 { // 100MB
+        return Err("Max buffer size too large (max: 100MB)".to_string());
+    }
+
+    if config.max_request_size > 1024 * 1024 * 1024 { // 1GB
+        return Err("Max request size too large (max: 1GB)".to_string());
     }
 
     Ok(())
 }
 
-/// Simple model identifier validation
-pub fn is_valid_model_identifier(name: &str) -> bool {
-    !name.is_empty() &&
-        name.len() <= 200 &&
-        name.chars().any(|c| c.is_alphanumeric()) &&
-        !name.chars().any(|c| c.is_control())
+/// Check if endpoint requires authentication (for future use)
+pub fn is_protected_endpoint(path: &str) -> bool {
+    // Currently no protected endpoints, but framework for future use
+    matches!(path, "/admin/*" | "/config/*")
+}
+
+/// Sanitize log message to prevent log injection
+pub fn sanitize_log_message(message: &str) -> String {
+    message
+        .chars()
+        .map(|c| if c.is_control() && !matches!(c, '\t' | '\n' | '\r') { '?' } else { c })
+        .collect()
+}
+
+/// Extract client IP from request headers (for logging/metrics)
+pub fn extract_client_ip(headers: &warp::http::HeaderMap) -> Option<String> {
+    // Check common headers for client IP
+    let ip_headers = [
+        "x-forwarded-for",
+        "x-real-ip",
+        "cf-connecting-ip",
+        "x-client-ip"
+    ];
+
+    for header_name in &ip_headers {
+        if let Some(header_value) = headers.get(*header_name) {
+            if let Ok(ip_str) = header_value.to_str() {
+                // Take first IP if comma-separated list
+                let ip = ip_str.split(',').next().unwrap_or(ip_str).trim();
+                if !ip.is_empty() {
+                    return Some(ip.to_string());
+                }
+            }
+        }
+    }
+
+    None
 }

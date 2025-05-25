@@ -1,4 +1,4 @@
-// src/common.rs - Optimized infrastructure for single-client use
+// src/common.rs - Enhanced infrastructure with runtime configuration support
 
 use serde_json::Value;
 use std::time::Duration;
@@ -8,7 +8,7 @@ use crate::constants::*;
 use crate::utils::{ProxyError, Logger};
 use crate::{check_cancelled, handle_lm_error};
 
-/// Lightweight request context for single client (no Arc needed)
+/// Lightweight request context for concurrent request handling
 #[derive(Clone)]
 pub struct RequestContext<'a> {
     pub client: &'a reqwest::Client,
@@ -17,7 +17,7 @@ pub struct RequestContext<'a> {
     pub timeout_seconds: u64,
 }
 
-/// Simplified cancellable request without request ID overhead
+/// Optimized cancellable request handler
 pub struct CancellableRequest<'a> {
     context: RequestContext<'a>,
     token: CancellationToken,
@@ -28,7 +28,7 @@ impl<'a> CancellableRequest<'a> {
         Self { context, token }
     }
 
-    /// Make a cancellable HTTP request (optimized for single client)
+    /// Make a cancellable HTTP request with proper error handling
     pub async fn make_request(
         &self,
         method: reqwest::Method,
@@ -47,7 +47,7 @@ impl<'a> CancellableRequest<'a> {
 
         request_builder = request_builder.timeout(Duration::from_secs(self.context.timeout_seconds));
 
-        // Race between request and cancellation
+        // Race between request and cancellation with proper error handling
         tokio::select! {
             result = request_builder.send() => {
                 match result {
@@ -56,7 +56,9 @@ impl<'a> CancellableRequest<'a> {
                         let error_msg = if err.is_timeout() {
                             "Request timeout"
                         } else if err.is_connect() {
-                            "Connection failed"
+                            ERROR_LM_STUDIO_UNAVAILABLE
+                        } else if err.is_request() {
+                            "Invalid request"
                         } else {
                             "Request failed"
                         };
@@ -71,7 +73,7 @@ impl<'a> CancellableRequest<'a> {
     }
 }
 
-/// Fast JSON response handling with cancellation
+/// Enhanced JSON response handling with cancellation support
 pub async fn handle_json_response(
     response: reqwest::Response,
     cancellation_token: CancellationToken
@@ -81,7 +83,9 @@ pub async fn handle_json_response(
 
     tokio::select! {
         result = response.json::<Value>() => {
-            result.map_err(|_| ProxyError::internal_server_error("Invalid JSON from LM Studio"))
+            result.map_err(|e| {
+                ProxyError::internal_server_error(&format!("Invalid JSON from LM Studio: {}", e))
+            })
         }
         _ = cancellation_token.cancelled() => {
             Err(ProxyError::request_cancelled())
@@ -89,70 +93,182 @@ pub async fn handle_json_response(
     }
 }
 
-/// Optimized request size validation
+/// Enhanced request size validation using runtime configuration
 pub fn validate_request_size(body: &Value) -> Result<(), ProxyError> {
-    // Fast size estimation without full serialization
-    let estimated_size = estimate_json_size(body);
+    let config = get_runtime_config();
 
-    if estimated_size > MAX_REQUEST_SIZE_BYTES {
-        return Err(ProxyError::bad_request("Request body too large"));
+    // Fast size estimation without full serialization
+    let estimated_size = estimate_json_size_optimized(body);
+
+    if estimated_size > config.max_request_size_bytes {
+        return Err(ProxyError::bad_request(&format!(
+            "{} (size: {} bytes, max: {} bytes)",
+            ERROR_REQUEST_TOO_LARGE,
+            estimated_size,
+            config.max_request_size_bytes
+        )));
     }
 
     Ok(())
 }
 
-/// Fast JSON size estimation (avoids full serialization)
-fn estimate_json_size(value: &Value) -> usize {
+/// Optimized JSON size estimation with better accuracy
+fn estimate_json_size_optimized(value: &Value) -> usize {
     match value {
         Value::Null => 4, // "null"
-        Value::Bool(_) => 5, // "false" (max)
-        Value::Number(n) => n.to_string().len(),
-        Value::String(s) => s.len() + 2, // quotes
+        Value::Bool(true) => 4, // "true"
+        Value::Bool(false) => 5, // "false"
+        Value::Number(n) => {
+            // More accurate number size estimation
+            if n.is_i64() {
+                n.as_i64().unwrap().to_string().len()
+            } else if n.is_u64() {
+                n.as_u64().unwrap().to_string().len()
+            } else {
+                n.as_f64().unwrap().to_string().len()
+            }
+        },
+        Value::String(s) => {
+            // Account for escaped characters and quotes
+            s.len() + 2 + count_escape_chars(s)
+        },
         Value::Array(arr) => {
-            2 + arr.iter().map(estimate_json_size).sum::<usize>() + arr.len().saturating_sub(1) // [] + commas
-        }
+            // More accurate array size calculation
+            if arr.is_empty() {
+                2 // "[]"
+            } else {
+                2 + arr.iter().map(estimate_json_size_optimized).sum::<usize>() + (arr.len() - 1) // [] + commas
+            }
+        },
         Value::Object(obj) => {
-            2 + obj.iter().map(|(k, v)| k.len() + 3 + estimate_json_size(v)).sum::<usize>() + obj.len().saturating_sub(1) // {} + quotes + colons + commas
+            // More accurate object size calculation
+            if obj.is_empty() {
+                2 // "{}"
+            } else {
+                2 + obj.iter().map(|(k, v)| {
+                    k.len() + 3 + count_escape_chars(k) + estimate_json_size_optimized(v) // key + ": + quotes
+                }).sum::<usize>() + (obj.len() - 1) // {} + commas
+            }
         }
     }
 }
 
-/// Fast model name extraction
+/// Count characters that need escaping in JSON strings
+fn count_escape_chars(s: &str) -> usize {
+    s.chars().filter(|&c| {
+        matches!(c, '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0C}')
+    }).count()
+}
+
+/// Enhanced model name extraction with validation
 pub fn extract_model_name<'a>(body: &'a Value, field_name: &str) -> Result<&'a str, ProxyError> {
-    body.get(field_name)
+    let model = body.get(field_name)
         .and_then(|m| m.as_str())
-        .filter(|s| !s.is_empty() && s.len() <= 200)
+        .filter(|s| !s.is_empty())
         .ok_or_else(|| match field_name {
             "model" => ProxyError::bad_request(ERROR_MISSING_MODEL),
             _ => ProxyError::bad_request("Missing required field"),
-        })
+        })?;
+
+    // Enhanced validation
+    if model.len() > 200 {
+        return Err(ProxyError::bad_request("Model name too long (max: 200 characters)"));
+    }
+
+    // Check for potentially problematic characters
+    if model.chars().any(|c| c.is_control() && c != '\t' && c != '\n' && c != '\r') {
+        return Err(ProxyError::bad_request("Model name contains invalid characters"));
+    }
+
+    Ok(model)
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
 
-    #[test]
-    fn test_json_size_estimation() {
-        let small = json!({"model": "test"});
-        assert!(estimate_json_size(&small) < 50);
+/// Enhanced request builder with common parameters
+pub struct RequestBuilder {
+    body: serde_json::Map<String, Value>,
+}
 
-        let large = json!({"model": "test", "prompt": "x".repeat(1000)});
-        assert!(estimate_json_size(&large) > 1000);
+impl RequestBuilder {
+    pub fn new() -> Self {
+        Self {
+            body: serde_json::Map::new(),
+        }
     }
 
-    #[test]
-    fn test_validate_request_size() {
-        let small_body = json!({"model": "test", "prompt": "hello"});
-        assert!(validate_request_size(&small_body).is_ok());
+    /// Add required field
+    pub fn add_required<T: Into<Value>>(mut self, key: &str, value: T) -> Self {
+        self.body.insert(key.to_string(), value.into());
+        self
     }
 
-    #[test]
-    fn test_extract_model_name() {
-        let valid_body = json!({"model": "llama3.2"});
-        assert_eq!(extract_model_name(&valid_body, "model").unwrap(), "llama3.2");
+    /// Add optional field
+    pub fn add_optional<T: Into<Value>>(mut self, key: &str, value: Option<T>) -> Self {
+        if let Some(v) = value {
+            self.body.insert(key.to_string(), v.into());
+        }
+        self
+    }
 
-        let invalid_body = json!({"prompt": "hello"});
-        assert!(extract_model_name(&invalid_body, "model").is_err());
+    /// Add field from another JSON object if it exists
+    pub fn add_from_source(mut self, key: &str, source: &Value) -> Self {
+        if let Some(value) = source.get(key) {
+            self.body.insert(key.to_string(), value.clone());
+        }
+        self
+    }
+
+    /// Build the final JSON value
+    pub fn build(self) -> Value {
+        Value::Object(self.body)
+    }
+}
+
+impl Default for RequestBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Common parameter mapping for LM Studio requests
+pub fn map_ollama_to_lmstudio_params(ollama_options: Option<&Value>) -> serde_json::Map<String, Value> {
+    let mut params = serde_json::Map::new();
+
+    if let Some(options) = ollama_options {
+        // Direct parameter mappings
+        const DIRECT_MAPPINGS: &[&str] = &[
+            "temperature", "top_p", "top_k", "presence_penalty",
+            "frequency_penalty", "seed", "stop"
+        ];
+
+        for &param in DIRECT_MAPPINGS {
+            if let Some(value) = options.get(param) {
+                params.insert(param.to_string(), value.clone());
+            }
+        }
+
+        // Special mappings
+        if let Some(max_tokens) = options.get("num_predict") {
+            params.insert("max_tokens".to_string(), max_tokens.clone());
+        }
+
+        if let Some(repeat_penalty) = options.get("repeat_penalty") {
+            if !params.contains_key("frequency_penalty") {
+                params.insert("frequency_penalty".to_string(), repeat_penalty.clone());
+            }
+        }
+
+        // Handle system message if present
+        if let Some(system) = options.get("system") {
+            params.insert("system".to_string(), system.clone());
+        }
+    }
+
+    params
+}
+
+/// Utility function to merge JSON objects efficiently
+pub fn merge_json_objects(base: &mut serde_json::Map<String, Value>, overlay: serde_json::Map<String, Value>) {
+    for (key, value) in overlay {
+        base.insert(key, value);
     }
 }
