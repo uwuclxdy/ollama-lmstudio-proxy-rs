@@ -32,8 +32,9 @@ pub use streaming::{
 
 // Retry functions
 pub use retry::{
-    with_retry_and_cancellation,
     trigger_model_loading,
+    with_retry_and_cancellation,
+    with_simple_retry,
 };
 
 // Helper functions

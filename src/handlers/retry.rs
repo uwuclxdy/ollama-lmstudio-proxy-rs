@@ -1,4 +1,4 @@
-// src/handlers/retry.rs - Unified auto-retry infrastructure with cancellation support
+// src/handlers/retry.rs - Simplified retry logic since model name resolution fixes the root issue
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,16 +10,17 @@ use crate::server::ProxyServer;
 use crate::utils::{is_model_loading_error, ProxyError, clean_model_name};
 use crate::common::CancellableRequest;
 
-/// Model loading trigger that works for both initial loading and model switching
+/// Simple model loading trigger (mainly for initial LM Studio startup)
+/// This is now much simpler since model name resolution handles the main switching
 pub async fn trigger_model_loading(
     server: &ProxyServer,
     model_name: &str,
     cancellation_token: CancellationToken,
 ) -> Result<bool, ProxyError> {
     let cleaned_model = clean_model_name(model_name);
-    server.logger.log(&format!("Attempting to trigger loading/switching for model: {}", cleaned_model));
+    server.logger.log(&format!("Attempting to trigger loading for model: {}", cleaned_model));
 
-    // Make a minimal chat completion request to trigger model loading/switching
+    // Make a minimal chat completion request to trigger model loading
     let url = format!("{}/v1/chat/completions", server.config.lmstudio_url);
 
     let minimal_request = json!({
@@ -61,7 +62,7 @@ pub async fn trigger_model_loading(
     let status = response.status();
 
     if status.is_success() {
-        server.logger.log(&format!("Model loading/switching triggered successfully for: {}", cleaned_model));
+        server.logger.log(&format!("Model loading triggered successfully for: {}", cleaned_model));
         Ok(true)
     } else if status.as_u16() == 400 || status.as_u16() == 404 {
         // These status codes might still trigger model loading in LM Studio
@@ -71,13 +72,12 @@ pub async fn trigger_model_loading(
         // Log error response
         let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
         server.logger.log(&format!("Model loading failed with status {}: {}", status, error_text));
-
-        // Still return success as the request might have triggered something
-        Ok(true)
+        Ok(false)
     }
 }
 
-/// Generic retry wrapper with cancellation support and model-specific loading
+/// Simplified retry wrapper - now mainly for handling LM Studio startup issues
+/// Since we resolve model names properly, most model switching issues are eliminated
 pub async fn with_retry_and_cancellation<F, Fut, T>(
     server: &Arc<ProxyServer>,
     model_name: &str,
@@ -96,7 +96,7 @@ where
     let cleaned_model = clean_model_name(model_name);
     server.logger.log(&format!("Attempting operation with model: {}", cleaned_model));
 
-    // First attempt
+    // First attempt - this should work now with proper model name resolution
     match operation().await {
         Ok(result) => {
             server.logger.log(&format!("Operation succeeded on first attempt for model: {}", cleaned_model));
@@ -110,20 +110,21 @@ where
             let error_msg = &e.message;
             server.logger.log(&format!("First attempt failed for model '{}': {}", cleaned_model, error_msg));
 
+            // Only retry if it's clearly a model loading issue (e.g., LM Studio starting up)
             if is_model_loading_error(error_msg) {
-                server.logger.log(&format!("Detected model loading error for '{}', attempting retry with model loading/switching...", cleaned_model));
+                server.logger.log(&format!("Detected model loading error for '{}', attempting retry...", cleaned_model));
 
                 // Check if cancelled before attempting retry
                 if cancellation_token.is_cancelled() {
                     return Err(ProxyError::request_cancelled());
                 }
 
-                // Trigger model loading/switching with cancellation support
+                // Try to trigger model loading
                 match trigger_model_loading(server, &cleaned_model, cancellation_token.clone()).await {
                     Ok(true) => {
-                        server.logger.log(&format!("Model loading/switching triggered for '{}', waiting for model to be ready...", cleaned_model));
+                        server.logger.log(&format!("Model loading triggered for '{}', waiting briefly...", cleaned_model));
 
-                        // Wait for model loading with cancellation support
+                        // Brief wait for model loading
                         let sleep_future = sleep(Duration::from_secs(server.config.load_timeout_seconds));
 
                         tokio::select! {
@@ -141,7 +142,7 @@ where
                             return Err(ProxyError::request_cancelled());
                         }
 
-                        server.logger.log(&format!("Retrying operation after model loading/switching for: {}", cleaned_model));
+                        server.logger.log(&format!("Retrying operation after brief wait for: {}", cleaned_model));
 
                         // Retry the operation
                         match operation().await {
@@ -156,7 +157,7 @@ where
                         }
                     },
                     Ok(false) => {
-                        server.logger.log(&format!("Model loading trigger returned false for: {}", cleaned_model));
+                        server.logger.log(&format!("Model loading trigger failed for: {}", cleaned_model));
                         Err(e)
                     },
                     Err(trigger_error) => {
