@@ -1,4 +1,6 @@
-// src/handlers/retry.rs - Simplified retry logic since model name resolution fixes the root issue
+// src/handlers/retry.rs - Simplified retry logic with minimal test requests
+//
+// PARAMETER FIX: Remove hardcoded parameter defaults from model loading triggers
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,7 +12,7 @@ use crate::server::ProxyServer;
 use crate::utils::{is_model_loading_error, ProxyError, clean_model_name};
 use crate::common::CancellableRequest;
 
-/// Simple model loading trigger (mainly for initial LM Studio startup)
+/// Simple model loading trigger with truly minimal request
 /// This is now much simpler since model name resolution handles the main switching
 pub async fn trigger_model_loading(
     server: &ProxyServer,
@@ -20,7 +22,8 @@ pub async fn trigger_model_loading(
     let cleaned_model = clean_model_name(model_name);
     server.logger.log(&format!("Attempting to trigger loading for model: {}", cleaned_model));
 
-    // Make a minimal chat completion request to trigger model loading
+    // 🎯 PARAMETER FIX: Make truly minimal chat completion request 
+    // Let LM Studio use its GUI-configured defaults for all parameters
     let url = format!("{}/v1/chat/completions", server.config.lmstudio_url);
 
     let minimal_request = json!({
@@ -28,12 +31,11 @@ pub async fn trigger_model_loading(
         "messages": [
             {
                 "role": "user",
-                "content": "test"
+                "content": "hi"
             }
-        ],
-        "max_tokens": 1,
-        "stream": false,
-        "temperature": 0.7
+        ]
+        // 🔑 NO other parameters - let LM Studio use GUI defaults
+        // This includes: temperature, max_tokens, top_p, top_k, etc.
     });
 
     let request = CancellableRequest::new(
@@ -119,7 +121,7 @@ where
                     return Err(ProxyError::request_cancelled());
                 }
 
-                // Try to trigger model loading
+                // Try to trigger model loading with minimal request
                 match trigger_model_loading(server, &cleaned_model, cancellation_token.clone()).await {
                     Ok(true) => {
                         server.logger.log(&format!("Model loading triggered for '{}', waiting briefly...", cleaned_model));

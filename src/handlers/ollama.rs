@@ -4,7 +4,7 @@
 // Ollama model names to actual LM Studio model names before sending requests.
 // LM Studio will automatically switch models when we send the correct name.
 
-use serde_json::{json, Value};
+use serde_json::{json, Value, Map};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -18,8 +18,70 @@ use super::streaming::{is_streaming_request, handle_streaming_response};
 use super::helpers::{
     json_response, determine_model_family, determine_parameter_size,
     estimate_model_size, determine_model_capabilities,
-    transform_chat_response, transform_generate_response, transform_embeddings_response
+    transform_chat_response, transform_generate_response, transform_embeddings_response, find_best_model_match
 };
+
+/// Helper function to build LM Studio request with only provided parameters
+fn build_lm_request_object(base_params: Map<String, Value>, ollama_options: Option<&Value>) -> Value {
+    let mut request = Map::new();
+
+    // Add base parameters (model, messages/prompt, stream)
+    for (key, value) in base_params {
+        request.insert(key, value);
+    }
+
+    // Only add optional parameters if they were provided by the Ollama client
+    if let Some(options) = ollama_options {
+        // Temperature
+        if let Some(temp) = options.get("temperature") {
+            request.insert("temperature".to_string(), temp.clone());
+        }
+
+        // Max tokens (Ollama uses "num_predict", LM Studio uses "max_tokens")
+        if let Some(max_tokens) = options.get("num_predict") {
+            request.insert("max_tokens".to_string(), max_tokens.clone());
+        }
+
+        // Top-p
+        if let Some(top_p) = options.get("top_p") {
+            request.insert("top_p".to_string(), top_p.clone());
+        }
+
+        // Top-k
+        if let Some(top_k) = options.get("top_k") {
+            request.insert("top_k".to_string(), top_k.clone());
+        }
+
+        // Presence penalty
+        if let Some(presence_penalty) = options.get("presence_penalty") {
+            request.insert("presence_penalty".to_string(), presence_penalty.clone());
+        }
+
+        // Frequency penalty
+        if let Some(frequency_penalty) = options.get("frequency_penalty") {
+            request.insert("frequency_penalty".to_string(), frequency_penalty.clone());
+        }
+
+        // Repeat penalty (Ollama-specific, map to frequency_penalty if not already set)
+        if let Some(repeat_penalty) = options.get("repeat_penalty") {
+            if !request.contains_key("frequency_penalty") {
+                request.insert("frequency_penalty".to_string(), repeat_penalty.clone());
+            }
+        }
+
+        // Seed
+        if let Some(seed) = options.get("seed") {
+            request.insert("seed".to_string(), seed.clone());
+        }
+
+        // Stop sequences
+        if let Some(stop) = options.get("stop") {
+            request.insert("stop".to_string(), stop.clone());
+        }
+    }
+
+    Value::Object(request)
+}
 
 /// Resolve Ollama model name to actual LM Studio model name
 async fn resolve_model_name(
@@ -78,81 +140,6 @@ async fn resolve_model_name(
         server.logger.log(&format!("⚠️  No match found for '{}', using cleaned name '{}'", ollama_model, cleaned_ollama));
         Ok(cleaned_ollama)
     }
-}
-
-/// Find the best matching LM Studio model for an Ollama model name
-fn find_best_model_match(ollama_name: &str, available_models: &[String]) -> Option<String> {
-    let lower_ollama = ollama_name.to_lowercase();
-
-    // Direct match first
-    for model in available_models {
-        if model.to_lowercase() == lower_ollama {
-            return Some(model.clone());
-        }
-    }
-
-    // Pattern matching for common model families
-    for model in available_models {
-        let lower_model = model.to_lowercase();
-
-        // Llama family matching
-        if lower_ollama.contains("llama") && lower_model.contains("llama") {
-            if models_match_size(&lower_ollama, &lower_model) {
-                return Some(model.clone());
-            }
-        }
-
-        // Qwen family matching
-        else if lower_ollama.contains("qwen") && lower_model.contains("qwen") {
-            if models_match_size(&lower_ollama, &lower_model) {
-                return Some(model.clone());
-            }
-        }
-
-        // Mistral family matching
-        else if lower_ollama.contains("mistral") && lower_model.contains("mistral") {
-            if models_match_size(&lower_ollama, &lower_model) {
-                return Some(model.clone());
-            }
-        }
-
-        // Gemma family matching
-        else if lower_ollama.contains("gemma") && lower_model.contains("gemma") {
-            if models_match_size(&lower_ollama, &lower_model) {
-                return Some(model.clone());
-            }
-        }
-
-        // Phi family matching
-        else if lower_ollama.contains("phi") && lower_model.contains("phi") {
-            if models_match_size(&lower_ollama, &lower_model) {
-                return Some(model.clone());
-            }
-        }
-
-        // DeepSeek family matching
-        else if lower_ollama.contains("deepseek") && lower_model.contains("deepseek") {
-            if models_match_size(&lower_ollama, &lower_model) {
-                return Some(model.clone());
-            }
-        }
-    }
-
-    None
-}
-
-/// Check if two model names refer to the same model size
-fn models_match_size(name1: &str, name2: &str) -> bool {
-    let sizes = ["0.5b", "1.5b", "2b", "3b", "7b", "8b", "9b", "11b", "13b", "14b", "27b", "30b", "32b", "70b"];
-
-    for size in &sizes {
-        if name1.contains(size) && name2.contains(size) {
-            return true;
-        }
-    }
-
-    // If no size found in either, consider them matching (size unknown)
-    true
 }
 
 /// Handle GET /api/tags - list available models with cancellation support
@@ -277,14 +264,13 @@ pub async fn handle_ollama_chat(
                 // 🔑 KEY FIX: Resolve to actual LM Studio model name
                 let lmstudio_model = resolve_model_name(&server, model, cancellation_token.clone()).await?;
 
-                // Convert to LM Studio format using the resolved model name
-                let lm_request = json!({
-                    "model": lmstudio_model,  // 🎯 Use actual LM Studio model name here
-                    "messages": messages,
-                    "stream": stream,
-                    "temperature": body.get("options").and_then(|o| o.get("temperature")).unwrap_or(&json!(0.7)),
-                    "max_tokens": body.get("options").and_then(|o| o.get("num_predict")).unwrap_or(&json!(2048))
-                });
+                // 🎯 PARAMETER FIX: Build request with only provided parameters
+                let mut base_params = Map::new();
+                base_params.insert("model".to_string(), json!(lmstudio_model));
+                base_params.insert("messages".to_string(), json!(messages));
+                base_params.insert("stream".to_string(), json!(stream));
+
+                let lm_request = build_lm_request_object(base_params, body.get("options"));
 
                 let request = CancellableRequest::new(
                     server.client.clone(),
@@ -364,14 +350,13 @@ pub async fn handle_ollama_generate(
                 // 🔑 KEY FIX: Resolve to actual LM Studio model name
                 let lmstudio_model = resolve_model_name(&server, model, cancellation_token.clone()).await?;
 
-                // Convert to LM Studio completions format using the resolved model name
-                let lm_request = json!({
-                    "model": lmstudio_model,  // 🎯 Use actual LM Studio model name here
-                    "prompt": prompt,
-                    "stream": stream,
-                    "temperature": body.get("options").and_then(|o| o.get("temperature")).unwrap_or(&json!(0.7)),
-                    "max_tokens": body.get("options").and_then(|o| o.get("num_predict")).unwrap_or(&json!(4096))
-                });
+                // 🎯 PARAMETER FIX: Build request with only provided parameters
+                let mut base_params = Map::new();
+                base_params.insert("model".to_string(), json!(lmstudio_model));
+                base_params.insert("prompt".to_string(), json!(prompt));
+                base_params.insert("stream".to_string(), json!(stream));
+
+                let lm_request = build_lm_request_object(base_params, body.get("options"));
 
                 let request = CancellableRequest::new(
                     server.client.clone(),
@@ -448,8 +433,9 @@ pub async fn handle_ollama_embeddings(
                 // 🔑 KEY FIX: Resolve to actual LM Studio model name
                 let lmstudio_model = resolve_model_name(&server, model, cancellation_token.clone()).await?;
 
+                // 🎯 PARAMETER FIX: Minimal request for embeddings (no optional parameters needed)
                 let lm_request = json!({
-                    "model": lmstudio_model,  // 🎯 Use actual LM Studio model name here
+                    "model": lmstudio_model,
                     "input": input
                 });
 
