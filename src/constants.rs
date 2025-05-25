@@ -1,26 +1,21 @@
-// src/constants.rs - Centralized constants and configuration values
+// src/constants.rs - Optimized constants for single-client use
 
 /// Buffer and streaming limits
 pub const MAX_BUFFER_SIZE: usize = 64 * 1024; // 64KB max buffer for streaming
-pub const MAX_CHUNK_COUNT: u64 = 10_000; // Maximum chunks per stream
-pub const MAX_PARTIAL_CONTENT_SIZE: usize = 10_000; // Max partial content tracking
+pub const MAX_CHUNK_COUNT: u64 = 5_000; // Maximum chunks per stream
+pub const MAX_PARTIAL_CONTENT_SIZE: usize = 5_000; // Max partial content tracking
 
 /// Timing and performance constants
-pub const TOKEN_TO_CHAR_RATIO: f64 = 0.25; // Approximate tokens per character
-pub const DEFAULT_LOAD_DURATION_NS: u64 = 1_000_000; // 1ms in nanoseconds
-pub const TIMING_EVAL_RATIO: u64 = 2; // eval_duration = total_duration / 2
-pub const TIMING_PROMPT_RATIO: u64 = 4; // prompt_eval_duration = total_duration / 4
+pub const TOKEN_TO_CHAR_RATIO: f64 = 0.25;
+pub const DEFAULT_LOAD_DURATION_NS: u64 = 1_000_000;
+pub const TIMING_EVAL_RATIO: u64 = 2;
+pub const TIMING_PROMPT_RATIO: u64 = 4;
 
 /// Model size estimates in bytes
-pub const DEFAULT_MODEL_SIZE_BYTES: u64 = 4_000_000_000; // 4GB default
-
-/// Cache settings
-pub const MODEL_CACHE_TTL_SECONDS: u64 = 300; // 5 minutes cache TTL
-pub const MAX_CACHE_ENTRIES: usize = 100; // Maximum cached model resolutions
+pub const DEFAULT_MODEL_SIZE_BYTES: u64 = 4_000_000_000;
 
 /// Request limits
-pub const MAX_REQUEST_SIZE_BYTES: usize = 10 * 1024 * 1024; // 10MB max request
-pub const REQUEST_ID_PREFIX: &str = "req";
+pub const MAX_REQUEST_SIZE_BYTES: usize = 100 * 1024 * 1024; // 100MB
 
 /// Response headers
 pub const CONTENT_TYPE_JSON: &str = "application/json; charset=utf-8";
@@ -59,8 +54,9 @@ pub const LOG_PREFIX_SUCCESS: &str = "✅";
 pub const LOG_PREFIX_ERROR: &str = "❌";
 pub const LOG_PREFIX_WARNING: &str = "⚠️";
 pub const LOG_PREFIX_CANCEL: &str = "🚫";
-pub const LOG_PREFIX_STREAM: &str = "🌊";
-pub const LOG_PREFIX_COMPLETE: &str = "🏁";
 
 /// Default context array for generate responses
 pub const DEFAULT_CONTEXT: [u32; 3] = [1, 2, 3];
+
+/// String buffer size for reusable operations
+pub const STRING_BUFFER_SIZE: usize = 512;

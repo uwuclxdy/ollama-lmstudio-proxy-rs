@@ -1,4 +1,4 @@
-// src/lib.rs - Updated module organization with new consolidated systems
+// src/lib.rs - Optimized module organization for single-client use
 
 // Core modules
 pub mod constants;
@@ -12,14 +12,15 @@ pub mod common;
 pub use server::{Config, ProxyServer};
 pub use utils::{ProxyError, Logger, validate_config};
 pub use model::{ModelInfo, ModelResolver, clean_model_name};
+pub use common::RequestContext;
 
 /// Version information
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const NAME: &str = env!("CARGO_PKG_NAME");
 
-/// Re-export commonly used constants for external use
+/// Re-export optimized constants for external use
 pub use constants::{
-    // Buffer and streaming limits
+    // Buffer and streaming limits (reduced for single client)
     MAX_BUFFER_SIZE,
     MAX_CHUNK_COUNT,
     MAX_PARTIAL_CONTENT_SIZE,
@@ -30,7 +31,7 @@ pub use constants::{
     DEFAULT_TOP_P,
     DEFAULT_TOP_K,
 
-    // Error messages
+    // Error messages (static str for efficiency)
     ERROR_MISSING_MODEL,
     ERROR_MISSING_MESSAGES,
     ERROR_MISSING_PROMPT,
@@ -43,7 +44,7 @@ pub use constants::{
     CONTENT_TYPE_JSON,
     CONTENT_TYPE_SSE,
 
-    // Logging prefixes
+    // Simplified logging prefixes
     LOG_PREFIX_REQUEST,
     LOG_PREFIX_SUCCESS,
     LOG_PREFIX_ERROR,

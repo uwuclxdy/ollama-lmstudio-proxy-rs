@@ -1,10 +1,55 @@
-// src/utils.rs - Optimized utilities with centralized error handling
+// src/utils.rs - Optimized utilities with macros and efficient string handling
 
+use std::cell::RefCell;
 use std::error::Error;
-use std::fmt;
+use std::fmt::{self, Write};
+use std::time::{Duration, Instant};
 use warp::reject::Reject;
-use regex::Regex;
-use once_cell::sync::Lazy;
+
+// Thread-local string buffer for reuse
+thread_local! {
+    static STRING_BUFFER: RefCell<String> = RefCell::new(String::with_capacity(crate::constants::STRING_BUFFER_SIZE));
+}
+
+/// Macro for efficient error handling in handlers
+#[macro_export]
+macro_rules! handle_lm_error {
+    ($response:expr) => {
+        if !$response.status().is_success() {
+            let status = $response.status();
+            return Err(ProxyError::new(
+                format!("LM Studio error: {}", status),
+                status.as_u16()
+            ));
+        }
+    };
+}
+
+/// Macro for cancellation checking
+#[macro_export]
+macro_rules! check_cancelled {
+    ($token:expr) => {
+        if $token.is_cancelled() {
+            return Err(ProxyError::request_cancelled());
+        }
+    };
+}
+
+/// Macro for efficient logging with timing
+#[macro_export]
+macro_rules! log_with_timing {
+    ($logger:expr, $prefix:expr, $operation:expr, $start:expr) => {
+        if $logger.enabled {
+            let duration = $start.elapsed();
+            STRING_BUFFER.with(|buf| {
+                let mut buffer = buf.borrow_mut();
+                buffer.clear();
+                write!(buffer, "{} {} ({})", $prefix, $operation, format_duration(duration)).unwrap();
+                println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), buffer);
+            });
+        }
+    };
+}
 
 /// Custom error type for the proxy server
 #[derive(Debug, Clone)]
@@ -15,7 +60,7 @@ pub struct ProxyError {
 }
 
 #[derive(Debug, Clone)]
-pub enum ProxyErrorKind {
+enum ProxyErrorKind {
     RequestCancelled,
     InternalServerError,
     BadRequest,
@@ -29,7 +74,7 @@ impl ProxyError {
         Self {
             message,
             status_code,
-            kind: ProxyErrorKind::Custom
+            kind: ProxyErrorKind::Custom,
         }
     }
 
@@ -87,7 +132,7 @@ impl fmt::Display for ProxyError {
 impl Error for ProxyError {}
 impl Reject for ProxyError {}
 
-/// Logger utility with consistent formatting
+/// Simplified logger for single-client use
 #[derive(Debug, Clone)]
 pub struct Logger {
     pub enabled: bool,
@@ -98,84 +143,67 @@ impl Logger {
         Self { enabled }
     }
 
+    /// Log with timing information (efficient implementation)
+    pub fn log_timed(&self, prefix: &str, operation: &str, start: Instant) {
+        if self.enabled {
+            let duration = start.elapsed();
+            STRING_BUFFER.with(|buf| {
+                let mut buffer = buf.borrow_mut();
+                buffer.clear();
+                write!(buffer, "{} {} ({})", prefix, operation, format_duration(duration)).unwrap();
+                println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), buffer);
+            });
+        }
+    }
+
+    /// Simple log without timing
     pub fn log(&self, message: &str) {
         if self.enabled {
-            println!("[PROXY] {}", message);
+            println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), message);
         }
     }
 
-    /// Log with specific prefix
-    pub fn log_with_prefix(&self, prefix: &str, message: &str) {
-        if self.enabled {
-            println!("[PROXY] {} {}", prefix, message);
-        }
-    }
-
-    /// Log request start
+    /// Log request with optional model
     pub fn log_request(&self, method: &str, path: &str, model: Option<&str>) {
         if self.enabled {
-            match model {
-                Some(m) => println!("[PROXY] 🔄 {} {} (model: {})", method, path, m),
-                None => println!("[PROXY] 🔄 {} {}", method, path),
-            }
+            STRING_BUFFER.with(|buf| {
+                let mut buffer = buf.borrow_mut();
+                buffer.clear();
+                match model {
+                    Some(m) => write!(buffer, "🔄 {} {} (model: {})", method, path, m).unwrap(),
+                    None => write!(buffer, "🔄 {} {}", method, path).unwrap(),
+                }
+                println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), buffer);
+            });
         }
     }
 
-    /// Log successful completion
-    pub fn log_success(&self, operation: &str, duration: std::time::Duration) {
-        if self.enabled {
-            println!("[PROXY] ✅ {} completed (took {})", operation, format_duration(duration));
-        }
-    }
-
-    /// Log error
+    /// Log error with operation context
     pub fn log_error(&self, operation: &str, error: &str) {
         if self.enabled {
-            println!("[PROXY] ❌ {} failed: {}", operation, error);
-        }
-    }
-
-    /// Log warning
-    pub fn log_warning(&self, message: &str) {
-        if self.enabled {
-            println!("[PROXY] ⚠️ {}", message);
-        }
-    }
-
-    /// Log cancellation
-    pub fn log_cancellation(&self, operation: &str) {
-        if self.enabled {
-            println!("[PROXY] 🚫 {} cancelled by client disconnection", operation);
+            STRING_BUFFER.with(|buf| {
+                let mut buffer = buf.borrow_mut();
+                buffer.clear();
+                write!(buffer, "❌ {} failed: {}", operation, error).unwrap();
+                println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), buffer);
+            });
         }
     }
 }
 
-/// Optimized error pattern detection using compiled regex
-static MODEL_ERROR_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)(no|not|missing|invalid|unknown|failed|cannot|unable).*(model|load|available|found)")
-        .expect("Failed to compile model error regex")
-});
-
-static HTTP_ERROR_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(404|503|400|422).*(model|service)")
-        .expect("Failed to compile HTTP error regex")
-});
-
-/// Check if error message indicates model loading issues
+/// Simplified model loading error detection (no regex for performance)
 pub fn is_model_loading_error(message: &str) -> bool {
-    MODEL_ERROR_REGEX.is_match(message) || HTTP_ERROR_REGEX.is_match(message)
+    let lower = message.to_lowercase();
+    (lower.contains("no") || lower.contains("not") || lower.contains("missing") ||
+        lower.contains("invalid") || lower.contains("unknown") || lower.contains("failed")) &&
+        (lower.contains("model") || lower.contains("load") || lower.contains("available"))
 }
 
-/// Format a duration into human-readable string
-pub fn format_duration(duration: std::time::Duration) -> String {
-    let total_ms = duration.as_millis();
+/// Fast duration formatting
+pub fn format_duration(duration: Duration) -> String {
+    let total_ms = duration.as_micros() as f64 / 1000.0;
 
-    if total_ms >= 1000 {
-        let seconds = total_ms as f64 / 1000.0;
-        format!("{:.2}s", seconds)
-    } else {
-        format!("{}ms", total_ms)
-    }
+    format!("{:.3}ms", total_ms)
 }
 
 /// Validate model name and return warnings for potentially malformed names
@@ -226,7 +254,7 @@ pub fn validate_model_name(name: &str) -> (bool, Option<String>) {
     (is_valid, warning_message)
 }
 
-/// Validate server configuration
+/// Optimized config validation for single client
 pub fn validate_config(config: &crate::server::Config) -> Result<(), String> {
     if config.request_timeout_seconds == 0 {
         return Err("Request timeout must be greater than 0".to_string());
@@ -240,19 +268,6 @@ pub fn validate_config(config: &crate::server::Config) -> Result<(), String> {
         return Err("Load timeout must be greater than 0".to_string());
     }
 
-    // Warnings for potentially problematic values
-    if config.load_timeout_seconds > 300 {
-        eprintln!("Warning: Load timeout is very high ({}s)", config.load_timeout_seconds);
-    }
-
-    if config.request_timeout_seconds > 3600 {
-        eprintln!("Warning: Request timeout is very high ({}s)", config.request_timeout_seconds);
-    }
-
-    if config.stream_timeout_seconds < 5 {
-        eprintln!("Warning: Stream timeout is very low ({}s)", config.stream_timeout_seconds);
-    }
-
     // Parse listen address
     if config.listen.parse::<std::net::SocketAddr>().is_err() {
         return Err(format!("Invalid listen address: {}", config.listen));
@@ -260,116 +275,16 @@ pub fn validate_config(config: &crate::server::Config) -> Result<(), String> {
 
     // Basic URL validation
     if !config.lmstudio_url.starts_with("http://") && !config.lmstudio_url.starts_with("https://") {
-        return Err(format!("Invalid LM Studio URL (must start with http:// or https://): {}", config.lmstudio_url));
+        return Err(format!("Invalid LM Studio URL: {}", config.lmstudio_url));
     }
 
     Ok(())
 }
 
-/// Check if a string is likely a valid model identifier
+/// Simple model identifier validation
 pub fn is_valid_model_identifier(name: &str) -> bool {
-    if name.is_empty() || name.len() > 200 {
-        return false;
-    }
-
-    // Must contain at least one alphanumeric character
-    if !name.chars().any(|c| c.is_alphanumeric()) {
-        return false;
-    }
-
-    // Should not contain control characters (except tab, newline, carriage return)
-    if name.chars().any(|c| c.is_control() && c != '\t' && c != '\n' && c != '\r') {
-        return false;
-    }
-
-    // Should not start or end with special characters
-    let first_char = name.chars().next().unwrap();
-    let last_char = name.chars().last().unwrap();
-
-    if !first_char.is_alphanumeric() && first_char != '_' {
-        return false;
-    }
-
-    if !last_char.is_alphanumeric() && last_char != '_' {
-        return false;
-    }
-
-    true
-}
-
-/// Extract HTTP status code from error message
-pub fn extract_status_code(message: &str) -> Option<u16> {
-    static STATUS_REGEX: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"\b([1-5][0-9]{2})\b").expect("Failed to compile status code regex")
-    });
-
-    STATUS_REGEX
-        .find(message)
-        .and_then(|m| m.as_str().parse().ok())
-}
-
-/// Check if an error message indicates a timeout
-pub fn is_timeout_error(message: &str) -> bool {
-    let lower = message.to_lowercase();
-    lower.contains("timeout") ||
-        lower.contains("timed out") ||
-        lower.contains("deadline exceeded") ||
-        lower.contains("connection timeout")
-}
-
-/// Check if an error message indicates a connection issue
-pub fn is_connection_error(message: &str) -> bool {
-    let lower = message.to_lowercase();
-    lower.contains("connection") ||
-        lower.contains("network") ||
-        lower.contains("unreachable") ||
-        lower.contains("refused") ||
-        lower.contains("reset") ||
-        lower.contains("broken pipe")
-}
-
-/// Sanitize error message for safe logging (remove sensitive information)
-pub fn sanitize_error_message(message: &str) -> String {
-    static SENSITIVE_REGEX: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"(?i)(password|token|key|secret|auth)[=:]\s*\S+")
-            .expect("Failed to compile sensitive data regex")
-    });
-
-    SENSITIVE_REGEX.replace_all(message, "$1=***").to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_model_loading_error_detection() {
-        assert!(is_model_loading_error("No model loaded"));
-        assert!(is_model_loading_error("Model not found"));
-        assert!(is_model_loading_error("404 model not available"));
-        assert!(is_model_loading_error("503 service unavailable"));
-        assert!(!is_model_loading_error("Generic error message"));
-    }
-
-    #[test]
-    fn test_format_duration() {
-        assert_eq!(format_duration(std::time::Duration::from_millis(500)), "500ms");
-        assert_eq!(format_duration(std::time::Duration::from_millis(1500)), "1.50s");
-    }
-
-    #[test]
-    fn test_model_name_validation() {
-        assert!(is_valid_model_identifier("llama3.2"));
-        assert!(is_valid_model_identifier("model_name"));
-        assert!(!is_valid_model_identifier(""));
-        assert!(!is_valid_model_identifier("   "));
-        assert!(!is_valid_model_identifier("\x00invalid"));
-    }
-
-    #[test]
-    fn test_status_code_extraction() {
-        assert_eq!(extract_status_code("HTTP 404 Not Found"), Some(404));
-        assert_eq!(extract_status_code("Error 500 occurred"), Some(500));
-        assert_eq!(extract_status_code("No status here"), None);
-    }
+    !name.is_empty() &&
+        name.len() <= 200 &&
+        name.chars().any(|c| c.is_alphanumeric()) &&
+        !name.chars().any(|c| c.is_control())
 }

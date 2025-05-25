@@ -1,4 +1,4 @@
-// src/handlers/streaming.rs - Unified streaming response handling with optimized resource management
+// src/handlers/streaming.rs - Optimized streaming with fixed buffer overflow
 
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -15,7 +15,7 @@ use crate::handlers::helpers::{
 };
 use crate::utils::{Logger, ProxyError};
 
-/// Global counter for stream IDs
+/// Stream counter with overflow protection
 static STREAM_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Check if streaming is enabled in request
@@ -23,38 +23,35 @@ pub fn is_streaming_request(body: &Value) -> bool {
     body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false)
 }
 
-/// Handle streaming responses from LM Studio with improved resource management
+/// Optimized streaming response handler
 pub async fn handle_streaming_response(
     response: reqwest::Response,
     is_chat: bool,
     model: &str,
     start_time: Instant,
     cancellation_token: CancellationToken,
-    logger: Logger,
+    logger: &Logger,
     stream_timeout_seconds: u64,
 ) -> Result<warp::reply::Response, ProxyError> {
     let model = model.to_string();
     let (tx, rx) = mpsc::unbounded_channel::<Result<bytes::Bytes, std::io::Error>>();
 
-    // Generate unique stream ID
-    let stream_id = STREAM_COUNTER.fetch_add(1, Ordering::Relaxed);
+    // Generate stream ID with overflow protection
+    let stream_id = STREAM_COUNTER.fetch_add(1, Ordering::Relaxed) % 1_000_000;
 
     let model_clone = model.clone();
     let token_clone = cancellation_token.clone();
     let logger_clone = logger.clone();
 
     tokio::spawn(async move {
-        logger_clone.log_with_prefix(LOG_PREFIX_STREAM, &format!("[{}] Starting stream processing for model: {}", stream_id, model_clone));
-
         let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
+        let mut buffer = String::with_capacity(MAX_BUFFER_SIZE);
         let mut chunk_count = 0u64;
-        let mut partial_content = String::new();
+        let mut partial_content = String::with_capacity(MAX_PARTIAL_CONTENT_SIZE);
 
         let stream_result = 'stream: loop {
             // Check limits before processing
             if chunk_count >= MAX_CHUNK_COUNT {
-                logger_clone.log_warning(&format!("[{}] Reached max chunk limit: {}", stream_id, MAX_CHUNK_COUNT));
                 send_error_and_close(&tx, &model_clone, ERROR_CHUNK_LIMIT, is_chat).await;
                 break 'stream Err(ERROR_CHUNK_LIMIT.to_string());
             }
@@ -64,9 +61,8 @@ pub async fn handle_streaming_response(
                     match chunk_result {
                         Ok(Some(Ok(chunk))) => {
                             if let Ok(chunk_str) = std::str::from_utf8(&chunk) {
-                                // Prevent buffer overflow
+                                // Check buffer size BEFORE appending to prevent overflow
                                 if buffer.len() + chunk_str.len() > MAX_BUFFER_SIZE {
-                                    logger_clone.log_warning(&format!("[{}] Buffer overflow prevented", stream_id));
                                     send_error_and_close(&tx, &model_clone, ERROR_BUFFER_OVERFLOW, is_chat).await;
                                     break 'stream Err(ERROR_BUFFER_OVERFLOW.to_string());
                                 }
@@ -76,20 +72,19 @@ pub async fn handle_streaming_response(
                                 // Process complete SSE messages
                                 while let Some(message_end) = find_complete_sse_message(&buffer) {
                                     let message = buffer[..message_end].to_string();
-                                    buffer = buffer[message_end + 2..].to_string();
+                                    buffer.drain(..message_end + 2); // Remove processed message
 
                                     if let Some(ollama_chunk) = convert_sse_to_ollama(&message, &model_clone, is_chat) {
                                         chunk_count += 1;
 
-                                        // Track partial content (with size limit)
-                                        if let Some(content) = extract_content_from_chunk(&ollama_chunk) {
-                                            if partial_content.len() < MAX_PARTIAL_CONTENT_SIZE {
+                                        // Track partial content efficiently
+                                        if partial_content.len() < MAX_PARTIAL_CONTENT_SIZE {
+                                            if let Some(content) = extract_content_from_chunk(&ollama_chunk) {
                                                 partial_content.push_str(&content);
                                             }
                                         }
 
                                         if !send_chunk(&tx, &ollama_chunk).await {
-                                            logger_clone.log_cancellation(&format!("[{}] Client disconnected after {} chunks", stream_id, chunk_count));
                                             break 'stream Ok(());
                                         }
                                     }
@@ -97,23 +92,19 @@ pub async fn handle_streaming_response(
                             }
                         }
                         Ok(Some(Err(e))) => {
-                            logger_clone.log_error(&format!("[{}] Streaming", stream_id), &e.to_string());
                             send_error_and_close(&tx, &model_clone, &format!("Streaming error: {}", e), is_chat).await;
                             break 'stream Err(format!("Network error: {}", e));
                         }
                         Ok(None) => {
-                            logger_clone.log_success(&format!("[{}] Stream", stream_id), start_time.elapsed());
                             break 'stream Ok(());
                         }
                         Err(_) => {
-                            logger_clone.log_warning(&format!("[{}] Stream timeout after {}s", stream_id, stream_timeout_seconds));
-                            send_error_and_close(&tx, &model_clone, &format!("{} after {}s", ERROR_TIMEOUT, stream_timeout_seconds), is_chat).await;
+                            send_error_and_close(&tx, &model_clone, ERROR_TIMEOUT, is_chat).await;
                             break 'stream Err(ERROR_TIMEOUT.to_string());
                         }
                     }
                 }
                 _ = token_clone.cancelled() => {
-                    logger_clone.log_cancellation(&format!("[{}] Stream after {} chunks", stream_id, chunk_count));
                     let cancellation_chunk = create_cancellation_chunk(
                         &model_clone,
                         &partial_content,
@@ -127,35 +118,28 @@ pub async fn handle_streaming_response(
             }
         };
 
-        // Handle remaining buffer content if stream ended successfully
-        if stream_result.is_ok() && !token_clone.is_cancelled() && !buffer.trim().is_empty() {
-            if let Some(ollama_chunk) = convert_sse_to_ollama(&buffer, &model_clone, is_chat) {
-                chunk_count += 1;
-                send_chunk(&tx, &ollama_chunk).await;
-            }
-        }
-
         // Send final chunk if successful
-        if stream_result.is_ok() {
+        if stream_result.is_ok() && !token_clone.is_cancelled() {
             let final_chunk = create_final_chunk(&model_clone, start_time.elapsed(), chunk_count, is_chat);
             send_chunk_and_close(&tx, final_chunk).await;
-            logger_clone.log_success(&format!("[{}] Stream processing", stream_id), start_time.elapsed());
         }
+
+        logger_clone.log_timed("Stream processing", &format!("[{}]", stream_id), start_time);
     });
 
-    // Create streaming response with proper headers
     create_streaming_response(rx)
 }
 
-/// Handle direct streaming passthrough from LM Studio
+/// Optimized passthrough streaming
 pub async fn handle_passthrough_streaming_response(
     response: reqwest::Response,
     cancellation_token: CancellationToken,
-    logger: Logger,
+    logger: &Logger,
     stream_timeout_seconds: u64,
 ) -> Result<warp::reply::Response, ProxyError> {
     let (tx, rx) = mpsc::unbounded_channel::<Result<bytes::Bytes, std::io::Error>>();
-    let stream_id = STREAM_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let stream_id = STREAM_COUNTER.fetch_add(1, Ordering::Relaxed) % 1_000_000;
+    let start_time = Instant::now();
 
     let logger_clone = logger.clone();
     tokio::spawn(async move {
@@ -167,7 +151,6 @@ pub async fn handle_passthrough_streaming_response(
                     match chunk_result {
                         Ok(Some(Ok(chunk))) => {
                             if tx.send(Ok(chunk)).is_err() {
-                                logger_clone.log_cancellation(&format!("[{}] Passthrough stream", stream_id));
                                 break;
                             }
                         }
@@ -176,37 +159,34 @@ pub async fn handle_passthrough_streaming_response(
                             let _ = tx.send(Ok(bytes::Bytes::from(error_data)));
                             break;
                         }
-                        Ok(None) => {
-                            logger_clone.log_success(&format!("[{}] Passthrough stream", stream_id), Instant::now().elapsed());
-                            break;
-                        }
+                        Ok(None) => break,
                         Err(_) => {
-                            logger_clone.log_warning(&format!("[{}] Passthrough stream timeout after {}s", stream_id, stream_timeout_seconds));
-                            let timeout_data = format!("data: {{\"error\": \"{} after {}s\"}}\n\n", ERROR_TIMEOUT, stream_timeout_seconds);
+                            let timeout_data = format!("data: {{\"error\": \"{}\"}}\n\n", ERROR_TIMEOUT);
                             let _ = tx.send(Ok(bytes::Bytes::from(timeout_data)));
                             break;
                         }
                     }
                 }
                 _ = cancellation_token.cancelled() => {
-                    logger_clone.log_cancellation(&format!("[{}] Passthrough stream", stream_id));
                     let cancel_data = format!("data: {{\"cancelled\": true, \"message\": \"{}\"}}\n\n", ERROR_CANCELLED);
                     let _ = tx.send(Ok(bytes::Bytes::from(cancel_data)));
                     break;
                 }
             }
         }
+
+        logger_clone.log_timed("Passthrough stream", &format!("[{}]", stream_id), start_time);
     });
 
     create_passthrough_streaming_response(rx)
 }
 
-/// Unified SSE to Ollama conversion function
+/// Fast SSE to Ollama conversion
 fn convert_sse_to_ollama(sse_message: &str, model: &str, is_chat: bool) -> Option<Value> {
     for line in sse_message.lines() {
         if let Some(data) = line.strip_prefix(SSE_DATA_PREFIX) {
             if data.trim() == SSE_DONE_MESSAGE {
-                return None; // End of stream
+                return None;
             }
 
             if let Ok(json_data) = serde_json::from_str::<Value>(data) {
@@ -227,7 +207,7 @@ fn convert_sse_to_ollama(sse_message: &str, model: &str, is_chat: bool) -> Optio
     None
 }
 
-/// Extract content from LM Studio SSE chat message
+/// Extract chat content from LM Studio response
 fn extract_chat_content(json_data: &Value) -> Option<String> {
     json_data
         .get("choices")?
@@ -239,7 +219,7 @@ fn extract_chat_content(json_data: &Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Extract content from LM Studio SSE completion message
+/// Extract completion content from LM Studio response
 fn extract_completion_content(json_data: &Value) -> Option<String> {
     json_data
         .get("choices")?
@@ -250,7 +230,7 @@ fn extract_completion_content(json_data: &Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Create Ollama-formatted streaming chunk
+/// Create Ollama-formatted chunk
 fn create_ollama_chunk(model: &str, content: &str, is_chat: bool) -> Value {
     let timestamp = chrono::Utc::now().to_rfc3339();
 
@@ -274,14 +254,13 @@ fn create_ollama_chunk(model: &str, content: &str, is_chat: bool) -> Value {
     }
 }
 
-/// Find complete SSE message boundary in buffer
+/// Optimized SSE message boundary detection
 fn find_complete_sse_message(buffer: &str) -> Option<usize> {
     let mut pos = 0;
     while let Some(found) = buffer[pos..].find(SSE_MESSAGE_BOUNDARY) {
         let end_pos = pos + found;
         let message = &buffer[..end_pos];
 
-        // Verify this looks like a complete SSE message
         if message.lines().any(|line| line.starts_with(SSE_DATA_PREFIX)) {
             return Some(end_pos);
         }
@@ -294,14 +273,14 @@ fn find_complete_sse_message(buffer: &str) -> Option<usize> {
     None
 }
 
-/// Send a chunk and return false if client disconnected
+/// Send chunk and detect client disconnect
 async fn send_chunk(tx: &mpsc::UnboundedSender<Result<bytes::Bytes, std::io::Error>>, chunk: &Value) -> bool {
     let chunk_json = serde_json::to_string(chunk).unwrap_or_default();
     let chunk_with_newline = format!("{}\n", chunk_json);
     tx.send(Ok(bytes::Bytes::from(chunk_with_newline))).is_ok()
 }
 
-/// Send a chunk and close the stream
+/// Send chunk and close stream
 async fn send_chunk_and_close(
     tx: &mpsc::UnboundedSender<Result<bytes::Bytes, std::io::Error>>,
     chunk: Value,
@@ -311,7 +290,7 @@ async fn send_chunk_and_close(
     let _ = tx.send(Ok(bytes::Bytes::from(chunk_with_newline)));
 }
 
-/// Send error chunk and close stream
+/// Send error and close stream
 async fn send_error_and_close(
     tx: &mpsc::UnboundedSender<Result<bytes::Bytes, std::io::Error>>,
     model: &str,
@@ -322,7 +301,7 @@ async fn send_error_and_close(
     send_chunk_and_close(tx, error_chunk).await;
 }
 
-/// Create streaming response with proper headers for Ollama compatibility
+/// Create streaming response
 fn create_streaming_response(
     rx: mpsc::UnboundedReceiver<Result<bytes::Bytes, std::io::Error>>,
 ) -> Result<warp::reply::Response, ProxyError> {
@@ -337,10 +316,10 @@ fn create_streaming_response(
         .header("access-control-allow-methods", HEADER_ACCESS_CONTROL_ALLOW_METHODS)
         .header("access-control-allow-headers", HEADER_ACCESS_CONTROL_ALLOW_HEADERS)
         .body(warp::hyper::Body::wrap_stream(stream))
-        .map_err(|e| ProxyError::internal_server_error(&format!("Failed to create streaming response: {}", e)))
+        .map_err(|_| ProxyError::internal_server_error("Failed to create streaming response"))
 }
 
-/// Create passthrough streaming response with SSE headers
+/// Create passthrough streaming response
 fn create_passthrough_streaming_response(
     rx: mpsc::UnboundedReceiver<Result<bytes::Bytes, std::io::Error>>,
 ) -> Result<warp::reply::Response, ProxyError> {
@@ -355,5 +334,5 @@ fn create_passthrough_streaming_response(
         .header("access-control-allow-methods", HEADER_ACCESS_CONTROL_ALLOW_METHODS)
         .header("access-control-allow-headers", HEADER_ACCESS_CONTROL_ALLOW_HEADERS)
         .body(warp::hyper::Body::wrap_stream(stream))
-        .map_err(|e| ProxyError::internal_server_error(&format!("Failed to create passthrough streaming response: {}", e)))
+        .map_err(|_| ProxyError::internal_server_error("Failed to create passthrough streaming response"))
 }
