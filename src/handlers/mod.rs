@@ -1,4 +1,4 @@
-// src/handlers/mod.rs - Module organization
+// src/handlers/mod.rs - Updated module organization with consolidated systems
 
 pub mod retry;
 pub mod streaming;
@@ -6,7 +6,7 @@ pub mod helpers;
 pub mod ollama;
 pub mod lmstudio;
 
-// Ollama handlers
+// Ollama API handlers
 pub use ollama::{
     handle_ollama_tags,
     handle_ollama_chat,
@@ -21,6 +21,8 @@ pub use ollama::{
 // LM Studio handlers
 pub use lmstudio::{
     handle_lmstudio_passthrough,
+    validate_lmstudio_endpoint,
+    get_lmstudio_status,
 };
 
 // Streaming functions
@@ -37,5 +39,14 @@ pub use retry::{
     with_simple_retry,
 };
 
-// Helper functions
-pub use helpers::*;
+// Helper functions and utilities
+pub use helpers::{
+    json_response,
+    ResponseTransformer,
+    TimingInfo,
+    build_lm_studio_request,
+    extract_content_from_chunk,
+    create_error_chunk,
+    create_cancellation_chunk,
+    create_final_chunk,
+};

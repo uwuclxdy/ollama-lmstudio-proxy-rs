@@ -1,16 +1,10 @@
-// src/utils.rs - Consolidated utilities with optimized lookups and centralized model resolution
+// src/utils.rs - Optimized utilities with centralized error handling
 
-use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
 use warp::reject::Reject;
-use tokio_util::sync::CancellationToken;
-use serde_json::Value;
+use regex::Regex;
 use once_cell::sync::Lazy;
-
-use crate::common::CancellableRequest;
-use crate::server::ProxyServer;
 
 /// Custom error type for the proxy server
 #[derive(Debug, Clone)]
@@ -93,7 +87,7 @@ impl fmt::Display for ProxyError {
 impl Error for ProxyError {}
 impl Reject for ProxyError {}
 
-/// Logger utility
+/// Logger utility with consistent formatting
 #[derive(Debug, Clone)]
 pub struct Logger {
     pub enabled: bool,
@@ -109,93 +103,67 @@ impl Logger {
             println!("[PROXY] {}", message);
         }
     }
-}
 
-// ===== OPTIMIZED LOOKUP TABLES =====
-
-/// Optimized parameter size lookup using HashMap for O(1) access
-static PARAMETER_SIZES: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
-    let mut map = HashMap::new();
-    map.insert("0.5b", "0.5B");
-    map.insert("1.5b", "1.5B");
-    map.insert("2b", "2B");
-    map.insert("3b", "3B");
-    map.insert("7b", "7B");
-    map.insert("8b", "8B");
-    map.insert("9b", "9B");
-    map.insert("13b", "13B");
-    map.insert("14b", "14B");
-    map.insert("27b", "27B");
-    map.insert("30b", "30B");
-    map.insert("32b", "32B");
-    map.insert("70b", "70B");
-    map
-});
-
-/// Optimized error pattern detection using static patterns
-static ERROR_PATTERNS: Lazy<Vec<&'static str>> = Lazy::new(|| {
-    vec![
-        "no model", "model not loaded", "no models loaded", "model loading",
-        "load a model", "model is not loaded", "model not found", "model not available",
-        "model does not exist", "unknown model", "invalid model", "model not supported",
-        "model mismatch", "requested model", "model is not available", "failed to load model",
-        "model failed to load", "cannot find model", "model path not found", "model file not found",
-        "model switching", "switching model", "model switch", "loading model",
-        "model initialization", "model not ready", "model busy", "model unavailable",
-        "please load a model", "no active model", "model required", "specify a model",
-        "missing model", "model parameter"
-    ]
-});
-
-// ===== CORE UTILITIES =====
-
-/// Clean model name by removing :latest and numeric suffixes
-pub fn clean_model_name(name: &str) -> String {
-    if name.is_empty() {
-        return name.to_string();
-    }
-
-    let after_latest = if name.ends_with(":latest") {
-        &name[..name.len() - 7]
-    } else {
-        name
-    };
-
-    if let Some(colon_pos) = after_latest.rfind(':') {
-        let suffix = &after_latest[colon_pos + 1..];
-
-        if !suffix.is_empty()
-            && suffix.chars().all(|c| c.is_ascii_digit())
-            && colon_pos > 0 {
-            return after_latest[..colon_pos].to_string();
+    /// Log with specific prefix
+    pub fn log_with_prefix(&self, prefix: &str, message: &str) {
+        if self.enabled {
+            println!("[PROXY] {} {}", prefix, message);
         }
     }
 
-    after_latest.to_string()
-}
-
-/// Determine parameter size based on model name using optimized lookup
-pub fn determine_parameter_size(model_name: &str) -> &'static str {
-    let lower_name = model_name.to_lowercase();
-
-    for (pattern, size) in PARAMETER_SIZES.iter() {
-        if lower_name.contains(pattern) {
-            return size;
+    /// Log request start
+    pub fn log_request(&self, method: &str, path: &str, model: Option<&str>) {
+        if self.enabled {
+            match model {
+                Some(m) => println!("[PROXY] 🔄 {} {} (model: {})", method, path, m),
+                None => println!("[PROXY] 🔄 {} {}", method, path),
+            }
         }
     }
 
-    "7B" // Fallback
+    /// Log successful completion
+    pub fn log_success(&self, operation: &str, duration: std::time::Duration) {
+        if self.enabled {
+            println!("[PROXY] ✅ {} completed (took {})", operation, format_duration(duration));
+        }
+    }
+
+    /// Log error
+    pub fn log_error(&self, operation: &str, error: &str) {
+        if self.enabled {
+            println!("[PROXY] ❌ {} failed: {}", operation, error);
+        }
+    }
+
+    /// Log warning
+    pub fn log_warning(&self, message: &str) {
+        if self.enabled {
+            println!("[PROXY] ⚠️ {}", message);
+        }
+    }
+
+    /// Log cancellation
+    pub fn log_cancellation(&self, operation: &str) {
+        if self.enabled {
+            println!("[PROXY] 🚫 {} cancelled by client disconnection", operation);
+        }
+    }
 }
 
-/// Check if error indicates model loading issues using optimized pattern matching
+/// Optimized error pattern detection using compiled regex
+static MODEL_ERROR_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(no|not|missing|invalid|unknown|failed|cannot|unable).*(model|load|available|found)")
+        .expect("Failed to compile model error regex")
+});
+
+static HTTP_ERROR_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(404|503|400|422).*(model|service)")
+        .expect("Failed to compile HTTP error regex")
+});
+
+/// Check if error message indicates model loading issues
 pub fn is_model_loading_error(message: &str) -> bool {
-    let lower_msg = message.to_lowercase();
-
-    ERROR_PATTERNS.iter().any(|pattern| lower_msg.contains(pattern))
-        || (lower_msg.contains("404") && lower_msg.contains("model"))
-        || (lower_msg.contains("400") && (lower_msg.contains("model") || lower_msg.contains("invalid")))
-        || (lower_msg.contains("422") && lower_msg.contains("model"))
-        || (lower_msg.contains("503") && (lower_msg.contains("model") || lower_msg.contains("service")))
+    MODEL_ERROR_REGEX.is_match(message) || HTTP_ERROR_REGEX.is_match(message)
 }
 
 /// Format a duration into human-readable string
@@ -218,33 +186,34 @@ pub fn validate_model_name(name: &str) -> (bool, Option<String>) {
 
     let mut warnings = Vec::new();
 
+    // Check for common issues
     if name.contains("::") {
-        warnings.push("Multiple consecutive colons detected".to_string());
+        warnings.push("Multiple consecutive colons".to_string());
     }
 
     if name.starts_with(':') && name.len() > 1 {
-        warnings.push("Model name starts with colon".to_string());
+        warnings.push("Starts with colon".to_string());
     }
 
     if name.ends_with(':') {
-        warnings.push("Model name ends with colon".to_string());
+        warnings.push("Ends with colon".to_string());
     }
 
     if name.len() > 200 {
-        warnings.push("Model name is unusually long".to_string());
+        warnings.push("Unusually long name".to_string());
     }
 
     if name.contains(char::is_whitespace) {
-        warnings.push("Model name contains whitespace characters".to_string());
+        warnings.push("Contains whitespace".to_string());
     }
 
     if name.chars().any(|c| c.is_control() && c != '\t' && c != '\n' && c != '\r') {
-        warnings.push("Model name contains control characters".to_string());
+        warnings.push("Contains control characters".to_string());
     }
 
     let colon_count = name.matches(':').count();
     if colon_count > 4 {
-        warnings.push(format!("Model name has {} colons, which seems excessive", colon_count));
+        warnings.push(format!("Too many colons ({})", colon_count));
     }
 
     let is_valid = warnings.is_empty();
@@ -257,146 +226,150 @@ pub fn validate_model_name(name: &str) -> (bool, Option<String>) {
     (is_valid, warning_message)
 }
 
-// ===== CENTRALIZED MODEL RESOLVER =====
+/// Validate server configuration
+pub fn validate_config(config: &crate::server::Config) -> Result<(), String> {
+    if config.request_timeout_seconds == 0 {
+        return Err("Request timeout must be greater than 0".to_string());
+    }
 
-/// Centralized model resolver - handles all model name resolution logic
-pub struct ModelResolver {
-    server: Arc<ProxyServer>,
+    if config.stream_timeout_seconds == 0 {
+        return Err("Stream timeout must be greater than 0".to_string());
+    }
+
+    if config.load_timeout_seconds == 0 {
+        return Err("Load timeout must be greater than 0".to_string());
+    }
+
+    // Warnings for potentially problematic values
+    if config.load_timeout_seconds > 300 {
+        eprintln!("Warning: Load timeout is very high ({}s)", config.load_timeout_seconds);
+    }
+
+    if config.request_timeout_seconds > 3600 {
+        eprintln!("Warning: Request timeout is very high ({}s)", config.request_timeout_seconds);
+    }
+
+    if config.stream_timeout_seconds < 5 {
+        eprintln!("Warning: Stream timeout is very low ({}s)", config.stream_timeout_seconds);
+    }
+
+    // Parse listen address
+    if config.listen.parse::<std::net::SocketAddr>().is_err() {
+        return Err(format!("Invalid listen address: {}", config.listen));
+    }
+
+    // Basic URL validation
+    if !config.lmstudio_url.starts_with("http://") && !config.lmstudio_url.starts_with("https://") {
+        return Err(format!("Invalid LM Studio URL (must start with http:// or https://): {}", config.lmstudio_url));
+    }
+
+    Ok(())
 }
 
-impl ModelResolver {
-    pub fn new(server: Arc<ProxyServer>) -> Self {
-        Self { server }
+/// Check if a string is likely a valid model identifier
+pub fn is_valid_model_identifier(name: &str) -> bool {
+    if name.is_empty() || name.len() > 200 {
+        return false;
     }
 
-    /// Resolve Ollama model name to actual LM Studio model name
-    /// This is the SINGLE source of truth for model resolution
-    pub async fn resolve_model_name(
-        &self,
-        ollama_model: &str,
-        cancellation_token: CancellationToken,
-    ) -> Result<String, ProxyError> {
-        let cleaned_ollama = clean_model_name(ollama_model);
-
-        // Get available models from LM Studio
-        let available_models = self.get_available_models(cancellation_token).await?;
-
-        // Find the best match using simplified logic
-        if let Some(matched_model) = self.find_best_match(&cleaned_ollama, &available_models) {
-            self.server.logger.log(&format!("✅ Resolved '{}' -> '{}'", ollama_model, matched_model));
-            Ok(matched_model)
-        } else {
-            // Fallback to cleaned name - let LM Studio handle it
-            self.server.logger.log(&format!("⚠️  No match found for '{}', using cleaned name '{}'", ollama_model, cleaned_ollama));
-            Ok(cleaned_ollama)
-        }
+    // Must contain at least one alphanumeric character
+    if !name.chars().any(|c| c.is_alphanumeric()) {
+        return false;
     }
 
-    /// Get available models from LM Studio
-    async fn get_available_models(&self, cancellation_token: CancellationToken) -> Result<Vec<String>, ProxyError> {
-        let url = format!("{}/v1/models", self.server.config.lmstudio_url);
-
-        let request = CancellableRequest::new(
-            self.server.client.clone(),
-            cancellation_token,
-            self.server.logger.clone(),
-            self.server.config.request_timeout_seconds
-        );
-
-        let response = match request.make_request(reqwest::Method::GET, &url, None).await {
-            Ok(response) => response,
-            Err(_) => {
-                // Return empty list
-                return Ok(vec![]);
-            }
-        };
-
-        if !response.status().is_success() {
-            return Ok(vec![]);
-        }
-
-        let models_response: Value = match response.json().await {
-            Ok(json) => json,
-            Err(_) => return Ok(vec![]),
-        };
-
-        let mut model_names = Vec::new();
-        if let Some(data) = models_response.get("data").and_then(|d| d.as_array()) {
-            for model in data {
-                if let Some(model_id) = model.get("id").and_then(|id| id.as_str()) {
-                    model_names.push(model_id.to_string());
-                }
-            }
-        }
-
-        Ok(model_names)
+    // Should not contain control characters (except tab, newline, carriage return)
+    if name.chars().any(|c| c.is_control() && c != '\t' && c != '\n' && c != '\r') {
+        return false;
     }
 
-    /// Find the best matching LM Studio model for an Ollama model name
-    /// Simplified logic - no hardcoded mappings, just pattern matching
-    fn find_best_match(&self, ollama_name: &str, available_models: &[String]) -> Option<String> {
-        let lower_ollama = ollama_name.to_lowercase();
+    // Should not start or end with special characters
+    let first_char = name.chars().next().unwrap();
+    let last_char = name.chars().last().unwrap();
 
-        // Direct match first
-        for model in available_models {
-            if model.to_lowercase() == lower_ollama {
-                return Some(model.clone());
-            }
-        }
-
-        // Family and size matching
-        for model in available_models {
-            let lower_model = model.to_lowercase();
-
-            // Check for family match + size match
-            if self.models_match_family_and_size(&lower_ollama, &lower_model) {
-                return Some(model.clone());
-            }
-        }
-
-        // Fallback: partial name matching
-        for model in available_models {
-            let lower_model = model.to_lowercase();
-            let ollama_parts: Vec<&str> = lower_ollama.split(&['-', '_', ':', '.']).filter(|s| s.len() > 2).collect();
-            let mut matches = 0;
-
-            for part in &ollama_parts {
-                if lower_model.contains(part) {
-                    matches += 1;
-                }
-            }
-
-            // If at least 2 significant parts match, consider it a candidate
-            if matches >= 2 {
-                return Some(model.clone());
-            }
-        }
-
-        None
+    if !first_char.is_alphanumeric() && first_char != '_' {
+        return false;
     }
 
-    /// Check if two model names match in family and size
-    fn models_match_family_and_size(&self, ollama_name: &str, lm_name: &str) -> bool {
-        let families = ["llama", "qwen", "mistral", "gemma", "phi", "deepseek"];
-        let sizes = ["0.5b", "1.5b", "2b", "3b", "7b", "8b", "9b", "13b", "14b", "27b", "30b", "32b", "70b"];
+    if !last_char.is_alphanumeric() && last_char != '_' {
+        return false;
+    }
 
-        // Check family match
-        let family_match = families.iter().any(|family| {
-            ollama_name.contains(family) && lm_name.contains(family)
-        });
+    true
+}
 
-        if !family_match {
-            return false;
-        }
+/// Extract HTTP status code from error message
+pub fn extract_status_code(message: &str) -> Option<u16> {
+    static STATUS_REGEX: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"\b([1-5][0-9]{2})\b").expect("Failed to compile status code regex")
+    });
 
-        // Check size match
-        for size in &sizes {
-            if ollama_name.contains(size) && lm_name.contains(size) {
-                return true;
-            }
-        }
+    STATUS_REGEX
+        .find(message)
+        .and_then(|m| m.as_str().parse().ok())
+}
 
-        // If no size found in either, consider them matching (size unknown)
-        true
+/// Check if an error message indicates a timeout
+pub fn is_timeout_error(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("timeout") ||
+        lower.contains("timed out") ||
+        lower.contains("deadline exceeded") ||
+        lower.contains("connection timeout")
+}
+
+/// Check if an error message indicates a connection issue
+pub fn is_connection_error(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("connection") ||
+        lower.contains("network") ||
+        lower.contains("unreachable") ||
+        lower.contains("refused") ||
+        lower.contains("reset") ||
+        lower.contains("broken pipe")
+}
+
+/// Sanitize error message for safe logging (remove sensitive information)
+pub fn sanitize_error_message(message: &str) -> String {
+    static SENSITIVE_REGEX: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"(?i)(password|token|key|secret|auth)[=:]\s*\S+")
+            .expect("Failed to compile sensitive data regex")
+    });
+
+    SENSITIVE_REGEX.replace_all(message, "$1=***").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_model_loading_error_detection() {
+        assert!(is_model_loading_error("No model loaded"));
+        assert!(is_model_loading_error("Model not found"));
+        assert!(is_model_loading_error("404 model not available"));
+        assert!(is_model_loading_error("503 service unavailable"));
+        assert!(!is_model_loading_error("Generic error message"));
+    }
+
+    #[test]
+    fn test_format_duration() {
+        assert_eq!(format_duration(std::time::Duration::from_millis(500)), "500ms");
+        assert_eq!(format_duration(std::time::Duration::from_millis(1500)), "1.50s");
+    }
+
+    #[test]
+    fn test_model_name_validation() {
+        assert!(is_valid_model_identifier("llama3.2"));
+        assert!(is_valid_model_identifier("model_name"));
+        assert!(!is_valid_model_identifier(""));
+        assert!(!is_valid_model_identifier("   "));
+        assert!(!is_valid_model_identifier("\x00invalid"));
+    }
+
+    #[test]
+    fn test_status_code_extraction() {
+        assert_eq!(extract_status_code("HTTP 404 Not Found"), Some(404));
+        assert_eq!(extract_status_code("Error 500 occurred"), Some(500));
+        assert_eq!(extract_status_code("No status here"), None);
     }
 }

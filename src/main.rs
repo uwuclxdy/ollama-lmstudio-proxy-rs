@@ -7,7 +7,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::parse();
 
     // Run the proxy server
-    let server = ProxyServer::new(config);
+    let server = ProxyServer::new(config)?;
     server.run().await?;
 
     Ok(())
