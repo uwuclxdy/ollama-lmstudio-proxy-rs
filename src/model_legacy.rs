@@ -6,8 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::common::CancellableRequest;
 use crate::constants::*;
-use crate::utils::{log_info, ProxyError};
-use crate::{log_timed, log_warning};
+use crate::utils::{log_timed, log_warning, ProxyError};
 
 /// Legacy model information with calculated estimates
 #[derive(Debug, Clone)]
@@ -514,14 +513,11 @@ impl ModelResolverLegacy {
         let cleaned_ollama_request = clean_model_name_legacy(ollama_model_name_requested).to_string();
 
         if let Some(cached_lm_studio_id) = self.cache.get(&cleaned_ollama_request).await {
-            log_timed(LOG_PREFIX_SUCCESS, &format!(
-                "Cache hit - legacy: '{}' -> '{}'",
-                cleaned_ollama_request, cached_lm_studio_id
-            ), start_time);
+            log_timed(LOG_PREFIX_SUCCESS, &format!("Cache hit (legacy): '{}' -> '{}'", cleaned_ollama_request, cached_lm_studio_id), start_time);
             return Ok(cached_lm_studio_id);
         }
 
-        log_warning("Fetching from LM Studio - legacy.", &format!("Cache miss: '{}'.", cleaned_ollama_request));
+        log_warning("Cache miss", &format!("Fetching '{}' from LM Studio (legacy)", cleaned_ollama_request));
 
         match self
             .get_available_lm_studio_models_legacy(client, cancellation_token)
@@ -534,10 +530,7 @@ impl ModelResolverLegacy {
                     self.cache
                         .insert(cleaned_ollama_request.clone(), matched_lm_studio_id.clone())
                         .await;
-                    log_info(&format!(
-                        "Resolved and cached (legacy): '{}' -> '{}'",
-                        cleaned_ollama_request, matched_lm_studio_id
-                    ));
+                    log_timed(LOG_PREFIX_SUCCESS, &format!("Resolved (legacy): '{}' -> '{}'", cleaned_ollama_request, matched_lm_studio_id), start_time);
                     Ok(matched_lm_studio_id)
                 } else {
                     Ok(cleaned_ollama_request)

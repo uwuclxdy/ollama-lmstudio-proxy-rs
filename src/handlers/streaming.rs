@@ -12,7 +12,7 @@ use crate::constants::*;
 use crate::handlers::helpers::{
     create_cancellation_chunk, create_error_chunk, create_final_chunk, create_ollama_streaming_chunk,
 };
-use crate::utils::{log_error, log_info, log_timed, log_warning, ProxyError};
+use crate::utils::{log_error, log_timed, log_warning, ProxyError};
 
 static STREAM_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -38,6 +38,7 @@ pub async fn handle_streaming_response(
     let (tx, rx) = mpsc::unbounded_channel::<Result<bytes::Bytes, std::io::Error>>();
 
     let stream_id = STREAM_COUNTER.fetch_add(1, Ordering::Relaxed) % 1_000_000;
+    let model_loading_start = Instant::now();
 
     let model_clone_for_task = ollama_model_name.clone();
     let token_clone = cancellation_token.clone();
@@ -72,10 +73,7 @@ pub async fn handle_streaming_response(
                                 let time_to_first_chunk = start_time.elapsed();
 
                                 if time_to_first_chunk.as_millis() > STREAM_START_LOADING_THRESHOLD_MS {
-                                    log_info(&format!(
-                                        "{} loaded | took {}ms",
-                                        model_clone_for_task, time_to_first_chunk.as_millis()
-                                    ));
+                                    log_timed(LOG_PREFIX_SUCCESS, &format!("{} loaded", model_clone_for_task), model_loading_start);
                                 }
                             }
 
@@ -129,11 +127,11 @@ pub async fn handle_streaming_response(
                                                 }
                                             }
                                             Err(e) => {
-                                                log_error("SSE JSON parsing", &format!("Failed to parse LM Studio SSE data: {}. Data: '{}'", e, data_content));
+                                                log_error("SSE parsing", &format!("Invalid JSON: {}", e));
                                             }
                                         }
                                     } else if !message_text.trim().is_empty() {
-                                         log_warning("SSE format", &format!("Received non-standard SSE line: {}", message_text));
+                                         log_warning("SSE format", &format!("Non-standard line: {}", message_text));
                                     }
                                 }
                             } else {
@@ -146,7 +144,7 @@ pub async fn handle_streaming_response(
                             break 'stream_loop Err(format!("Network error: {}", e));
                         }
                         Ok(None) => {
-                            log_warning("Stream ended prematurely", "LM Studio stream ended without [DONE]");
+                            log_warning("Stream end", "LM Studio ended without [DONE]");
                             break 'stream_loop Ok(());
                         }
                         Err(_) => {
@@ -168,7 +166,7 @@ pub async fn handle_streaming_response(
             send_chunk_and_close_channel(&tx, final_chunk).await;
         }
 
-        log_timed("Stream processing", &format!("[{}] {} Ollama chunks", stream_id, chunk_count), start_time);
+        log_timed(LOG_PREFIX_CONN, &format!("Stream [{}] completed | {} chunks", stream_id, chunk_count), start_time);
     });
 
     create_ollama_streaming_response_format(rx)
@@ -220,7 +218,7 @@ pub async fn handle_passthrough_streaming_response(
             }
         }
 
-        log_timed(LOG_PREFIX_SUCCESS,&format!("Passthrough stream [{}] finished! | {} chunks", stream_id, chunk_count), start_time);
+        log_timed(LOG_PREFIX_CONN, &format!("Passthrough stream [{}] | {} chunks", stream_id, chunk_count), start_time);
     });
 
     create_passthrough_streaming_response_format(rx)
@@ -229,7 +227,7 @@ pub async fn handle_passthrough_streaming_response(
 /// Send Ollama chunk to client
 async fn send_ollama_chunk(tx: &mpsc::UnboundedSender<Result<bytes::Bytes, std::io::Error>>, chunk: &Value) -> bool {
     let chunk_json = serde_json::to_string(chunk).unwrap_or_else(|e| {
-        log_error("Chunk serialization", &format!("Failed to serialize Ollama chunk: {}", e));
+        log_error("Chunk serialization", &format!("Failed to serialize: {}", e));
         String::from("{\"error\":\"Internal proxy error: failed to serialize chunk\"}")
     });
     let chunk_with_newline = format!("{}\n", chunk_json);

@@ -43,7 +43,7 @@ pub fn log_warning(operation: &str, warning: &str) {
         STRING_BUFFER.with(|buf| {
             let mut buffer = buf.borrow_mut();
             buffer.clear();
-            write!(buffer, "{} {} {}", LOG_PREFIX_WARNING, sanitize_log_message(warning), sanitize_log_message(operation)).unwrap();
+            write!(buffer, "{} {}: {}", LOG_PREFIX_WARNING, sanitize_log_message(operation), sanitize_log_message(warning)).unwrap();
             println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), buffer);
         });
     }

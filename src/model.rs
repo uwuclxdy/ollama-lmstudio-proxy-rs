@@ -7,8 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::common::CancellableRequest;
 use crate::constants::*;
-use crate::log_timed;
-use crate::utils::{log_warning, ProxyError};
+use crate::utils::{log_timed, log_warning, ProxyError};
 
 /// Native LM Studio model data from /api/v0/models
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -295,31 +294,22 @@ impl ModelResolver {
 
         // Check cache first
         if let Some(cached_lm_studio_id) = self.cache.get(&cleaned_ollama_request).await {
-            log_timed(LOG_PREFIX_SUCCESS, &format!(
-                "Cache hit - native API: '{}' -> '{}'",
-                cleaned_ollama_request, cached_lm_studio_id
-            ), start_time);
+            log_timed(LOG_PREFIX_SUCCESS, &format!("Cache hit: '{}' -> '{}'", cleaned_ollama_request, cached_lm_studio_id), start_time);
             return Ok(cached_lm_studio_id);
         }
 
-        log_warning("Fetching from LM Studio - native API.", &format!("Cache miss: '{}'.", cleaned_ollama_request));
+        log_warning("Cache miss", &format!("Fetching '{}' from LM Studio", cleaned_ollama_request));
 
         match self.get_available_lm_studio_models_native(client, cancellation_token).await {
             Ok(available_models) => {
                 if let Some(matched_model) = self.find_best_match_native(&cleaned_ollama_request, &available_models) {
                     // Check if model is loaded for strict error handling
                     if !matched_model.is_loaded {
-                        log_warning(
-                            "",
-                            &format!(
-                                "Model '{}' found but not loaded (state: {}). This may cause request failures.",
-                                matched_model.id, matched_model.state
-                            ),
-                        );
+                        log_warning("Model state", &format!("'{}' found but not loaded (state: {})", matched_model.id, matched_model.state));
                     }
 
                     self.cache.insert(cleaned_ollama_request.clone(), matched_model.id.clone()).await;
-                    log_timed(LOG_PREFIX_INFO, &format!("Resolved and cached: '{}' -> '{}' (state: {})", cleaned_ollama_request, matched_model.id, matched_model.state), start_time);
+                    log_timed(LOG_PREFIX_SUCCESS, &format!("Resolved: '{}' -> '{}' ({})", cleaned_ollama_request, matched_model.id, matched_model.state), start_time);
                     Ok(matched_model.id)
                 } else {
                     // Strict error handling - don't allow unknown models
@@ -367,7 +357,7 @@ impl ModelResolver {
         if !response.status().is_success() {
             return Err(ProxyError::new(
                 format!(
-                    "LM Studio native API error ({}): {}. Try --legacy flag for older LM Studio versions.",
+                    "Native API error ({}): {}. Try --legacy flag for older versions",
                     response.status(), ERROR_LM_STUDIO_UNAVAILABLE
                 ),
                 response.status().as_u16(),
@@ -379,7 +369,7 @@ impl ModelResolver {
             .await
             .map_err(|e| {
                 ProxyError::internal_server_error(&format!(
-                    "Invalid JSON from LM Studio native API /api/v0/models: {}. Try --legacy flag.",
+                    "Invalid JSON from /api/v0/models: {}. Try --legacy flag",
                     e
                 ))
             })?;

@@ -14,7 +14,7 @@ use crate::handlers::streaming::{handle_streaming_response, is_streaming_request
 use crate::model::ModelInfo;
 use crate::model_legacy::ModelInfoLegacy;
 use crate::server::{Config, ModelResolverType};
-use crate::utils::{log_error, log_info, log_request, log_timed, log_warning, ProxyError};
+use crate::utils::{log_error, log_request, log_timed, log_warning, ProxyError};
 
 /// Handle GET /api/tags - list available models
 pub async fn handle_ollama_tags(
@@ -61,10 +61,7 @@ pub async fn handle_ollama_tags(
                             })
                             .collect::<Vec<_>>()
                     } else {
-                        log_warning(
-                            "/v1/models response",
-                            "LM Studio response missing 'data' array or not an array, returning empty models list.",
-                        );
+                        log_warning("/v1/models", "Missing 'data' array, returning empty list");
                         vec![]
                     };
 
@@ -84,7 +81,7 @@ pub async fn handle_ollama_tags(
     )
         .await
         .unwrap_or_else(|e| {
-            log_error("Ollama tags fetch", &e.message);
+            log_error("Tags fetch", &e.message);
             json!({ "models": [] })
         });
 
@@ -137,10 +134,7 @@ pub async fn handle_ollama_ps(
                             })
                             .collect::<Vec<_>>()
                     } else {
-                        log_warning(
-                            "/v1/models response for /api/ps",
-                            "LM Studio response missing 'data' array or not an array, returning empty models list.",
-                        );
+                        log_warning("/v1/models for ps", "Missing 'data' array, returning empty list");
                         vec![]
                     };
                     Ok(json!({ "models": models }))
@@ -159,7 +153,7 @@ pub async fn handle_ollama_ps(
     )
         .await
         .unwrap_or_else(|e| {
-            log_error("Ollama ps fetch", &e.message);
+            log_error("PS fetch", &e.message);
             json!({ "models": [] })
         });
 
@@ -217,12 +211,7 @@ pub async fn handle_ollama_chat(
 
     // Empty messages trigger
     if messages.is_empty() {
-        log_info(
-            &format!(
-                "Empty messages for /api/chat with model '{}', treating as load hint.",
-                ollama_model_name
-            ),
-        );
+        log_timed(LOG_PREFIX_INFO, &format!("Load hint for {}", ollama_model_name), start_time);
         trigger_model_loading_for_ollama(&context, ollama_model_name, cancellation_token.clone())
             .await?;
         let fabricated_response = json!({
@@ -354,12 +343,7 @@ pub async fn handle_ollama_generate(
     if prompt.is_empty()
         && images.map_or(true, |i| i.as_array().map_or(true, |a| a.is_empty()))
     {
-        log_info(
-            &format!(
-                "Empty prompt for /api/generate with model '{}', treating as load hint.",
-                ollama_model_name
-            ),
-        );
+        log_timed(LOG_PREFIX_INFO, &format!("Load hint for {}", ollama_model_name), start_time);
         trigger_model_loading_for_ollama(&context, ollama_model_name, cancellation_token.clone())
             .await?;
         let fabricated_response = json!({
@@ -662,26 +646,31 @@ pub async fn handle_health_check(
                 }
             }
 
-            let duration_ms = start_time.elapsed().as_millis();
+            log_timed(
+                if is_healthy { LOG_PREFIX_SUCCESS } else { LOG_PREFIX_ERROR },
+                &format!("Health check - {} models", model_count),
+                start_time
+            );
+
             Ok(json!({
                 "status": if is_healthy { "healthy" } else { "unhealthy" },
                 "lmstudio_url": context.lmstudio_url,
                 "http_status": status.as_u16(),
                 "models_known_to_lmstudio": model_count,
-                "response_time_ms": duration_ms,
+                "response_time_ms": start_time.elapsed().as_millis(),
                 "timestamp": chrono::Utc::now().to_rfc3339(),
                 "proxy_version": crate::VERSION
             }))
         }
         Err(e) if e.is_cancelled() => Err(ProxyError::request_cancelled()),
         Err(e) => {
-            let duration_ms = start_time.elapsed().as_millis();
+            log_timed(LOG_PREFIX_ERROR, &format!("Health check failed: {}", e.message), start_time);
             Ok(json!({
                 "status": "unreachable",
                 "lmstudio_url": context.lmstudio_url,
                 "error_message": e.message,
                 "error_details": ERROR_LM_STUDIO_UNAVAILABLE,
-                "response_time_ms": duration_ms,
+                "response_time_ms": start_time.elapsed().as_millis(),
                 "timestamp": chrono::Utc::now().to_rfc3339(),
                 "proxy_version": crate::VERSION
             }))

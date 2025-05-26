@@ -8,7 +8,7 @@ use crate::check_cancelled;
 use crate::common::{CancellableRequest, RequestContext};
 use crate::constants::ERROR_LM_STUDIO_UNAVAILABLE;
 use crate::model_legacy::clean_model_name_legacy;
-use crate::utils::{is_model_loading_error, log_error, log_info, log_warning, ProxyError};
+use crate::utils::{is_model_loading_error, log_error, log_timed, log_warning, ProxyError};
 
 #[derive(Serialize)]
 struct MinimalChatMessage<'a> {
@@ -59,10 +59,7 @@ pub async fn trigger_model_loading(
             let trigger_considered_successful = status.is_success() || status.is_client_error();
 
             if !trigger_considered_successful {
-                log_warning(
-                    "Model loading trigger",
-                    &format!("Trigger returned status: {}", status),
-                );
+                log_warning("Model trigger", &format!("Status: {}", status));
             }
             Ok(trigger_considered_successful)
         }
@@ -73,7 +70,7 @@ pub async fn trigger_model_loading(
             ))
         }
         Err(e) => {
-            log_error("Model loading trigger failed", &e.message);
+            log_error("Model trigger", &e.message);
             Ok(false)
         }
     }
@@ -88,13 +85,7 @@ pub async fn trigger_model_loading_for_ollama(
     match trigger_model_loading(context, ollama_model_name, cancellation_token).await {
         Ok(true) => Ok(()),
         Ok(false) => {
-            log_warning(
-                "Model load hint",
-                &format!(
-                    "Trigger for '{}' returned false, proceeding with main request.",
-                    ollama_model_name
-                ),
-            );
+            log_warning("Load hint", &format!("Trigger for '{}' failed, proceeding", ollama_model_name));
             Ok(())
         }
         Err(e) => Err(e),
@@ -124,9 +115,9 @@ where
         }
         Err(e) => {
             if is_model_loading_error(&e.message) {
-                log_info(&format!("{} not loaded, loading now...", ollama_model_name));
-
                 let model_loading_start = Instant::now();
+                log_timed(crate::constants::LOG_PREFIX_INFO, &format!("{} not loaded, triggering", ollama_model_name), model_loading_start);
+
                 match trigger_model_loading(context, ollama_model_name, cancellation_token.clone())
                     .await
                 {
@@ -141,38 +132,21 @@ where
 
                         match operation().await {
                             Ok(result) => {
-                                let total_loading_time = model_loading_start.elapsed();
-                                log_info(&format!(
-                                    "{} loaded | took {}ms",
-                                    ollama_model_name,
-                                    total_loading_time.as_millis()
-                                ));
+                                log_timed(crate::constants::LOG_PREFIX_SUCCESS, &format!("{} loaded", ollama_model_name), model_loading_start);
                                 Ok(result)
                             }
                             Err(retry_error) => {
-                                log_error(
-                                    &format!("Retry failed for model: {}", ollama_model_name),
-                                    &retry_error.message,
-                                );
+                                log_error(&format!("Retry failed for {}", ollama_model_name), &retry_error.message);
                                 Err(e) // Return original error
                             }
                         }
                     }
                     Ok(false) => {
-                        log_error(
-                            "Model loading trigger",
-                            &format!(
-                                "Failed to confirm model loading for {} or model may not exist. Original error: {}",
-                                ollama_model_name, e.message
-                            ),
-                        );
+                        log_error("Model trigger", &format!("Failed for {} - model may not exist. Original: {}", ollama_model_name, e.message));
                         Err(e)
                     }
                     Err(loading_trigger_error) => {
-                        log_error(
-                            "Model loading trigger failed",
-                            &loading_trigger_error.message,
-                        );
+                        log_error("Model trigger error", &loading_trigger_error.message);
                         Err(loading_trigger_error)
                     }
                 }
@@ -203,6 +177,7 @@ pub async fn check_lm_studio_availability(
 ) -> Result<(), ProxyError> {
     let url = format!("{}/v1/models", context.lmstudio_url);
     let request = CancellableRequest::new(context.clone(), cancellation_token);
+    let start_time = Instant::now();
 
     match request
         .make_request(reqwest::Method::GET, &url, None::<serde_json::Value>)
@@ -210,8 +185,10 @@ pub async fn check_lm_studio_availability(
     {
         Ok(response) => {
             if response.status().is_success() {
+                log_timed(crate::constants::LOG_PREFIX_SUCCESS, "LM Studio availability check", start_time);
                 Ok(())
             } else {
+                log_timed(crate::constants::LOG_PREFIX_ERROR, &format!("LM Studio health check failed: {}", response.status()), start_time);
                 Err(ProxyError::lm_studio_unavailable(&format!(
                     "LM Studio health check failed: {}",
                     response.status()
@@ -219,10 +196,13 @@ pub async fn check_lm_studio_availability(
             }
         }
         Err(e) if e.is_cancelled() => Err(ProxyError::request_cancelled()),
-        Err(e) => Err(ProxyError::lm_studio_unavailable(&format!(
-            "{}: {}",
-            ERROR_LM_STUDIO_UNAVAILABLE, e.message
-        ))),
+        Err(e) => {
+            log_timed(crate::constants::LOG_PREFIX_ERROR, &format!("{}: {}", ERROR_LM_STUDIO_UNAVAILABLE, e.message), start_time);
+            Err(ProxyError::lm_studio_unavailable(&format!(
+                "{}: {}",
+                ERROR_LM_STUDIO_UNAVAILABLE, e.message
+            )))
+        }
     }
 }
 

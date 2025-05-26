@@ -9,7 +9,7 @@ use crate::handlers::helpers::json_response;
 use crate::handlers::retry::{with_retry_and_cancellation, with_simple_retry};
 use crate::handlers::streaming::{handle_passthrough_streaming_response, is_streaming_request};
 use crate::server::ModelResolverType;
-use crate::utils::{format_duration, log_info, log_request, log_timed, ProxyError};
+use crate::utils::{format_duration, log_request, log_timed, ProxyError};
 
 /// Handle direct LM Studio API passthrough with model loading detection
 pub async fn handle_lmstudio_passthrough(
@@ -112,7 +112,6 @@ pub async fn handle_lmstudio_passthrough(
                 let response = request
                     .make_request(request_method, &final_endpoint_url, request_body_opt)
                     .await?;
-                let lm_studio_response_time = lm_studio_request_start.elapsed();
 
                 if !response.status().is_success() {
                     let status = response.status();
@@ -142,11 +141,9 @@ pub async fn handle_lmstudio_passthrough(
                     return Err(ProxyError::new(error_message, status.as_u16()));
                 }
 
-                // Log LM Studio response time for completions
-                if let Some(_) = current_original_model_name {
-                    if current_endpoint.contains("completion") || current_endpoint.contains("chat") {
-                        log_info(&format!("Processing... | LM Studio responded in {}", format_duration(lm_studio_response_time)));
-                    }
+                // Log LM Studio response time for completions only
+                if current_original_model_name.is_some() && (current_endpoint.contains("completion") || current_endpoint.contains("chat")) {
+                    log_timed(LOG_PREFIX_INFO, &format!("LM Studio responded | {}", format_duration(lm_studio_request_start.elapsed())), lm_studio_request_start);
                 }
 
                 if is_streaming {
@@ -177,7 +174,7 @@ pub async fn handle_lmstudio_passthrough(
         with_simple_retry(operation, cancellation_token).await?
     };
 
-    log_timed(LOG_PREFIX_CONN, "Started LM Studio passthrough", start_time);
+    log_timed(LOG_PREFIX_SUCCESS, "LM Studio passthrough", start_time);
     Ok(result)
 }
 
@@ -230,7 +227,6 @@ pub async fn get_lmstudio_status(
         .await
     {
         Ok(response) => {
-            let response_time = health_check_start.elapsed();
             let status = response.status();
             let is_healthy = status.is_success();
             let mut additional_info = serde_json::Map::new();
@@ -263,6 +259,7 @@ pub async fn get_lmstudio_status(
                 }
             }
 
+            let response_time = health_check_start.elapsed();
             let mut result = serde_json::json!({
                 "status": if is_healthy { "healthy" } else { "unhealthy" },
                 "lmstudio_url": context.lmstudio_url,
@@ -281,29 +278,32 @@ pub async fn get_lmstudio_status(
                 }
             }
 
+            log_timed(LOG_PREFIX_SUCCESS, "Health check", health_check_start);
             Ok(result)
         }
         Err(_) => {
-            let response_time = health_check_start.elapsed();
             let status_message = if endpoint.starts_with("/api/v0/") {
                 "unreachable_native_api"
             } else {
                 "unreachable"
             };
 
-            Ok(serde_json::json!({
+            let result = serde_json::json!({
                 "status": status_message,
                 "lmstudio_url": context.lmstudio_url,
                 "error": ERROR_LM_STUDIO_UNAVAILABLE,
                 "api_endpoint": endpoint,
-                "response_time_ms": response_time.as_millis(),
+                "response_time_ms": health_check_start.elapsed().as_millis(),
                 "timestamp": chrono::Utc::now().to_rfc3339(),
                 "suggestion": if endpoint.starts_with("/api/v0/") {
                     "Update to LM Studio 0.3.6+ or use --legacy flag"
                 } else {
                     "Check LM Studio availability"
                 }
-            }))
+            });
+
+            log_timed(LOG_PREFIX_ERROR, "Health check failed", health_check_start);
+            Ok(result)
         }
     }
 }
