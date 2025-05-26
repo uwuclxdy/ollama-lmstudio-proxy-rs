@@ -3,7 +3,6 @@
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-
 use crate::check_cancelled;
 use crate::constants::*;
 use crate::utils::{log_error, ProxyError};
@@ -72,7 +71,7 @@ impl<'a> CancellableRequest<'a> {
 /// Enhanced JSON response handling with cancellation support - passes through LM Studio errors
 pub async fn handle_json_response(
     response: reqwest::Response,
-    cancellation_token: CancellationToken
+    cancellation_token: CancellationToken,
 ) -> Result<Value, ProxyError> {
     check_cancelled!(cancellation_token);
 

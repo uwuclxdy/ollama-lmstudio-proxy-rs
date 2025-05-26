@@ -8,7 +8,6 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
-
 use crate::constants::*;
 use crate::handlers::helpers::{
     create_cancellation_chunk, create_error_chunk, create_final_chunk, create_ollama_streaming_chunk,
@@ -147,7 +146,7 @@ pub async fn handle_streaming_response(
                 &model_clone_for_task,
                 start_time.elapsed(),
                 chunk_count,
-                is_chat_endpoint
+                is_chat_endpoint,
             );
             send_chunk_and_close_channel(&tx, final_chunk).await;
         }

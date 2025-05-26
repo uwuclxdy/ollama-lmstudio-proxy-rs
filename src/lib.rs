@@ -27,7 +27,6 @@ pub use constants::{
     RuntimeConfig,
 };
 
-
 /// Re-export optimized constants for external use
 pub use constants::{
     // Timing and performance constants
@@ -72,7 +71,6 @@ pub use constants::{
     // Default context for responses
     TOKEN_TO_CHAR_RATIO,
 };
-
 
 /// Centralized logging - re-export the global logger
 pub use utils::{init_global_logger, log_error, log_info, log_request, log_timed, log_warning};

@@ -3,7 +3,6 @@
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-
 use crate::common::{CancellableRequest, RequestContext};
 use crate::constants::*;
 use crate::utils::ProxyError;

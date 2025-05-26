@@ -2,7 +2,6 @@
 
 use std::sync::OnceLock;
 
-
 /// Global configuration that can be set at runtime
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {

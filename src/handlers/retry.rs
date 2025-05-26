@@ -5,7 +5,6 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
-
 use crate::check_cancelled;
 use crate::common::{CancellableRequest, RequestContext};
 use crate::constants::ERROR_LM_STUDIO_UNAVAILABLE;
@@ -82,7 +81,7 @@ pub async fn with_retry_and_cancellation<F, Fut, T>(
 ) -> Result<T, ProxyError>
 where
     F: Fn() -> Fut,
-    Fut: std::future::Future<Output=Result<T, ProxyError>>,
+    Fut: std::future::Future<Output = Result<T, ProxyError>>,
 {
     check_cancelled!(cancellation_token);
 
@@ -142,7 +141,7 @@ pub async fn with_simple_retry<F, Fut, T>(
 ) -> Result<T, ProxyError>
 where
     F: Fn() -> Fut,
-    Fut: std::future::Future<Output=Result<T, ProxyError>>,
+    Fut: std::future::Future<Output = Result<T, ProxyError>>,
 {
     check_cancelled!(cancellation_token);
     operation().await
@@ -181,7 +180,7 @@ pub async fn with_health_check_and_retry<F, Fut, T>(
 ) -> Result<T, ProxyError>
 where
     F: Fn() -> Fut,
-    Fut: std::future::Future<Output=Result<T, ProxyError>>,
+    Fut: std::future::Future<Output = Result<T, ProxyError>>,
 {
     match ollama_model_name {
         Some(model) => {

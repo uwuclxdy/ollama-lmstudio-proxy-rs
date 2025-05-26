@@ -9,7 +9,6 @@ use tokio_util::sync::CancellationToken;
 use warp::log::Info as LogInfo;
 use warp::{Filter, Rejection, Reply};
 
-
 use crate::common::RequestContext;
 use crate::constants::*;
 use crate::handlers;

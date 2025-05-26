@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use warp::reject::Reject;
 
-
 use crate::constants::*;
 
 // Global logging state
@@ -216,6 +215,7 @@ impl fmt::Display for ProxyError {
 }
 
 impl Error for ProxyError {}
+
 impl Reject for ProxyError {}
 
 /// Enhanced model loading error detection

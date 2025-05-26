@@ -3,7 +3,6 @@
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
-
 use crate::common::{map_ollama_to_lmstudio_params, RequestBuilder};
 use crate::constants::*;
 
@@ -200,7 +199,7 @@ impl ResponseTransformer {
             estimated_input_tokens,
             estimated_output_tokens,
             actual_prompt_tokens,
-            None
+            None,
         );
 
         json!({
@@ -351,7 +350,7 @@ pub fn create_ollama_streaming_chunk(
     content: &str,
     is_chat_endpoint: bool,
     done: bool,
-    tool_calls_delta: Option<&Value>
+    tool_calls_delta: Option<&Value>,
 ) -> Value {
     let timestamp = chrono::Utc::now().to_rfc3339();
 
@@ -446,7 +445,7 @@ pub fn create_final_chunk(
         10,
         chunk_count_for_token_estimation.max(1),
         None,
-        None
+        None,
     );
 
     let mut chunk = create_ollama_streaming_chunk(model_ollama_name, "", is_chat_endpoint, true, None);
@@ -479,7 +478,7 @@ pub async fn execute_request_with_retry<F, Fut, T>(
 ) -> Result<T, crate::utils::ProxyError>
 where
     F: Fn() -> Fut,
-    Fut: std::future::Future<Output=Result<T, crate::utils::ProxyError>>,
+    Fut: std::future::Future<Output = Result<T, crate::utils::ProxyError>>,
 {
     if use_model_retry {
         crate::handlers::retry::with_retry_and_cancellation(

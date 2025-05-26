@@ -4,7 +4,6 @@ use serde_json::{json, Value};
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-
 use crate::common::{extract_model_name, handle_json_response, CancellableRequest, RequestContext};
 use crate::constants::*;
 use crate::handlers::helpers::{
