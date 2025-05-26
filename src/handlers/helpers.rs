@@ -3,9 +3,9 @@
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
-use crate::common::{RequestBuilder, map_ollama_to_lmstudio_params};
+
+use crate::common::{map_ollama_to_lmstudio_params, RequestBuilder};
 use crate::constants::*;
-use crate::metrics::get_global_metrics;
 
 /// Create JSON response with proper headers
 pub fn json_response(value: &Value) -> warp::reply::Response {
@@ -116,15 +116,6 @@ impl ResponseTransformer {
             actual_completion_tokens,
         );
 
-        // Record metrics
-        if let Some(metrics) = get_global_metrics() {
-            let model_metrics_name = crate::model::clean_model_name(model_ollama_name).to_string();
-            let tokens_for_metrics = timing.eval_count;
-            tokio::spawn(async move {
-                metrics.record_model_usage(&model_metrics_name, tokens_for_metrics).await;
-            });
-        }
-
         let mut ollama_message = json!({
             "role": "assistant",
             "content": content
@@ -175,15 +166,6 @@ impl ResponseTransformer {
             actual_prompt_tokens,
             actual_completion_tokens,
         );
-
-        // Record metrics
-        if let Some(metrics) = get_global_metrics() {
-            let model_metrics_name = crate::model::clean_model_name(model_ollama_name).to_string();
-            let tokens_for_metrics = timing.eval_count;
-            tokio::spawn(async move {
-                metrics.record_model_usage(&model_metrics_name, tokens_for_metrics).await;
-            });
-        }
 
         json!({
             "model": model_ollama_name,

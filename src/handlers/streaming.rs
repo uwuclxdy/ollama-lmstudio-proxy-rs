@@ -8,12 +8,12 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
+
 use crate::constants::*;
 use crate::handlers::helpers::{
     create_cancellation_chunk, create_error_chunk, create_final_chunk, create_ollama_streaming_chunk,
 };
-use crate::metrics::get_global_metrics;
-use crate::utils::{Logger, ProxyError};
+use crate::utils::{log_error, log_timed, log_warning, ProxyError};
 
 static STREAM_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -29,7 +29,6 @@ pub async fn handle_streaming_response(
     ollama_model_name: &str,
     start_time: Instant,
     cancellation_token: CancellationToken,
-    logger: &Logger,
     stream_timeout_seconds: u64,
 ) -> Result<warp::reply::Response, ProxyError> {
     let runtime_config = get_runtime_config();
@@ -38,13 +37,8 @@ pub async fn handle_streaming_response(
 
     let stream_id = STREAM_COUNTER.fetch_add(1, Ordering::Relaxed) % 1_000_000;
 
-    if let Some(metrics) = get_global_metrics() {
-        metrics.record_stream_start();
-    }
-
     let model_clone_for_task = ollama_model_name.clone();
     let token_clone = cancellation_token.clone();
-    let logger_clone = logger.clone();
 
     tokio::spawn(async move {
         let mut stream = lm_studio_response.bytes_stream();
@@ -71,6 +65,12 @@ pub async fn handle_streaming_response(
                         Ok(Some(Ok(bytes_chunk))) => {
                             if let Ok(chunk_str) = std::str::from_utf8(&bytes_chunk) {
                                 sse_buffer.push_str(chunk_str);
+
+                                // Prevent unbounded buffer growth
+                                if sse_buffer.len() > runtime_config.max_buffer_size {
+                                    send_error_and_close(&tx, &model_clone_for_task, ERROR_BUFFER_OVERFLOW, is_chat_endpoint).await;
+                                    break 'stream_loop Err(ERROR_BUFFER_OVERFLOW.to_string());
+                                }
 
                                 while let Some(boundary_pos) = sse_buffer.find(SSE_MESSAGE_BOUNDARY) {
                                     let message_text = sse_buffer[..boundary_pos].to_string();
@@ -119,11 +119,11 @@ pub async fn handle_streaming_response(
                                                 }
                                             }
                                             Err(e) => {
-                                                logger_clone.log_error("SSE JSON parsing", &format!("Failed to parse LM Studio SSE data: {}. Data: '{}'", e, data_content));
+                                                log_error("SSE JSON parsing", &format!("Failed to parse LM Studio SSE data: {}. Data: '{}'", e, data_content));
                                             }
                                         }
                                     } else if !message_text.trim().is_empty() {
-                                         logger_clone.log_warning("SSE format", &format!("Received non-standard SSE line: {}", message_text));
+                                         log_warning("SSE format", &format!("Received non-standard SSE line: {}", message_text));
                                     }
                                 }
                             } else {
@@ -136,7 +136,7 @@ pub async fn handle_streaming_response(
                             break 'stream_loop Err(format!("Network error: {}", e));
                         }
                         Ok(None) => {
-                            logger_clone.log_warning("Stream ended prematurely", "LM Studio stream ended without [DONE]");
+                            log_warning("Stream ended prematurely", "LM Studio stream ended without [DONE]");
                             break 'stream_loop Ok(());
                         }
                         Err(_) => {
@@ -158,10 +158,7 @@ pub async fn handle_streaming_response(
             send_chunk_and_close_channel(&tx, final_chunk).await;
         }
 
-        if let Some(metrics) = get_global_metrics() {
-            metrics.record_stream_end(chunk_count, stream_result.is_err());
-        }
-        logger_clone.log_timed("Stream processing", &format!("[{}] {} Ollama chunks", stream_id, chunk_count), start_time);
+        log_timed("Stream processing", &format!("[{}] {} Ollama chunks", stream_id, chunk_count), start_time);
     });
 
     create_ollama_streaming_response_format(rx)
@@ -171,22 +168,15 @@ pub async fn handle_streaming_response(
 pub async fn handle_passthrough_streaming_response(
     response: reqwest::Response,
     cancellation_token: CancellationToken,
-    logger: &Logger,
     stream_timeout_seconds: u64,
 ) -> Result<warp::reply::Response, ProxyError> {
     let (tx, rx) = mpsc::unbounded_channel::<Result<bytes::Bytes, std::io::Error>>();
     let stream_id = STREAM_COUNTER.fetch_add(1, Ordering::Relaxed) % 1_000_000;
     let start_time = Instant::now();
 
-    if let Some(metrics) = get_global_metrics() {
-        metrics.record_stream_start();
-    }
-
-    let logger_clone = logger.clone();
     tokio::spawn(async move {
         let mut stream = response.bytes_stream();
         let mut chunk_count = 0u64;
-        let mut has_error = false;
 
         loop {
             tokio::select! {
@@ -205,14 +195,12 @@ pub async fn handle_passthrough_streaming_response(
                             }
                         }
                         Ok(Some(Err(e))) => {
-                            has_error = true;
                             let error_data = format!("data: {{\"error\": \"Streaming error: {}\"}}\n\n", e);
                             let _ = tx.send(Ok(bytes::Bytes::from(error_data)));
                             break;
                         }
                         Ok(None) => break,
                         Err(_) => {
-                            has_error = true;
                             let timeout_data = format!("data: {{\"error\": \"{}\"}}\n\n", ERROR_TIMEOUT);
                             let _ = tx.send(Ok(bytes::Bytes::from(timeout_data)));
                             break;
@@ -222,10 +210,7 @@ pub async fn handle_passthrough_streaming_response(
             }
         }
 
-        if let Some(metrics) = get_global_metrics() {
-            metrics.record_stream_end(chunk_count, has_error);
-        }
-        logger_clone.log_timed("Passthrough stream", &format!("[{}] {} chunks", stream_id, chunk_count), start_time);
+        log_timed("Passthrough stream", &format!("[{}] {} chunks", stream_id, chunk_count), start_time);
     });
 
     create_passthrough_streaming_response_format(rx)
@@ -234,7 +219,7 @@ pub async fn handle_passthrough_streaming_response(
 /// Send Ollama chunk to client
 async fn send_ollama_chunk(tx: &mpsc::UnboundedSender<Result<bytes::Bytes, std::io::Error>>, chunk: &Value) -> bool {
     let chunk_json = serde_json::to_string(chunk).unwrap_or_else(|e| {
-        eprintln!("[ERROR] Failed to serialize Ollama chunk: {}", e);
+        log_error("Chunk serialization", &format!("Failed to serialize Ollama chunk: {}", e));
         String::from("{\"error\":\"Internal proxy error: failed to serialize chunk\"}")
     });
     let chunk_with_newline = format!("{}\n", chunk_json);

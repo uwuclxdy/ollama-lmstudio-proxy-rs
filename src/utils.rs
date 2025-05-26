@@ -1,16 +1,93 @@
-/// src/utils.rs - Consolidated utilities with enhanced error handling
+/// src/utils.rs - Centralized logging and utilities
 
 use std::cell::RefCell;
 use std::error::Error;
 use std::fmt::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use warp::reject::Reject;
 
+
 use crate::constants::*;
+
+// Global logging state
+static LOGGING_ENABLED: AtomicBool = AtomicBool::new(true);
 
 // Thread-local string buffer for reuse
 thread_local! {
     pub static STRING_BUFFER: RefCell<String> = RefCell::new(String::with_capacity(get_runtime_config().string_buffer_size));
+}
+
+/// Initialize global logger
+pub fn init_global_logger(enabled: bool) {
+    LOGGING_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Check if logging is enabled
+#[inline]
+pub fn is_logging_enabled() -> bool {
+    LOGGING_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Centralized logging functions - use these throughout the application
+
+/// Log informational message
+pub fn log_info(message: &str) {
+    if is_logging_enabled() {
+        println!("[{}] ℹ️ {}", chrono::Local::now().format("%H:%M:%S"), sanitize_log_message(message));
+    }
+}
+
+/// Log warning message
+pub fn log_warning(operation: &str, warning: &str) {
+    if is_logging_enabled() {
+        STRING_BUFFER.with(|buf| {
+            let mut buffer = buf.borrow_mut();
+            buffer.clear();
+            write!(buffer, "{} {} warning: {}", LOG_PREFIX_WARNING, sanitize_log_message(operation), sanitize_log_message(warning)).unwrap();
+            println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), buffer);
+        });
+    }
+}
+
+/// Log error message
+pub fn log_error(operation: &str, error: &str) {
+    if is_logging_enabled() {
+        STRING_BUFFER.with(|buf| {
+            let mut buffer = buf.borrow_mut();
+            buffer.clear();
+            write!(buffer, "{} {} failed: {}", LOG_PREFIX_ERROR, sanitize_log_message(operation), sanitize_log_message(error)).unwrap();
+            println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), buffer);
+        });
+    }
+}
+
+/// Log request with optional model
+pub fn log_request(method: &str, path: &str, model: Option<&str>) {
+    if is_logging_enabled() {
+        STRING_BUFFER.with(|buf| {
+            let mut buffer = buf.borrow_mut();
+            buffer.clear();
+            match model {
+                Some(m) => write!(buffer, "{} {} {} (model: {})", LOG_PREFIX_REQUEST, method, sanitize_log_message(path), sanitize_log_message(m)).unwrap(),
+                None => write!(buffer, "{} {} {}", LOG_PREFIX_REQUEST, method, sanitize_log_message(path)).unwrap(),
+            }
+            println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), buffer);
+        });
+    }
+}
+
+/// Log with timing information
+pub fn log_timed(prefix: &str, operation: &str, start: Instant) {
+    if is_logging_enabled() {
+        let duration = start.elapsed();
+        STRING_BUFFER.with(|buf| {
+            let mut buffer = buf.borrow_mut();
+            buffer.clear();
+            write!(buffer, "{} {} ({})", prefix, operation, format_duration(duration)).unwrap();
+            println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), buffer);
+        });
+    }
 }
 
 /// Macro for efficient error handling in handlers
@@ -34,22 +111,6 @@ macro_rules! check_cancelled {
     ($token:expr) => {
         if $token.is_cancelled() {
             return Err(ProxyError::request_cancelled());
-        }
-    };
-}
-
-/// Macro for efficient logging with timing
-#[macro_export]
-macro_rules! log_with_timing {
-    ($logger:expr, $prefix:expr, $operation:expr, $start:expr) => {
-        if $logger.enabled {
-            let duration = $start.elapsed();
-            STRING_BUFFER.with(|buf| {
-                let mut buffer = buf.borrow_mut();
-                buffer.clear();
-                write!(buffer, "{} {} ({})", $prefix, $operation, format_duration(duration)).unwrap();
-                println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), buffer);
-            });
         }
     };
 }
@@ -156,78 +217,6 @@ impl fmt::Display for ProxyError {
 
 impl Error for ProxyError {}
 impl Reject for ProxyError {}
-
-/// Enhanced logger with metrics integration
-#[derive(Debug, Clone)]
-pub struct Logger {
-    pub enabled: bool,
-}
-
-impl Logger {
-    /// Create a new logger
-    pub fn new(enabled: bool) -> Self {
-        Self { enabled }
-    }
-
-    /// Log with timing information using string buffer
-    pub fn log_timed(&self, prefix: &str, operation: &str, start: Instant) {
-        if self.enabled {
-            let duration = start.elapsed();
-            STRING_BUFFER.with(|buf| {
-                let mut buffer = buf.borrow_mut();
-                buffer.clear();
-                write!(buffer, "{} {} ({})", prefix, operation, format_duration(duration)).unwrap();
-                println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), buffer);
-            });
-        }
-    }
-
-    /// Simple log without timing
-    pub fn log(&self, message: &str) {
-        if self.enabled {
-            println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), sanitize_log_message(message));
-        }
-    }
-
-    /// Log request with optional model
-    pub fn log_request(&self, method: &str, path: &str, model: Option<&str>) {
-        if self.enabled {
-            STRING_BUFFER.with(|buf| {
-                let mut buffer = buf.borrow_mut();
-                buffer.clear();
-                match model {
-                    Some(m) => write!(buffer, "{} {} {} (model: {})", LOG_PREFIX_REQUEST, method, sanitize_log_message(path), sanitize_log_message(m)).unwrap(),
-                    None => write!(buffer, "{} {} {}", LOG_PREFIX_REQUEST, method, sanitize_log_message(path)).unwrap(),
-                }
-                println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), buffer);
-            });
-        }
-    }
-
-    /// Log error with operation context
-    pub fn log_error(&self, operation: &str, error: &str) {
-        if self.enabled {
-            STRING_BUFFER.with(|buf| {
-                let mut buffer = buf.borrow_mut();
-                buffer.clear();
-                write!(buffer, "{} {} failed: {}", LOG_PREFIX_ERROR, sanitize_log_message(operation), sanitize_log_message(error)).unwrap();
-                println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), buffer);
-            });
-        }
-    }
-
-    /// Log warning message
-    pub fn log_warning(&self, operation: &str, warning: &str) {
-        if self.enabled {
-            STRING_BUFFER.with(|buf| {
-                let mut buffer = buf.borrow_mut();
-                buffer.clear();
-                write!(buffer, "{} {} warning: {}", LOG_PREFIX_WARNING, sanitize_log_message(operation), sanitize_log_message(warning)).unwrap();
-                println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), buffer);
-            });
-        }
-    }
-}
 
 /// Enhanced model loading error detection
 pub fn is_model_loading_error(message: &str) -> bool {

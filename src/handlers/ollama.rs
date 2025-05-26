@@ -4,18 +4,19 @@ use serde_json::{json, Value};
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+
 use crate::common::{extract_model_name, handle_json_response, CancellableRequest, RequestContext};
 use crate::constants::*;
 use crate::handle_lm_error;
 use crate::handlers::helpers::{
-    json_response, ResponseTransformer, build_lm_studio_request,
-    execute_request_with_retry, LMStudioRequestType,
+    build_lm_studio_request, execute_request_with_retry, json_response,
+    LMStudioRequestType, ResponseTransformer,
 };
-use crate::handlers::streaming::{handle_streaming_response, is_streaming_request};
 use crate::handlers::retry::trigger_model_loading_for_ollama;
+use crate::handlers::streaming::{handle_streaming_response, is_streaming_request};
 use crate::model::{ModelInfo, ModelResolver};
 use crate::server::Config;
-use crate::utils::ProxyError;
+use crate::utils::{log_error, log_info, log_request, log_timed, log_warning, ProxyError};
 
 /// Handle GET /api/tags - list available models
 pub async fn handle_ollama_tags(
@@ -30,7 +31,7 @@ pub async fn handle_ollama_tags(
         async move {
             let request = CancellableRequest::new(context.clone(), cancellation_token.clone());
             let url = format!("{}/v1/models", context.lmstudio_url);
-            context.logger.log_request("GET", &url, None);
+            log_request("GET", &url, None);
 
             let response = request.make_request(reqwest::Method::GET, &url, None).await?;
 
@@ -43,7 +44,7 @@ pub async fn handle_ollama_tags(
                     model_info.to_ollama_tags_model()
                 }).collect::<Vec<_>>()
             } else {
-                context.logger.log_warning("/v1/models response", "LM Studio response missing 'data' array or not an array, returning empty models list.");
+                log_warning("/v1/models response", "LM Studio response missing 'data' array or not an array, returning empty models list.");
                 vec![]
             };
 
@@ -59,11 +60,11 @@ pub async fn handle_ollama_tags(
         0,
         cancellation_token.clone(),
     ).await.unwrap_or_else(|e| {
-        context.logger.log_error("Ollama tags fetch", &e.message);
+        log_error("Ollama tags fetch", &e.message);
         json!({"models": []})
     });
 
-    context.logger.log_timed(LOG_PREFIX_SUCCESS, "Ollama tags", start_time);
+    log_timed(LOG_PREFIX_SUCCESS, "Ollama tags", start_time);
     Ok(json_response(&result))
 }
 
@@ -82,7 +83,7 @@ pub async fn handle_ollama_chat(
 
     // Empty messages trigger
     if messages.is_empty() {
-        context.logger.log(&format!("Empty messages for /api/chat with model '{}', treating as load hint.", ollama_model_name));
+        log_info(&format!("Empty messages for /api/chat with model '{}', treating as load hint.", ollama_model_name));
         trigger_model_loading_for_ollama(&context, ollama_model_name, cancellation_token.clone()).await?;
         let fabricated_response = json!({
             "model": ollama_model_name,
@@ -91,7 +92,7 @@ pub async fn handle_ollama_chat(
             "done_reason": "load",
             "done": true
         });
-        context.logger.log_timed(LOG_PREFIX_SUCCESS, "Ollama chat (load hint)", start_time);
+        log_timed(LOG_PREFIX_SUCCESS, "Ollama chat (load hint)", start_time);
         return Ok(json_response(&fabricated_response));
     }
 
@@ -122,7 +123,7 @@ pub async fn handle_ollama_chat(
 
             let request_obj = CancellableRequest::new(context.clone(), cancellation_token_clone.clone());
             let url = format!("{}/v1/chat/completions", context.lmstudio_url);
-            context.logger.log_request("POST", &url, Some(&lm_studio_model_id));
+            log_request("POST", &url, Some(&lm_studio_model_id));
 
             let response = request_obj.make_request(reqwest::Method::POST, &url, Some(lm_request)).await?;
 
@@ -134,7 +135,6 @@ pub async fn handle_ollama_chat(
                     &ollama_model_name_clone,
                     start_time,
                     cancellation_token_clone.clone(),
-                    context.logger,
                     config_clone.stream_timeout_seconds,
                 ).await
             } else {
@@ -160,7 +160,7 @@ pub async fn handle_ollama_chat(
         cancellation_token.clone(),
     ).await?;
 
-    context.logger.log_timed(LOG_PREFIX_SUCCESS, "Ollama chat", start_time);
+    log_timed(LOG_PREFIX_SUCCESS, "Ollama chat", start_time);
     Ok(result)
 }
 
@@ -180,7 +180,7 @@ pub async fn handle_ollama_generate(
 
     // Empty prompt trigger
     if prompt.is_empty() && images.map_or(true, |i| i.as_array().map_or(true, |a| a.is_empty())) {
-        context.logger.log(&format!("Empty prompt for /api/generate with model '{}', treating as load hint.", ollama_model_name));
+        log_info(&format!("Empty prompt for /api/generate with model '{}', treating as load hint.", ollama_model_name));
         trigger_model_loading_for_ollama(&context, ollama_model_name, cancellation_token.clone()).await?;
         let fabricated_response = json!({
             "model": ollama_model_name,
@@ -188,7 +188,7 @@ pub async fn handle_ollama_generate(
             "response": "",
             "done": true
         });
-        context.logger.log_timed(LOG_PREFIX_SUCCESS, "Ollama generate (load hint)", start_time);
+        log_timed(LOG_PREFIX_SUCCESS, "Ollama generate (load hint)", start_time);
         return Ok(json_response(&fabricated_response));
     }
 
@@ -231,7 +231,7 @@ pub async fn handle_ollama_generate(
             );
 
             let request_obj = CancellableRequest::new(context.clone(), cancellation_token_clone.clone());
-            context.logger.log_request("POST", &lm_studio_target_url, Some(&lm_studio_model_id));
+            log_request("POST", &lm_studio_target_url, Some(&lm_studio_model_id));
 
             let response = request_obj.make_request(reqwest::Method::POST, &lm_studio_target_url, Some(lm_request)).await?;
 
@@ -243,7 +243,6 @@ pub async fn handle_ollama_generate(
                     &ollama_model_name_clone,
                     start_time,
                     cancellation_token_clone.clone(),
-                    context.logger,
                     config_clone.stream_timeout_seconds,
                 ).await
             } else {
@@ -269,7 +268,7 @@ pub async fn handle_ollama_generate(
         cancellation_token.clone(),
     ).await?;
 
-    context.logger.log_timed(LOG_PREFIX_SUCCESS, "Ollama generate", start_time);
+    log_timed(LOG_PREFIX_SUCCESS, "Ollama generate", start_time);
     Ok(result)
 }
 
@@ -306,7 +305,7 @@ pub async fn handle_ollama_embeddings(
                     if s_input.chars().count() > EMBEDDING_TRUNCATE_CHAR_LIMIT {
                         let truncated_input: String = s_input.chars().take(EMBEDDING_TRUNCATE_CHAR_LIMIT).collect();
                         input_value = Value::String(truncated_input);
-                        context.logger.log_warning("Embeddings input", "Input string truncated due to length.");
+                        log_warning("Embeddings input", "Input string truncated due to length.");
                     }
                 } else if let Some(arr_input) = input_value.as_array_mut() {
                     for val in arr_input.iter_mut() {
@@ -314,7 +313,7 @@ pub async fn handle_ollama_embeddings(
                             if s.chars().count() > EMBEDDING_TRUNCATE_CHAR_LIMIT {
                                 let truncated_s: String = s.chars().take(EMBEDDING_TRUNCATE_CHAR_LIMIT).collect();
                                 *val = Value::String(truncated_s);
-                                context.logger.log_warning("Embeddings input", "An input string in array truncated.");
+                                log_warning("Embeddings input", "An input string in array truncated.");
                             }
                         }
                     }
@@ -333,7 +332,7 @@ pub async fn handle_ollama_embeddings(
 
             let request_obj = CancellableRequest::new(context.clone(), cancellation_token_clone.clone());
             let url = format!("{}/v1/embeddings", context.lmstudio_url);
-            context.logger.log_request("POST", &url, Some(&lm_studio_model_id));
+            log_request("POST", &url, Some(&lm_studio_model_id));
 
             let response = request_obj.make_request(reqwest::Method::POST, &url, Some(lm_request)).await?;
             handle_lm_error!(response);
@@ -357,7 +356,7 @@ pub async fn handle_ollama_embeddings(
         cancellation_token.clone(),
     ).await?;
 
-    context.logger.log_timed(LOG_PREFIX_SUCCESS, "Ollama embeddings", start_time);
+    log_timed(LOG_PREFIX_SUCCESS, "Ollama embeddings", start_time);
     Ok(json_response(&result))
 }
 
@@ -367,7 +366,7 @@ pub async fn handle_ollama_ps(
     cancellation_token: CancellationToken,
 ) -> Result<warp::reply::Response, ProxyError> {
     let start_time = Instant::now();
-    context.logger.log_request("GET", "/api/ps", None);
+    log_request("GET", "/api/ps", None);
 
     let operation = || {
         let context = context.clone();
@@ -387,7 +386,7 @@ pub async fn handle_ollama_ps(
                     model_info.to_ollama_ps_model()
                 }).collect::<Vec<_>>()
             } else {
-                context.logger.log_warning("/v1/models response for /api/ps", "LM Studio response missing 'data' array or not an array, returning empty models list.");
+                log_warning("/v1/models response for /api/ps", "LM Studio response missing 'data' array or not an array, returning empty models list.");
                 vec![]
             };
             Ok(json!({"models": models}))
@@ -402,11 +401,11 @@ pub async fn handle_ollama_ps(
         0,
         cancellation_token.clone(),
     ).await.unwrap_or_else(|e| {
-        context.logger.log_error("Ollama ps fetch", &e.message);
+        log_error("Ollama ps fetch", &e.message);
         json!({"models": []})
     });
 
-    context.logger.log_timed(LOG_PREFIX_SUCCESS, "Ollama ps", start_time);
+    log_timed(LOG_PREFIX_SUCCESS, "Ollama ps", start_time);
     Ok(json_response(&result))
 }
 

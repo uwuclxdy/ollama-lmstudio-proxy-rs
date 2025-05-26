@@ -9,12 +9,12 @@ use tokio_util::sync::CancellationToken;
 use warp::log::Info as LogInfo;
 use warp::{Filter, Rejection, Reply};
 
+
 use crate::common::RequestContext;
 use crate::constants::*;
 use crate::handlers;
 use crate::handlers::json_response;
-use crate::metrics::{get_global_metrics, init_global_metrics};
-use crate::utils::{validate_config, Logger, ProxyError};
+use crate::utils::{init_global_logger, is_logging_enabled, log_error, log_info, validate_config, ProxyError};
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "ollama-lmstudio-proxy")]
@@ -42,9 +42,6 @@ pub struct Config {
     #[arg(long, default_value = "60", help = "Streaming timeout in seconds (per chunk)")]
     pub stream_timeout_seconds: u64,
 
-    #[arg(long, default_value = "true", help = "Enable metrics collection")]
-    pub enable_metrics: bool,
-
     #[arg(
         long,
         default_value = "262144",
@@ -61,7 +58,6 @@ pub struct Config {
 pub struct ProxyServer {
     pub client: reqwest::Client,
     pub config: Arc<Config>,
-    pub logger: Logger,
 }
 
 /// Wrapper for ollama show handler
@@ -83,11 +79,10 @@ impl ProxyServer {
             max_buffer_size: config.max_buffer_size,
             max_partial_content_size: config.max_buffer_size / 4,
             string_buffer_size: 2048,
-            enable_metrics: config.enable_metrics,
             enable_chunk_recovery: config.enable_chunk_recovery,
         };
         init_runtime_config(runtime_config);
-        init_global_metrics(config.enable_metrics);
+        init_global_logger(!config.no_log);
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(config.request_timeout_seconds + 10))
@@ -95,12 +90,9 @@ impl ProxyServer {
             .pool_max_idle_per_host(10)
             .build()?;
 
-        let logger = Logger::new(!config.no_log);
-
         Ok(Self {
             client,
             config: Arc::new(config),
-            logger,
         })
     }
 
@@ -112,12 +104,11 @@ impl ProxyServer {
             .map_err(|e| format!("Invalid listen address '{}': {}", self.config.listen, e))?;
 
         let server_arc = Arc::new(self);
-        let server_arc_routes = server_arc.clone();
 
         let log_filter = warp::log::custom({
-            let logger = server_arc.logger.clone();
+            let logging_enabled = is_logging_enabled();
             move |info: LogInfo| {
-                if logger.enabled {
+                if logging_enabled {
                     let status_icon = match info.status().as_u16() {
                         200..=299 => LOG_PREFIX_SUCCESS,
                         400..=499 => LOG_PREFIX_WARNING,
@@ -137,7 +128,10 @@ impl ProxyServer {
             }
         });
 
-        let with_server_state = warp::any().map(move || server_arc_routes.clone());
+        let with_server_state = warp::any().map({
+            let server_clone = server_arc.clone();
+            move || server_clone.clone()
+        });
 
         let ollama_tags_route = warp::path!("api" / "tags")
             .and(warp::get())
@@ -145,7 +139,6 @@ impl ProxyServer {
             .and_then(|s: Arc<ProxyServer>| async move {
                 let context = RequestContext {
                     client: &s.client,
-                    logger: &s.logger,
                     lmstudio_url: &s.config.lmstudio_url,
                     timeout_seconds: s.config.request_timeout_seconds,
                 };
@@ -160,7 +153,6 @@ impl ProxyServer {
             .and_then(|body: Value, s: Arc<ProxyServer>| async move {
                 let context = RequestContext {
                     client: &s.client,
-                    logger: &s.logger,
                     lmstudio_url: &s.config.lmstudio_url,
                     timeout_seconds: s.config.request_timeout_seconds,
                 };
@@ -176,7 +168,6 @@ impl ProxyServer {
             .and_then(|body: Value, s: Arc<ProxyServer>| async move {
                 let context = RequestContext {
                     client: &s.client,
-                    logger: &s.logger,
                     lmstudio_url: &s.config.lmstudio_url,
                     timeout_seconds: s.config.request_timeout_seconds,
                 };
@@ -194,7 +185,6 @@ impl ProxyServer {
             .and_then(|body: Value, s: Arc<ProxyServer>| async move {
                 let context = RequestContext {
                     client: &s.client,
-                    logger: &s.logger,
                     lmstudio_url: &s.config.lmstudio_url,
                     timeout_seconds: s.config.request_timeout_seconds,
                 };
@@ -213,7 +203,6 @@ impl ProxyServer {
             .and_then(|s: Arc<ProxyServer>| async move {
                 let context = RequestContext {
                     client: &s.client,
-                    logger: &s.logger,
                     lmstudio_url: &s.config.lmstudio_url,
                     timeout_seconds: s.config.request_timeout_seconds,
                 };
@@ -233,7 +222,6 @@ impl ProxyServer {
             .and_then(|tail: warp::path::Tail, method: warp::http::Method, body: Value, s: Arc<ProxyServer>| async move {
                 let context = RequestContext {
                     client: &s.client,
-                    logger: &s.logger,
                     lmstudio_url: &s.config.lmstudio_url,
                     timeout_seconds: s.config.request_timeout_seconds,
                 };
@@ -248,7 +236,6 @@ impl ProxyServer {
             .and_then(|s: Arc<ProxyServer>| async move {
                 let context = RequestContext {
                     client: &s.client,
-                    logger: &s.logger,
                     lmstudio_url: &s.config.lmstudio_url,
                     timeout_seconds: s.config.request_timeout_seconds,
                 };
@@ -258,10 +245,6 @@ impl ProxyServer {
                     Err(e) => Err(warp::reject::custom(e)),
                 }
             });
-
-        let metrics_route = warp::path("metrics")
-            .and(warp::get())
-            .and_then(handle_metrics_endpoint);
 
         let unsupported_ollama_route = warp::path("api")
             .and(warp::path::full())
@@ -278,29 +261,27 @@ impl ProxyServer {
             .or(ollama_version_route.boxed())
             .or(lmstudio_passthrough_route.boxed())
             .or(health_route.boxed())
-            .or(metrics_route.boxed())
             .or(unsupported_ollama_route.boxed());
 
         let final_routes = app_routes
             .recover(handle_rejection)
             .with(log_filter);
 
-        server_arc.logger.log("Starting server...");
+        log_info("Starting server...");
         warp::serve(final_routes).run(addr).await;
         Ok(())
     }
 
     /// Print startup banner with configuration info
     fn print_startup_banner(&self) {
-        if self.logger.enabled {
+        if is_logging_enabled() {
             println!();
             println!("------------------------------------------------------");
             println!("Ollama <-> LM Studio Proxy - Version: {}", crate::VERSION);
             println!("------------------------------------------------------");
             println!(" Listening on: {}", self.config.listen);
             println!(" LM Studio URL: {}", self.config.lmstudio_url);
-            println!(" Logging: {}", if self.logger.enabled { "Enabled" } else { "Disabled" });
-            println!(" Metrics: {}", if self.config.enable_metrics { "Enabled (/metrics)" } else { "Disabled" });
+            println!(" Logging: {}", if is_logging_enabled() { "Enabled" } else { "Disabled" });
             println!(" Model Load Timeout: {}s", self.config.load_timeout_seconds);
             println!(" Request Timeout: {}s", self.config.request_timeout_seconds);
             println!(" Stream Timeout: {}s", self.config.stream_timeout_seconds);
@@ -310,22 +291,6 @@ impl ProxyServer {
             println!(" INFO: Proxy request validation deferred to LM Studio backend.");
             println!("------------------------------------------------------");
             println!();
-        }
-    }
-}
-
-/// Handle metrics endpoint
-async fn handle_metrics_endpoint() -> Result<impl Reply, Rejection> {
-    match get_global_metrics() {
-        Some(metrics_collector) => {
-            let metrics_data = metrics_collector.get_metrics().await;
-            Ok(json_response(&metrics_data))
-        }
-        None => {
-            let disabled_response = serde_json::json!({
-                "error": "Metrics collection is disabled in server configuration."
-            });
-            Ok(json_response(&disabled_response))
         }
     }
 }
@@ -370,7 +335,7 @@ async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
         message = "Unsupported Media Type. Expected application/json.".to_string();
         error_type = "unsupported_media_type_error".to_string();
     } else {
-        eprintln!("[ERROR] Unhandled rejection: {:?}", err);
+        log_error("Unhandled rejection", &format!("{:?}", err));
         code = warp::http::StatusCode::INTERNAL_SERVER_ERROR;
         message = "An unexpected internal error occurred.".to_string();
         error_type = "internal_server_error".to_string();

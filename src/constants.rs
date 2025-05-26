@@ -2,13 +2,13 @@
 
 use std::sync::OnceLock;
 
+
 /// Global configuration that can be set at runtime
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub max_buffer_size: usize,
     pub max_partial_content_size: usize,
     pub string_buffer_size: usize,
-    pub enable_metrics: bool,
     pub enable_chunk_recovery: bool,
 }
 
@@ -18,7 +18,6 @@ impl Default for RuntimeConfig {
             max_buffer_size: 256 * 1024,
             max_partial_content_size: 50_000,
             string_buffer_size: 2048,
-            enable_metrics: true,
             enable_chunk_recovery: true,
         }
     }
@@ -88,7 +87,6 @@ pub const LOG_PREFIX_SUCCESS: &str = "✅";
 pub const LOG_PREFIX_ERROR: &str = "❌";
 pub const LOG_PREFIX_WARNING: &str = "⚠️";
 pub const LOG_PREFIX_CANCEL: &str = "🚫";
-pub const LOG_PREFIX_METRICS: &str = "📊";
 
 /// Default context array for generate responses
 pub const DEFAULT_CONTEXT: [u32; 3] = [1, 2, 3];

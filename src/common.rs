@@ -1,18 +1,18 @@
-/// src/common.rs - Enhanced infrastructure with runtime configuration support
+/// src/common.rs - Enhanced infrastructure with centralized logging
 
 use serde_json::Value;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+
 use crate::constants::*;
-use crate::utils::{ProxyError, Logger};
+use crate::utils::{log_error, ProxyError};
 use crate::{check_cancelled, handle_lm_error};
 
 /// Lightweight request context for concurrent request handling
 #[derive(Clone)]
 pub struct RequestContext<'a> {
     pub client: &'a reqwest::Client,
-    pub logger: &'a Logger,
     pub lmstudio_url: &'a str,
     pub timeout_seconds: u64,
 }
@@ -63,7 +63,7 @@ impl<'a> CancellableRequest<'a> {
                         } else {
                             "Request failed"
                         };
-                        self.context.logger.log_error("CancellableRequest send", &format!("{}: {:?}", error_msg, err));
+                        log_error("CancellableRequest send", &format!("{}: {:?}", error_msg, err));
                         Err(ProxyError::internal_server_error(error_msg))
                     }
                 }

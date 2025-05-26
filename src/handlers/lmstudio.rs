@@ -4,13 +4,14 @@ use serde_json::Value;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+
 use crate::common::{handle_json_response, CancellableRequest, RequestContext};
 use crate::constants::*;
 use crate::handlers::helpers::json_response;
 use crate::handlers::retry::{with_retry_and_cancellation, with_simple_retry};
 use crate::handlers::streaming::{handle_passthrough_streaming_response, is_streaming_request};
 use crate::model::ModelResolver;
-use crate::utils::ProxyError;
+use crate::utils::{log_request, log_timed, ProxyError};
 
 /// Handle direct LM Studio API passthrough with model resolution
 pub async fn handle_lmstudio_passthrough(
@@ -55,7 +56,7 @@ pub async fn handle_lmstudio_passthrough(
                 let url = format!("{}{}", context.lmstudio_url, current_endpoint);
                 let is_streaming = is_streaming_request(&current_body);
 
-                context.logger.log_request(&current_method, &url, current_original_model_name.as_deref());
+                log_request(&current_method, &url, current_original_model_name.as_deref());
 
                 let request_method = match current_method.as_str() {
                     "GET" => reqwest::Method::GET,
@@ -92,7 +93,6 @@ pub async fn handle_lmstudio_passthrough(
                     handle_passthrough_streaming_response(
                         response,
                         current_cancellation_token.clone(),
-                        context.logger,
                         context.timeout_seconds
                     ).await
                 } else {
@@ -109,7 +109,7 @@ pub async fn handle_lmstudio_passthrough(
         with_simple_retry(operation, cancellation_token).await?
     };
 
-    context.logger.log_timed(LOG_PREFIX_SUCCESS, "LM Studio passthrough", start_time);
+    log_timed(LOG_PREFIX_SUCCESS, "LM Studio passthrough", start_time);
     Ok(result)
 }
 
