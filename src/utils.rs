@@ -251,15 +251,6 @@ pub fn format_duration(duration: Duration) -> String {
 
 /// Enhanced config validation
 pub fn validate_config(config: &crate::server::Config) -> Result<(), String> {
-    if config.request_timeout_seconds == 0 {
-        return Err("Request timeout must be greater than 0".to_string());
-    }
-    if config.stream_timeout_seconds == 0 {
-        return Err("Stream timeout must be greater than 0".to_string());
-    }
-    if config.load_timeout_seconds == 0 {
-        return Err("Load timeout must be greater than 0".to_string());
-    }
     if config.listen.parse::<std::net::SocketAddr>().is_err() {
         return Err(format!("Invalid listen address: {}", config.listen));
     }
@@ -268,11 +259,6 @@ pub fn validate_config(config: &crate::server::Config) -> Result<(), String> {
     }
     if let Err(e) = url::Url::parse(&config.lmstudio_url) {
         return Err(format!("Invalid LM Studio URL format: {}", e));
-    }
-
-    // Validate buffer sizes
-    if config.max_buffer_size == 0 {
-        return Err("Max buffer size must be greater than 0".to_string());
     }
 
     Ok(())

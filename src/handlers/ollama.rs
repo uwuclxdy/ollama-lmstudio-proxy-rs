@@ -7,7 +7,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::common::{extract_model_name, handle_json_response, CancellableRequest, RequestContext};
 use crate::constants::*;
-use crate::handle_lm_error;
 use crate::handlers::helpers::{
     build_lm_studio_request, execute_request_with_retry, json_response,
     LMStudioRequestType, ResponseTransformer,
@@ -100,7 +99,6 @@ pub async fn handle_ollama_chat(
         let context = context.clone();
         let body_clone = body.clone();
         let cancellation_token_clone = cancellation_token.clone();
-        let config_clone = config.clone();
         let ollama_model_name_clone = ollama_model_name.to_string();
 
         async move {
@@ -128,17 +126,15 @@ pub async fn handle_ollama_chat(
             let response = request_obj.make_request(reqwest::Method::POST, &url, Some(lm_request)).await?;
 
             if stream {
-                handle_lm_error!(response);
                 handle_streaming_response(
                     response,
                     true,
                     &ollama_model_name_clone,
                     start_time,
                     cancellation_token_clone.clone(),
-                    config_clone.stream_timeout_seconds,
+                    60, // Default stream timeout since removed from config
                 ).await
             } else {
-                handle_lm_error!(response);
                 let lm_response_value = handle_json_response(response, cancellation_token_clone).await?;
                 let ollama_response = ResponseTransformer::convert_to_ollama_chat(
                     &lm_response_value,
@@ -196,7 +192,6 @@ pub async fn handle_ollama_generate(
         let context = context.clone();
         let body_clone = body.clone();
         let cancellation_token_clone = cancellation_token.clone();
-        let config_clone = config.clone();
         let ollama_model_name_clone = ollama_model_name.to_string();
 
         async move {
@@ -236,17 +231,15 @@ pub async fn handle_ollama_generate(
             let response = request_obj.make_request(reqwest::Method::POST, &lm_studio_target_url, Some(lm_request)).await?;
 
             if stream {
-                handle_lm_error!(response);
                 handle_streaming_response(
                     response,
                     false,
                     &ollama_model_name_clone,
                     start_time,
                     cancellation_token_clone.clone(),
-                    config_clone.stream_timeout_seconds,
+                    60, // Default stream timeout since removed from config
                 ).await
             } else {
-                handle_lm_error!(response);
                 let lm_response_value = handle_json_response(response, cancellation_token_clone).await?;
                 let ollama_response = ResponseTransformer::convert_to_ollama_generate(
                     &lm_response_value,
@@ -289,36 +282,9 @@ pub async fn handle_ollama_embeddings(
 
         async move {
             let current_ollama_model_name = extract_model_name(&body_clone, "model")?;
-            let mut input_value = body_clone.get("input").or_else(|| body_clone.get("prompt"))
+            let input_value = body_clone.get("input").or_else(|| body_clone.get("prompt"))
                 .cloned()
                 .ok_or_else(|| ProxyError::bad_request(ERROR_MISSING_INPUT))?;
-
-            let ollama_options = body_clone.get("options");
-            let truncate = ollama_options
-                .and_then(|opts| opts.get("truncate"))
-                .and_then(|t| t.as_bool())
-                .unwrap_or(true);
-
-            // Truncate if enabled
-            if truncate {
-                if let Some(s_input) = input_value.as_str() {
-                    if s_input.chars().count() > EMBEDDING_TRUNCATE_CHAR_LIMIT {
-                        let truncated_input: String = s_input.chars().take(EMBEDDING_TRUNCATE_CHAR_LIMIT).collect();
-                        input_value = Value::String(truncated_input);
-                        log_warning("Embeddings input", "Input string truncated due to length.");
-                    }
-                } else if let Some(arr_input) = input_value.as_array_mut() {
-                    for val in arr_input.iter_mut() {
-                        if let Some(s) = val.as_str() {
-                            if s.chars().count() > EMBEDDING_TRUNCATE_CHAR_LIMIT {
-                                let truncated_s: String = s.chars().take(EMBEDDING_TRUNCATE_CHAR_LIMIT).collect();
-                                *val = Value::String(truncated_s);
-                                log_warning("Embeddings input", "An input string in array truncated.");
-                            }
-                        }
-                    }
-                }
-            }
 
             let resolver = ModelResolver::new(context.clone());
             let lm_studio_model_id = resolver.resolve_model_name(current_ollama_model_name, cancellation_token_clone.clone()).await?;
@@ -335,7 +301,6 @@ pub async fn handle_ollama_embeddings(
             log_request("POST", &url, Some(&lm_studio_model_id));
 
             let response = request_obj.make_request(reqwest::Method::POST, &url, Some(lm_request)).await?;
-            handle_lm_error!(response);
             let lm_response_value = handle_json_response(response, cancellation_token_clone).await?;
 
             let ollama_response = ResponseTransformer::convert_to_ollama_embeddings(

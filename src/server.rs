@@ -36,16 +36,10 @@ pub struct Config {
     )]
     pub load_timeout_seconds: u64,
 
-    #[arg(long, default_value = "120", help = "HTTP request timeout in seconds")]
-    pub request_timeout_seconds: u64,
-
-    #[arg(long, default_value = "60", help = "Streaming timeout in seconds (per chunk)")]
-    pub stream_timeout_seconds: u64,
-
     #[arg(
         long,
         default_value = "262144",
-        help = "Maximum buffer size in bytes for SSE message assembly (capacity hint)"
+        help = "Initial buffer size in bytes for SSE message assembly (capacity hint)"
     )]
     pub max_buffer_size: usize,
 
@@ -76,8 +70,8 @@ impl ProxyServer {
         validate_config(&config)?;
 
         let runtime_config = RuntimeConfig {
-            max_buffer_size: config.max_buffer_size,
-            max_partial_content_size: config.max_buffer_size / 4,
+            max_buffer_size: if config.max_buffer_size > 0 { config.max_buffer_size } else { usize::MAX },
+            max_partial_content_size: usize::MAX,
             string_buffer_size: 2048,
             enable_chunk_recovery: config.enable_chunk_recovery,
         };
@@ -85,7 +79,6 @@ impl ProxyServer {
         init_global_logger(!config.no_log);
 
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(config.request_timeout_seconds + 10))
             .connect_timeout(std::time::Duration::from_secs(10))
             .pool_max_idle_per_host(10)
             .build()?;
@@ -140,7 +133,6 @@ impl ProxyServer {
                 let context = RequestContext {
                     client: &s.client,
                     lmstudio_url: &s.config.lmstudio_url,
-                    timeout_seconds: s.config.request_timeout_seconds,
                 };
                 let token = CancellationToken::new();
                 handlers::ollama::handle_ollama_tags(context, token).await.map_err(warp::reject::custom)
@@ -154,7 +146,6 @@ impl ProxyServer {
                 let context = RequestContext {
                     client: &s.client,
                     lmstudio_url: &s.config.lmstudio_url,
-                    timeout_seconds: s.config.request_timeout_seconds,
                 };
                 let token = CancellationToken::new();
                 let config_ref = s.config.as_ref();
@@ -169,7 +160,6 @@ impl ProxyServer {
                 let context = RequestContext {
                     client: &s.client,
                     lmstudio_url: &s.config.lmstudio_url,
-                    timeout_seconds: s.config.request_timeout_seconds,
                 };
                 let token = CancellationToken::new();
                 let config_ref = s.config.as_ref();
@@ -186,7 +176,6 @@ impl ProxyServer {
                 let context = RequestContext {
                     client: &s.client,
                     lmstudio_url: &s.config.lmstudio_url,
-                    timeout_seconds: s.config.request_timeout_seconds,
                 };
                 let token = CancellationToken::new();
                 handlers::ollama::handle_ollama_embeddings(context, body, token).await.map_err(warp::reject::custom)
@@ -204,7 +193,6 @@ impl ProxyServer {
                 let context = RequestContext {
                     client: &s.client,
                     lmstudio_url: &s.config.lmstudio_url,
-                    timeout_seconds: s.config.request_timeout_seconds,
                 };
                 let token = CancellationToken::new();
                 handlers::ollama::handle_ollama_ps(context, token).await.map_err(warp::reject::custom)
@@ -223,7 +211,6 @@ impl ProxyServer {
                 let context = RequestContext {
                     client: &s.client,
                     lmstudio_url: &s.config.lmstudio_url,
-                    timeout_seconds: s.config.request_timeout_seconds,
                 };
                 let token = CancellationToken::new();
                 let full_path = format!("/v1/{}", tail.as_str());
@@ -237,7 +224,6 @@ impl ProxyServer {
                 let context = RequestContext {
                     client: &s.client,
                     lmstudio_url: &s.config.lmstudio_url,
-                    timeout_seconds: s.config.request_timeout_seconds,
                 };
                 let token = CancellationToken::new();
                 match handlers::ollama::handle_health_check(context, token).await {
@@ -283,12 +269,10 @@ impl ProxyServer {
             println!(" LM Studio URL: {}", self.config.lmstudio_url);
             println!(" Logging: {}", if is_logging_enabled() { "Enabled" } else { "Disabled" });
             println!(" Model Load Timeout: {}s", self.config.load_timeout_seconds);
-            println!(" Request Timeout: {}s", self.config.request_timeout_seconds);
-            println!(" Stream Timeout: {}s", self.config.stream_timeout_seconds);
-            println!(" Max SSE Buffer (capacity hint): {} bytes", self.config.max_buffer_size);
+            println!(" Initial SSE Buffer: {} bytes", self.config.max_buffer_size);
             println!(" Chunk Recovery: {}", if get_runtime_config().enable_chunk_recovery { "Enabled" } else { "Disabled" });
             println!("------------------------------------------------------");
-            println!(" INFO: Proxy request validation deferred to LM Studio backend.");
+            println!(" INFO: Proxy forwards all requests and timing to LM Studio backend.");
             println!("------------------------------------------------------");
             println!();
         }

@@ -1,20 +1,18 @@
 /// src/common.rs - Enhanced infrastructure with centralized logging
 
 use serde_json::Value;
-use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 
+use crate::check_cancelled;
 use crate::constants::*;
 use crate::utils::{log_error, ProxyError};
-use crate::{check_cancelled, handle_lm_error};
 
 /// Lightweight request context for concurrent request handling
 #[derive(Clone)]
 pub struct RequestContext<'a> {
     pub client: &'a reqwest::Client,
     pub lmstudio_url: &'a str,
-    pub timeout_seconds: u64,
 }
 
 /// Optimized cancellable request handler
@@ -46,17 +44,13 @@ impl<'a> CancellableRequest<'a> {
                 .json(&body_content);
         }
 
-        request_builder = request_builder.timeout(Duration::from_secs(self.context.timeout_seconds));
-
         // Race request against cancellation
         tokio::select! {
             result = request_builder.send() => {
                 match result {
                     Ok(response) => Ok(response),
                     Err(err) => {
-                        let error_msg = if err.is_timeout() {
-                            "Request timeout"
-                        } else if err.is_connect() {
+                        let error_msg = if err.is_connect() {
                             ERROR_LM_STUDIO_UNAVAILABLE
                         } else if err.is_request() {
                             "Invalid request"
@@ -75,19 +69,37 @@ impl<'a> CancellableRequest<'a> {
     }
 }
 
-/// Enhanced JSON response handling with cancellation support
+/// Enhanced JSON response handling with cancellation support - passes through LM Studio errors
 pub async fn handle_json_response(
     response: reqwest::Response,
     cancellation_token: CancellationToken
 ) -> Result<Value, ProxyError> {
     check_cancelled!(cancellation_token);
-    handle_lm_error!(response);
+
+    // Check if response indicates an error but still has JSON content
+    let status = response.status();
+    let is_error = !status.is_success();
 
     tokio::select! {
         result = response.json::<Value>() => {
-            result.map_err(|e| {
-                ProxyError::internal_server_error(&format!("Invalid JSON from LM Studio: {}", e))
-            })
+            match result {
+                Ok(json_value) => {
+                    if is_error {
+                        // Pass through LM Studio errors as-is but in ProxyError format
+                        let error_message = json_value.get("error")
+                            .and_then(|e| e.get("message"))
+                            .and_then(|m| m.as_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| format!("LM Studio error: {}", status));
+                        Err(ProxyError::new(error_message, status.as_u16()))
+                    } else {
+                        Ok(json_value)
+                    }
+                }
+                Err(e) => {
+                    Err(ProxyError::internal_server_error(&format!("Invalid JSON from LM Studio: {}", e)))
+                }
+            }
         }
         _ = cancellation_token.cancelled() => {
             Err(ProxyError::request_cancelled())

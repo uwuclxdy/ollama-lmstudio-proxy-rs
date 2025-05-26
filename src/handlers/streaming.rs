@@ -42,7 +42,7 @@ pub async fn handle_streaming_response(
 
     tokio::spawn(async move {
         let mut stream = lm_studio_response.bytes_stream();
-        let mut sse_buffer = String::with_capacity(runtime_config.max_buffer_size / 10);
+        let mut sse_buffer = String::with_capacity(runtime_config.max_buffer_size.min(1024 * 1024)); // Cap initial capacity for memory efficiency
         let mut chunk_count = 0u64;
         let mut accumulated_tool_calls: Option<Vec<Value>> = None;
 
@@ -65,12 +65,6 @@ pub async fn handle_streaming_response(
                         Ok(Some(Ok(bytes_chunk))) => {
                             if let Ok(chunk_str) = std::str::from_utf8(&bytes_chunk) {
                                 sse_buffer.push_str(chunk_str);
-
-                                // Prevent unbounded buffer growth
-                                if sse_buffer.len() > runtime_config.max_buffer_size {
-                                    send_error_and_close(&tx, &model_clone_for_task, ERROR_BUFFER_OVERFLOW, is_chat_endpoint).await;
-                                    break 'stream_loop Err(ERROR_BUFFER_OVERFLOW.to_string());
-                                }
 
                                 while let Some(boundary_pos) = sse_buffer.find(SSE_MESSAGE_BOUNDARY) {
                                     let message_text = sse_buffer[..boundary_pos].to_string();

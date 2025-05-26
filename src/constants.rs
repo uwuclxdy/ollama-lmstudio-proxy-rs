@@ -15,8 +15,8 @@ pub struct RuntimeConfig {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            max_buffer_size: 256 * 1024,
-            max_partial_content_size: 50_000,
+            max_buffer_size: usize::MAX, // No limit
+            max_partial_content_size: usize::MAX, // No limit
             string_buffer_size: 2048,
             enable_chunk_recovery: true,
         }
@@ -62,7 +62,6 @@ pub const DEFAULT_TOP_P: f64 = 0.9;
 pub const DEFAULT_TOP_K: u32 = 40;
 pub const DEFAULT_REPEAT_PENALTY: f64 = 1.1;
 pub const DEFAULT_KEEP_ALIVE_MINUTES: i64 = 5;
-pub const EMBEDDING_TRUNCATE_CHAR_LIMIT: usize = 131072;
 
 /// Error messages
 pub const ERROR_MISSING_MODEL: &str = "Missing 'model' field";

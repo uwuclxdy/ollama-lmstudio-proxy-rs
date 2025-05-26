@@ -93,7 +93,7 @@ pub async fn handle_lmstudio_passthrough(
                     handle_passthrough_streaming_response(
                         response,
                         current_cancellation_token.clone(),
-                        context.timeout_seconds
+                        60 // Default stream timeout since removed from context
                     ).await
                 } else {
                     let json_data = handle_json_response(response, current_cancellation_token).await?;
