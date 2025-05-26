@@ -1,4 +1,4 @@
-// src/constants.rs - Runtime configurable constants
+/// src/constants.rs - Runtime configurable constants and static values
 
 use std::sync::OnceLock;
 
@@ -6,9 +6,7 @@ use std::sync::OnceLock;
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub max_buffer_size: usize,
-    pub max_chunk_count: u64,
     pub max_partial_content_size: usize,
-    pub max_request_size_bytes: usize,
     pub string_buffer_size: usize,
     pub enable_metrics: bool,
     pub enable_chunk_recovery: bool,
@@ -17,10 +15,8 @@ pub struct RuntimeConfig {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            max_buffer_size: 256 * 1024, // 256KB default
-            max_chunk_count: 50_000,
+            max_buffer_size: 256 * 1024,
             max_partial_content_size: 50_000,
-            max_request_size_bytes: 500 * 1024 * 1024, // 500MB default
             string_buffer_size: 2048,
             enable_metrics: true,
             enable_chunk_recovery: true,
@@ -66,6 +62,8 @@ pub const DEFAULT_TEMPERATURE: f64 = 0.7;
 pub const DEFAULT_TOP_P: f64 = 0.9;
 pub const DEFAULT_TOP_K: u32 = 40;
 pub const DEFAULT_REPEAT_PENALTY: f64 = 1.1;
+pub const DEFAULT_KEEP_ALIVE_MINUTES: i64 = 5;
+pub const EMBEDDING_TRUNCATE_CHAR_LIMIT: usize = 131072;
 
 /// Error messages
 pub const ERROR_MISSING_MODEL: &str = "Missing 'model' field";

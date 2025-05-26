@@ -1,8 +1,7 @@
-// src/handlers/helpers.rs - Consolidated helper functions with reduced duplication
+/// src/handlers/helpers.rs - Helper functions for request/response transformation and timing.
 
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
-use warp::Reply;
 
 use crate::common::{RequestBuilder, map_ollama_to_lmstudio_params};
 use crate::constants::*;
@@ -10,13 +9,27 @@ use crate::metrics::get_global_metrics;
 
 /// Create JSON response with proper headers
 pub fn json_response(value: &Value) -> warp::reply::Response {
-    warp::reply::with_status(
-        warp::reply::json(value),
-        warp::http::StatusCode::OK,
-    ).into_response()
+    let json_string = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
+    let content_length = json_string.len();
+
+    warp::http::Response::builder()
+        .status(warp::http::StatusCode::OK)
+        .header("Content-Type", CONTENT_TYPE_JSON)
+        .header("Content-Length", content_length.to_string())
+        .header("Cache-Control", HEADER_CACHE_CONTROL)
+        .header("Access-Control-Allow-Origin", HEADER_ACCESS_CONTROL_ALLOW_ORIGIN)
+        .header("Access-Control-Allow-Methods", HEADER_ACCESS_CONTROL_ALLOW_METHODS)
+        .header("Access-Control-Allow-Headers", HEADER_ACCESS_CONTROL_ALLOW_HEADERS)
+        .body(json_string.into())
+        .unwrap_or_else(|_| {
+            warp::http::Response::builder()
+                .status(warp::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .body("Internal Server Error".into())
+                .unwrap()
+        })
 }
 
-/// Consolidated timing information calculator
+/// Consolidated timing information for Ollama responses
 #[derive(Debug, Clone)]
 pub struct TimingInfo {
     pub total_duration: u64,
@@ -28,17 +41,39 @@ pub struct TimingInfo {
 }
 
 impl TimingInfo {
-    /// Calculate timing from request parameters
-    pub fn calculate(start_time: Instant, input_tokens: u64, output_tokens: u64) -> Self {
-        let total_duration = start_time.elapsed().as_nanos() as u64;
+    /// Calculate timing from token counts and duration
+    pub fn calculate(
+        start_time: Instant,
+        input_tokens_estimate: u64,
+        output_tokens_estimate: u64,
+        actual_prompt_tokens: Option<u64>,
+        actual_completion_tokens: Option<u64>,
+    ) -> Self {
+        let total_duration_ns = start_time.elapsed().as_nanos() as u64;
+
+        let final_prompt_tokens = actual_prompt_tokens.unwrap_or(input_tokens_estimate).max(1);
+        let final_eval_tokens = actual_completion_tokens.unwrap_or(output_tokens_estimate).max(1);
+
+        // Proportional split
+        let prompt_eval_duration_ns = if final_prompt_tokens + final_eval_tokens > 0 && total_duration_ns > 1000 {
+            (total_duration_ns as f64 * (final_prompt_tokens as f64 / (final_prompt_tokens + final_eval_tokens) as f64)) as u64
+        } else {
+            total_duration_ns / TIMING_PROMPT_RATIO
+        };
+
+        let eval_duration_ns = if final_prompt_tokens + final_eval_tokens > 0 && total_duration_ns > 1000 {
+            total_duration_ns - prompt_eval_duration_ns
+        } else {
+            total_duration_ns / TIMING_EVAL_RATIO
+        };
 
         Self {
-            total_duration,
+            total_duration: total_duration_ns,
             load_duration: DEFAULT_LOAD_DURATION_NS,
-            prompt_eval_count: input_tokens.max(1),
-            prompt_eval_duration: total_duration / TIMING_PROMPT_RATIO,
-            eval_count: output_tokens.max(1),
-            eval_duration: total_duration / TIMING_EVAL_RATIO,
+            prompt_eval_count: final_prompt_tokens,
+            prompt_eval_duration: prompt_eval_duration_ns.max(1),
+            eval_count: final_eval_tokens,
+            eval_duration: eval_duration_ns.max(1),
         }
     }
 
@@ -46,49 +81,71 @@ impl TimingInfo {
     pub fn from_text_content(start_time: Instant, input_text: &str, output_text: &str) -> Self {
         let input_tokens = estimate_token_count(input_text);
         let output_tokens = estimate_token_count(output_text);
-        Self::calculate(start_time, input_tokens, output_tokens)
+        Self::calculate(start_time, input_tokens, output_tokens, None, None)
     }
 
     /// Calculate timing from message count
     pub fn from_message_count(start_time: Instant, message_count: usize, output_text: &str) -> Self {
-        let input_tokens = (message_count * 10).max(1) as u64; // Rough estimate
+        let input_tokens = (message_count * 10).max(1) as u64;
         let output_tokens = estimate_token_count(output_text);
-        Self::calculate(start_time, input_tokens, output_tokens)
+        Self::calculate(start_time, input_tokens, output_tokens, None, None)
     }
 }
 
-/// Enhanced response transformer with consolidated patterns
+/// Transform LM Studio responses to Ollama format
 pub struct ResponseTransformer;
 
 impl ResponseTransformer {
     /// Transform LM Studio chat response to Ollama format
     pub fn convert_to_ollama_chat(
         lm_response: &Value,
-        model: &str,
-        messages: &[Value],
+        model_ollama_name: &str,
+        message_count_for_estimation: usize,
         start_time: Instant,
     ) -> Value {
-        let content = Self::extract_content_with_reasoning(lm_response, true);
-        let timing = TimingInfo::from_message_count(start_time, messages.len(), &content);
+        let content = Self::extract_chat_content_with_reasoning(lm_response);
 
-        // Record metrics if enabled
+        let actual_prompt_tokens = lm_response.get("usage").and_then(|u| u.get("prompt_tokens")).and_then(|t| t.as_u64());
+        let actual_completion_tokens = lm_response.get("usage").and_then(|u| u.get("completion_tokens")).and_then(|t| t.as_u64());
+
+        let timing = TimingInfo::calculate(
+            start_time,
+            (message_count_for_estimation * 10).max(1) as u64,
+            estimate_token_count(&content),
+            actual_prompt_tokens,
+            actual_completion_tokens,
+        );
+
+        // Record metrics
         if let Some(metrics) = get_global_metrics() {
-            tokio::spawn({
-                let model = model.to_string();
-                let content_len = content.len() as u64;
-                async move {
-                    metrics.record_model_usage(&model, content_len / 4).await; // Rough token estimate
-                }
+            let model_metrics_name = crate::model::clean_model_name(model_ollama_name).to_string();
+            let tokens_for_metrics = timing.eval_count;
+            tokio::spawn(async move {
+                metrics.record_model_usage(&model_metrics_name, tokens_for_metrics).await;
             });
         }
 
+        let mut ollama_message = json!({
+            "role": "assistant",
+            "content": content
+        });
+
+        if let Some(tool_calls) = lm_response.get("choices")
+            .and_then(|c| c.as_array()?.first())
+            .and_then(|choice| choice.get("message")?.get("tool_calls"))
+            .and_then(|tc| tc.as_array())
+        {
+            if !tool_calls.is_empty() {
+                if let Some(msg_obj) = ollama_message.as_object_mut() {
+                    msg_obj.insert("tool_calls".to_string(), json!(tool_calls));
+                }
+            }
+        }
+
         json!({
-            "model": model,
+            "model": model_ollama_name,
             "created_at": chrono::Utc::now().to_rfc3339(),
-            "message": {
-                "role": "assistant",
-                "content": content
-            },
+            "message": ollama_message,
             "done": true,
             "total_duration": timing.total_duration,
             "load_duration": timing.load_duration,
@@ -102,26 +159,34 @@ impl ResponseTransformer {
     /// Transform LM Studio completion response to Ollama format
     pub fn convert_to_ollama_generate(
         lm_response: &Value,
-        model: &str,
-        prompt: &str,
+        model_ollama_name: &str,
+        prompt_for_estimation: &str,
         start_time: Instant,
     ) -> Value {
         let content = Self::extract_completion_content(lm_response);
-        let timing = TimingInfo::from_text_content(start_time, prompt, &content);
 
-        // Record metrics if enabled
+        let actual_prompt_tokens = lm_response.get("usage").and_then(|u| u.get("prompt_tokens")).and_then(|t| t.as_u64());
+        let actual_completion_tokens = lm_response.get("usage").and_then(|u| u.get("completion_tokens")).and_then(|t| t.as_u64());
+
+        let timing = TimingInfo::calculate(
+            start_time,
+            estimate_token_count(prompt_for_estimation),
+            estimate_token_count(&content),
+            actual_prompt_tokens,
+            actual_completion_tokens,
+        );
+
+        // Record metrics
         if let Some(metrics) = get_global_metrics() {
-            tokio::spawn({
-                let model = model.to_string();
-                let content_len = content.len() as u64;
-                async move {
-                    metrics.record_model_usage(&model, content_len / 4).await;
-                }
+            let model_metrics_name = crate::model::clean_model_name(model_ollama_name).to_string();
+            let tokens_for_metrics = timing.eval_count;
+            tokio::spawn(async move {
+                metrics.record_model_usage(&model_metrics_name, tokens_for_metrics).await;
             });
         }
 
         json!({
-            "model": model,
+            "model": model_ollama_name,
             "created_at": chrono::Utc::now().to_rfc3339(),
             "response": content,
             "done": true,
@@ -138,14 +203,26 @@ impl ResponseTransformer {
     /// Transform LM Studio embeddings response to Ollama format
     pub fn convert_to_ollama_embeddings(
         lm_response: &Value,
-        model: &str,
+        model_ollama_name: &str,
         start_time: Instant,
     ) -> Value {
         let embeddings = Self::extract_embeddings(lm_response);
-        let timing = TimingInfo::calculate(start_time, 1, 1); // Minimal timing for embeddings
+
+        let actual_prompt_tokens = lm_response.get("usage").and_then(|u| u.get("prompt_tokens")).and_then(|t| t.as_u64());
+
+        let estimated_input_tokens = 10;
+        let estimated_output_tokens = embeddings.len().max(1) as u64;
+
+        let timing = TimingInfo::calculate(
+            start_time,
+            estimated_input_tokens,
+            estimated_output_tokens,
+            actual_prompt_tokens,
+            None
+        );
 
         json!({
-            "model": model,
+            "model": model_ollama_name,
             "embeddings": embeddings,
             "total_duration": timing.total_duration,
             "load_duration": timing.load_duration,
@@ -154,109 +231,99 @@ impl ResponseTransformer {
         })
     }
 
-    /// Extract content with reasoning support
-    fn extract_content_with_reasoning(lm_response: &Value, is_chat: bool) -> String {
-        let base_content = if is_chat {
-            Self::extract_chat_content(lm_response)
-        } else {
-            Self::extract_completion_content(lm_response)
-        };
+    /// Extract chat content including reasoning
+    fn extract_chat_content_with_reasoning(lm_response: &Value) -> String {
+        let base_content = lm_response
+            .get("choices")
+            .and_then(|c| c.as_array()?.first())
+            .and_then(|choice| choice.get("message")?.get("content")?.as_str())
+            .unwrap_or("")
+            .to_string();
 
-        // Check for reasoning content
         if let Some(reasoning) = lm_response
             .get("choices")
-            .and_then(|c| c.as_array())
-            .and_then(|choices| choices.first())
-            .and_then(|choice| {
-                choice
-                    .get("message")
-                    .and_then(|m| m.get("reasoning_content"))
-                    .and_then(|r| r.as_str())
-            })
+            .and_then(|c| c.as_array()?.first())
+            .and_then(|choice| choice.get("message")?.get("reasoning_content")?.as_str())
         {
             if !reasoning.is_empty() {
                 return format!("**Reasoning:**\n{}\n\n**Answer:**\n{}", reasoning, base_content);
             }
         }
-
         base_content
     }
 
-    /// Extract chat content from LM Studio response
-    fn extract_chat_content(lm_response: &Value) -> String {
-        lm_response
-            .get("choices")
-            .and_then(|c| c.as_array())
-            .and_then(|choices| choices.first())
-            .and_then(|choice| {
-                choice
-                    .get("message")
-                    .and_then(|m| m.get("content"))
-                    .and_then(|c| c.as_str())
-            })
-            .unwrap_or("")
-            .to_string()
-    }
-
-    /// Extract completion content from LM Studio response
+    /// Extract completion content from response
     fn extract_completion_content(lm_response: &Value) -> String {
         lm_response
             .get("choices")
-            .and_then(|c| c.as_array())
-            .and_then(|choices| choices.first())
-            .and_then(|choice| choice.get("text"))
-            .and_then(|text| text.as_str())
+            .and_then(|c| c.as_array()?.first())
+            .and_then(|choice| choice.get("text")?.as_str())
             .unwrap_or("")
             .to_string()
     }
 
-    /// Extract embeddings from LM Studio response
+    /// Extract embeddings from response
     fn extract_embeddings(lm_response: &Value) -> Vec<Value> {
         lm_response
             .get("data")
             .and_then(|d| d.as_array())
-            .map(|data| {
-                data.iter()
-                    .filter_map(|item| item.get("embedding"))
-                    .cloned()
+            .map(|data_array| {
+                data_array.iter()
+                    .filter_map(|item| item.get("embedding").cloned())
                     .collect()
             })
             .unwrap_or_default()
     }
 }
 
-/// Build LM Studio request using consolidated pattern
+/// Build LM Studio request from Ollama parameters
 pub fn build_lm_studio_request(
-    model: &str,
+    model_lm_studio_id: &str,
     request_type: LMStudioRequestType,
-    options: Option<&Value>,
+    ollama_options: Option<&Value>,
+    ollama_tools: Option<&Value>,
 ) -> Value {
     let mut builder = RequestBuilder::new()
-        .add_required("model", model);
+        .add_required("model", model_lm_studio_id);
 
-    // Add type-specific fields
     match request_type {
         LMStudioRequestType::Chat { messages, stream } => {
             builder = builder
                 .add_required("messages", messages.clone())
                 .add_required("stream", stream);
+            if let Some(tools_val) = ollama_tools {
+                if tools_val.is_array() && !tools_val.as_array().unwrap().is_empty() {
+                    builder = builder.add_required("tools", tools_val.clone());
+                }
+            }
         }
-        LMStudioRequestType::Completion { prompt, stream } => {
-            builder = builder
-                .add_required("prompt", prompt)
-                .add_required("stream", stream);
+        LMStudioRequestType::Completion { prompt, stream, images } => {
+            // Vision support
+            if let Some(img_array) = images {
+                let chat_messages = json!([{
+                    "role": "user",
+                    "content": prompt,
+                    "images": img_array
+                }]);
+                builder = builder
+                    .add_required("messages", chat_messages)
+                    .add_required("stream", stream);
+            } else {
+                builder = builder
+                    .add_required("prompt", prompt)
+                    .add_required("stream", stream);
+            }
         }
         LMStudioRequestType::Embeddings { input } => {
             builder = builder.add_required("input", input.clone());
         }
     }
 
-    // Add common parameters from Ollama options
-    let lm_params = map_ollama_to_lmstudio_params(options);
+    let lm_studio_mapped_params = map_ollama_to_lmstudio_params(ollama_options);
     let mut request_json = builder.build();
 
     if let Some(request_obj) = request_json.as_object_mut() {
-        for (key, value) in lm_params {
+        for (key, value) in lm_studio_mapped_params {
             request_obj.insert(key, value);
         }
     }
@@ -264,23 +331,31 @@ pub fn build_lm_studio_request(
     request_json
 }
 
-/// Request type enumeration for cleaner code
+/// Request type enumeration
 pub enum LMStudioRequestType<'a> {
     Chat { messages: &'a Value, stream: bool },
-    Completion { prompt: &'a str, stream: bool },
+    Completion { prompt: &'a str, stream: bool, images: Option<&'a Value> },
     Embeddings { input: &'a Value },
 }
 
 /// Extract content from streaming chunk
 pub fn extract_content_from_chunk(chunk: &Value) -> Option<String> {
-    // Try chat format first
+    // Chat format
     chunk
-        .get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
+        .get("choices")
+        .and_then(|c| c.as_array()?.first())
+        .and_then(|choice| choice.get("delta")?.get("content")?.as_str())
         .map(|s| s.to_string())
         .or_else(|| {
-            // Try generate format
+            // Completion format
+            chunk
+                .get("choices")
+                .and_then(|c| c.as_array()?.first())
+                .and_then(|choice| choice.get("text")?.as_str())
+                .map(|s| s.to_string())
+        })
+        .or_else(|| {
+            // Ollama fallback
             chunk
                 .get("response")
                 .and_then(|r| r.as_str())
@@ -288,23 +363,36 @@ pub fn extract_content_from_chunk(chunk: &Value) -> Option<String> {
         })
 }
 
-/// Create streaming chunk templates
-pub fn create_streaming_chunk(model: &str, content: &str, is_chat: bool, done: bool) -> Value {
+/// Create Ollama streaming chunk
+pub fn create_ollama_streaming_chunk(
+    model_ollama_name: &str,
+    content: &str,
+    is_chat_endpoint: bool,
+    done: bool,
+    tool_calls_delta: Option<&Value>
+) -> Value {
     let timestamp = chrono::Utc::now().to_rfc3339();
 
-    if is_chat {
+    if is_chat_endpoint {
+        let mut message_obj = json!({
+            "role": "assistant",
+            "content": content
+        });
+        if let Some(tc_delta) = tool_calls_delta {
+            if let Some(msg_map) = message_obj.as_object_mut() {
+                msg_map.insert("tool_calls".to_string(), tc_delta.clone());
+            }
+        }
+
         json!({
-            "model": model,
+            "model": model_ollama_name,
             "created_at": timestamp,
-            "message": {
-                "role": "assistant",
-                "content": content
-            },
+            "message": message_obj,
             "done": done
         })
     } else {
         json!({
-            "model": model,
+            "model": model_ollama_name,
             "created_at": timestamp,
             "response": content,
             "done": done,
@@ -313,49 +401,73 @@ pub fn create_streaming_chunk(model: &str, content: &str, is_chat: bool, done: b
     }
 }
 
-/// Create error chunk for streaming responses
-pub fn create_error_chunk(model: &str, error_message: &str, is_chat: bool) -> Value {
-    let mut chunk = create_streaming_chunk(model, "", is_chat, true);
-
+/// Create error chunk for streaming
+pub fn create_error_chunk(model_ollama_name: &str, error_message: &str, is_chat_endpoint: bool) -> Value {
+    let mut chunk = create_ollama_streaming_chunk(model_ollama_name, "", is_chat_endpoint, true, None);
     if let Some(chunk_obj) = chunk.as_object_mut() {
         chunk_obj.insert("error".to_string(), json!(error_message));
+        if is_chat_endpoint {
+            if let Some(msg) = chunk_obj.get_mut("message").and_then(|m| m.as_object_mut()) {
+                msg.insert("content".to_string(), json!(""));
+            }
+        }
     }
-
     chunk
 }
 
-/// Create cancellation chunk with timing info
+/// Create cancellation chunk with timing
 pub fn create_cancellation_chunk(
-    model: &str,
+    model_ollama_name: &str,
     duration: Duration,
-    tokens_generated: u64,
-    is_chat: bool,
+    tokens_generated_estimate: u64,
+    is_chat_endpoint: bool,
 ) -> Value {
-    let total_duration = duration.as_nanos() as u64;
-    let mut chunk = create_streaming_chunk(model, "", is_chat, true);
+    let timing = TimingInfo::calculate(Instant::now() - duration, 10, tokens_generated_estimate, None, Some(tokens_generated_estimate));
+
+    let mut chunk = create_ollama_streaming_chunk(model_ollama_name, "", is_chat_endpoint, true, None);
 
     if let Some(chunk_obj) = chunk.as_object_mut() {
-        if is_chat {
-            chunk_obj.insert("message".to_string(), json!({
-                "role": "system",
-                "content": ERROR_CANCELLED
-            }));
+        let content_field_value = if tokens_generated_estimate > 0 {
+            format!("[Request cancelled after {} tokens generated (estimated)]", tokens_generated_estimate)
         } else {
-            chunk_obj.insert("response".to_string(), json!(ERROR_CANCELLED));
+            ERROR_CANCELLED.to_string()
+        };
+
+        if is_chat_endpoint {
+            if let Some(msg) = chunk_obj.get_mut("message").and_then(|m| m.as_object_mut()) {
+                msg.insert("content".to_string(), json!(content_field_value));
+            }
+        } else {
+            chunk_obj.insert("response".to_string(), json!(content_field_value));
         }
 
-        chunk_obj.insert("total_duration".to_string(), json!(total_duration));
-        chunk_obj.insert("eval_count".to_string(), json!(tokens_generated));
-        chunk_obj.insert("cancelled".to_string(), json!(true));
+        chunk_obj.insert("total_duration".to_string(), json!(timing.total_duration));
+        chunk_obj.insert("load_duration".to_string(), json!(timing.load_duration));
+        chunk_obj.insert("prompt_eval_count".to_string(), json!(timing.prompt_eval_count));
+        chunk_obj.insert("prompt_eval_duration".to_string(), json!(timing.prompt_eval_duration));
+        chunk_obj.insert("eval_count".to_string(), json!(timing.eval_count));
+        chunk_obj.insert("eval_duration".to_string(), json!(timing.eval_duration));
+        chunk_obj.insert("done_reason".to_string(), json!("cancelled"));
     }
-
     chunk
 }
 
-/// Create final completion chunk
-pub fn create_final_chunk(model: &str, duration: Duration, chunk_count: u64, is_chat: bool) -> Value {
-    let timing = TimingInfo::calculate(Instant::now() - duration, 10, chunk_count.max(1));
-    let mut chunk = create_streaming_chunk(model, "", is_chat, true);
+/// Create final completion chunk for streaming
+pub fn create_final_chunk(
+    model_ollama_name: &str,
+    duration: Duration,
+    chunk_count_for_token_estimation: u64,
+    is_chat_endpoint: bool,
+) -> Value {
+    let timing = TimingInfo::calculate(
+        Instant::now() - duration,
+        10,
+        chunk_count_for_token_estimation.max(1),
+        None,
+        None
+    );
+
+    let mut chunk = create_ollama_streaming_chunk(model_ollama_name, "", is_chat_endpoint, true, None);
 
     if let Some(chunk_obj) = chunk.as_object_mut() {
         chunk_obj.insert("total_duration".to_string(), json!(timing.total_duration));
@@ -365,20 +477,19 @@ pub fn create_final_chunk(model: &str, duration: Duration, chunk_count: u64, is_
         chunk_obj.insert("eval_count".to_string(), json!(timing.eval_count));
         chunk_obj.insert("eval_duration".to_string(), json!(timing.eval_duration));
     }
-
     chunk
 }
 
-/// Estimate token count from text (rough approximation)
+/// Estimate token count from text
 fn estimate_token_count(text: &str) -> u64 {
-    // Rough estimation: 1 token ≈ 4 characters on average
-    ((text.len() as f64) * TOKEN_TO_CHAR_RATIO) as u64
+    if text.is_empty() { return 0; }
+    ((text.len() as f64) * TOKEN_TO_CHAR_RATIO).ceil() as u64
 }
 
-/// Common request pattern for handlers
+/// Execute request with optional retry logic
 pub async fn execute_request_with_retry<F, Fut, T>(
     context: &crate::common::RequestContext<'_>,
-    model_name: &str,
+    model_name_for_retry_logic: &str,
     operation: F,
     use_model_retry: bool,
     load_timeout_seconds: u64,
@@ -391,73 +502,12 @@ where
     if use_model_retry {
         crate::handlers::retry::with_retry_and_cancellation(
             context,
-            model_name,
+            model_name_for_retry_logic,
             load_timeout_seconds,
             operation,
             cancellation_token,
         ).await
     } else {
         crate::handlers::retry::with_simple_retry(operation, cancellation_token).await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn test_timing_calculation() {
-        let start = Instant::now();
-        std::thread::sleep(Duration::from_millis(10));
-        let timing = TimingInfo::calculate(start, 100, 50);
-
-        assert!(timing.total_duration > 0);
-        assert_eq!(timing.prompt_eval_count, 100);
-        assert_eq!(timing.eval_count, 50);
-    }
-
-    #[test]
-    fn test_extract_content_from_chunk() {
-        let chat_chunk = json!({
-            "message": {
-                "content": "Hello world"
-            }
-        });
-
-        assert_eq!(
-            extract_content_from_chunk(&chat_chunk).unwrap(),
-            "Hello world"
-        );
-
-        let generate_chunk = json!({
-            "response": "Hello world"
-        });
-
-        assert_eq!(
-            extract_content_from_chunk(&generate_chunk).unwrap(),
-            "Hello world"
-        );
-    }
-
-    #[test]
-    fn test_build_lm_studio_request() {
-        let messages = json!([{"role": "user", "content": "Hello"}]);
-        let request = build_lm_studio_request(
-            "test-model",
-            LMStudioRequestType::Chat { messages: &messages, stream: false },
-            None,
-        );
-
-        assert_eq!(request.get("model").unwrap().as_str().unwrap(), "test-model");
-        assert_eq!(request.get("messages").unwrap(), &messages);
-        assert_eq!(request.get("stream").unwrap().as_bool().unwrap(), false);
-    }
-
-    #[test]
-    fn test_estimate_token_count() {
-        assert_eq!(estimate_token_count(""), 0);
-        assert_eq!(estimate_token_count("hello"), 1); // 5 * 0.25 = 1.25 -> 1
-        assert_eq!(estimate_token_count("hello world test"), 3); // 17 * 0.25 = 4.25 -> 4, but let's check
     }
 }

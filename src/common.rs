@@ -1,4 +1,4 @@
-// src/common.rs - Enhanced infrastructure with runtime configuration support
+/// src/common.rs - Enhanced infrastructure with runtime configuration support
 
 use serde_json::Value;
 use std::time::Duration;
@@ -24,6 +24,7 @@ pub struct CancellableRequest<'a> {
 }
 
 impl<'a> CancellableRequest<'a> {
+    /// Create new cancellable request handler
     pub fn new(context: RequestContext<'a>, token: CancellationToken) -> Self {
         Self { context, token }
     }
@@ -39,15 +40,15 @@ impl<'a> CancellableRequest<'a> {
 
         let mut request_builder = self.context.client.request(method, url);
 
-        if let Some(body) = body {
+        if let Some(body_content) = body {
             request_builder = request_builder
                 .header("Content-Type", CONTENT_TYPE_JSON)
-                .json(&body);
+                .json(&body_content);
         }
 
         request_builder = request_builder.timeout(Duration::from_secs(self.context.timeout_seconds));
 
-        // Race between request and cancellation with proper error handling
+        // Race request against cancellation
         tokio::select! {
             result = request_builder.send() => {
                 match result {
@@ -62,6 +63,7 @@ impl<'a> CancellableRequest<'a> {
                         } else {
                             "Request failed"
                         };
+                        self.context.logger.log_error("CancellableRequest send", &format!("{}: {:?}", error_msg, err));
                         Err(ProxyError::internal_server_error(error_msg))
                     }
                 }
@@ -93,94 +95,15 @@ pub async fn handle_json_response(
     }
 }
 
-/// Enhanced request size validation using runtime configuration
-pub fn validate_request_size(body: &Value) -> Result<(), ProxyError> {
-    let config = get_runtime_config();
-
-    // Fast size estimation without full serialization
-    let estimated_size = estimate_json_size_optimized(body);
-
-    if estimated_size > config.max_request_size_bytes {
-        return Err(ProxyError::bad_request(&format!(
-            "{} (size: {} bytes, max: {} bytes)",
-            ERROR_REQUEST_TOO_LARGE,
-            estimated_size,
-            config.max_request_size_bytes
-        )));
-    }
-
-    Ok(())
-}
-
-/// Optimized JSON size estimation with better accuracy
-fn estimate_json_size_optimized(value: &Value) -> usize {
-    match value {
-        Value::Null => 4, // "null"
-        Value::Bool(true) => 4, // "true"
-        Value::Bool(false) => 5, // "false"
-        Value::Number(n) => {
-            // More accurate number size estimation
-            if n.is_i64() {
-                n.as_i64().unwrap().to_string().len()
-            } else if n.is_u64() {
-                n.as_u64().unwrap().to_string().len()
-            } else {
-                n.as_f64().unwrap().to_string().len()
-            }
-        },
-        Value::String(s) => {
-            // Account for escaped characters and quotes
-            s.len() + 2 + count_escape_chars(s)
-        },
-        Value::Array(arr) => {
-            // More accurate array size calculation
-            if arr.is_empty() {
-                2 // "[]"
-            } else {
-                2 + arr.iter().map(estimate_json_size_optimized).sum::<usize>() + (arr.len() - 1) // [] + commas
-            }
-        },
-        Value::Object(obj) => {
-            // More accurate object size calculation
-            if obj.is_empty() {
-                2 // "{}"
-            } else {
-                2 + obj.iter().map(|(k, v)| {
-                    k.len() + 3 + count_escape_chars(k) + estimate_json_size_optimized(v) // key + ": + quotes
-                }).sum::<usize>() + (obj.len() - 1) // {} + commas
-            }
-        }
-    }
-}
-
-/// Count characters that need escaping in JSON strings
-fn count_escape_chars(s: &str) -> usize {
-    s.chars().filter(|&c| {
-        matches!(c, '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0C}')
-    }).count()
-}
-
-/// Enhanced model name extraction with validation
+/// Enhanced model name extraction
 pub fn extract_model_name<'a>(body: &'a Value, field_name: &str) -> Result<&'a str, ProxyError> {
-    let model = body.get(field_name)
+    body.get(field_name)
         .and_then(|m| m.as_str())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| match field_name {
             "model" => ProxyError::bad_request(ERROR_MISSING_MODEL),
             _ => ProxyError::bad_request("Missing required field"),
-        })?;
-
-    // Enhanced validation
-    if model.len() > 200 {
-        return Err(ProxyError::bad_request("Model name too long (max: 200 characters)"));
-    }
-
-    // Check for potentially problematic characters
-    if model.chars().any(|c| c.is_control() && c != '\t' && c != '\n' && c != '\r') {
-        return Err(ProxyError::bad_request("Model name contains invalid characters"));
-    }
-
-    Ok(model)
+        })
 }
 
 /// Enhanced request builder with common parameters
@@ -189,6 +112,7 @@ pub struct RequestBuilder {
 }
 
 impl RequestBuilder {
+    /// Create new request builder
     pub fn new() -> Self {
         Self {
             body: serde_json::Map::new(),
@@ -217,7 +141,7 @@ impl RequestBuilder {
         self
     }
 
-    /// Build the final JSON value
+    /// Build the JSON value
     pub fn build(self) -> Value {
         Value::Object(self.body)
     }
@@ -251,13 +175,16 @@ pub fn map_ollama_to_lmstudio_params(ollama_options: Option<&Value>) -> serde_js
             params.insert("max_tokens".to_string(), max_tokens.clone());
         }
 
-        if let Some(repeat_penalty) = options.get("repeat_penalty") {
-            if !params.contains_key("frequency_penalty") {
-                params.insert("frequency_penalty".to_string(), repeat_penalty.clone());
+        if let Some(repeat_penalty_val) = options.get("repeat_penalty") {
+            // Map to frequency_penalty
+            if !params.contains_key("frequency_penalty") && !params.contains_key("presence_penalty") {
+                params.insert("repeat_penalty".to_string(), repeat_penalty_val.clone());
+            } else if !params.contains_key("frequency_penalty") {
+                params.insert("frequency_penalty".to_string(), repeat_penalty_val.clone());
             }
         }
 
-        // Handle system message if present
+        // Handle system message
         if let Some(system) = options.get("system") {
             params.insert("system".to_string(), system.clone());
         }

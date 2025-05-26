@@ -1,18 +1,18 @@
-// src/server.rs - High-performance server with concurrent request support
+/// src/server.rs - High-performance server with concurrent request support
 
 use clap::Parser;
 use serde_json::Value;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use warp::log::Info as LogInfo;
 use warp::{Filter, Rejection, Reply};
 
-use crate::common::{validate_request_size, RequestContext};
+use crate::common::RequestContext;
 use crate::constants::*;
 use crate::handlers;
+use crate::handlers::json_response;
 use crate::metrics::{get_global_metrics, init_global_metrics};
 use crate::utils::{validate_config, Logger, ProxyError};
 
@@ -29,26 +29,28 @@ pub struct Config {
     #[arg(long, help = "Disable logging output")]
     pub no_log: bool,
 
-    #[arg(long, default_value = "5", help = "Model loading wait timeout in seconds")]
+    #[arg(
+        long,
+        default_value = "15",
+        help = "Model loading wait timeout in seconds (after trigger)"
+    )]
     pub load_timeout_seconds: u64,
 
     #[arg(long, default_value = "120", help = "HTTP request timeout in seconds")]
     pub request_timeout_seconds: u64,
 
-    #[arg(long, default_value = "30", help = "Streaming timeout in seconds")]
+    #[arg(long, default_value = "60", help = "Streaming timeout in seconds (per chunk)")]
     pub stream_timeout_seconds: u64,
 
-    #[arg(long, help = "Enable metrics collection")]
+    #[arg(long, default_value = "true", help = "Enable metrics collection")]
     pub enable_metrics: bool,
 
-    #[arg(long, default_value = "262144", help = "Maximum buffer size in bytes")]
+    #[arg(
+        long,
+        default_value = "262144",
+        help = "Maximum buffer size in bytes for SSE message assembly (capacity hint)"
+    )]
     pub max_buffer_size: usize,
-
-    #[arg(long, default_value = "50000", help = "Maximum chunks per stream")]
-    pub max_chunk_count: u64,
-
-    #[arg(long, default_value = "524288000", help = "Maximum request size in bytes")]
-    pub max_request_size: usize,
 
     #[arg(long, help = "Enable partial chunk recovery for streams")]
     pub enable_chunk_recovery: bool,
@@ -58,265 +60,256 @@ pub struct Config {
 #[derive(Clone)]
 pub struct ProxyServer {
     pub client: reqwest::Client,
-    pub config: Config,
+    pub config: Arc<Config>,
     pub logger: Logger,
 }
 
+/// Wrapper for ollama show handler
+async fn handle_ollama_show_rejection_wrapper(body: Value) -> Result<impl Reply, Rejection> {
+    handlers::ollama::handle_ollama_show(body).await.map_err(warp::reject::custom)
+}
+
+/// Wrapper for ollama version handler
+async fn handle_ollama_version_rejection_wrapper() -> Result<impl Reply, Rejection> {
+    handlers::ollama::handle_ollama_version().await.map_err(warp::reject::custom)
+}
+
 impl ProxyServer {
+    /// Create new proxy server instance
     pub fn new(config: Config) -> Result<Self, Box<dyn std::error::Error>> {
         validate_config(&config)?;
 
-        // Initialize runtime configuration
         let runtime_config = RuntimeConfig {
             max_buffer_size: config.max_buffer_size,
-            max_chunk_count: config.max_chunk_count,
             max_partial_content_size: config.max_buffer_size / 4,
-            max_request_size_bytes: config.max_request_size,
             string_buffer_size: 2048,
             enable_metrics: config.enable_metrics,
             enable_chunk_recovery: config.enable_chunk_recovery,
         };
         init_runtime_config(runtime_config);
-
-        // Initialize global metrics
         init_global_metrics(config.enable_metrics);
 
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(config.request_timeout_seconds + 5))
+            .timeout(std::time::Duration::from_secs(config.request_timeout_seconds + 10))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .pool_max_idle_per_host(10)
             .build()?;
 
         let logger = Logger::new(!config.no_log);
 
         Ok(Self {
             client,
-            config,
+            config: Arc::new(config),
             logger,
         })
     }
 
+    /// Run the proxy server
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
         self.print_startup_banner();
 
         let addr: SocketAddr = self.config.listen.parse()
             .map_err(|e| format!("Invalid listen address '{}': {}", self.config.listen, e))?;
 
-        // Create shared server reference for concurrent access
-        let server = Arc::new(self);
+        let server_arc = Arc::new(self);
+        let server_arc_routes = server_arc.clone();
 
-        // Enhanced logging with metrics
-        let log = warp::log::custom({
-            let logger = server.logger.clone();
+        let log_filter = warp::log::custom({
+            let logger = server_arc.logger.clone();
             move |info: LogInfo| {
                 if logger.enabled {
                     let status_icon = match info.status().as_u16() {
-                        200..=299 => "✅",
-                        400..=499 => "⚠️",
-                        500..=599 => "❌",
-                        _ => "🔄",
+                        200..=299 => LOG_PREFIX_SUCCESS,
+                        400..=499 => LOG_PREFIX_WARNING,
+                        500..=599 => LOG_PREFIX_ERROR,
+                        _ => "❔",
                     };
-                    println!("[{}] {} {} {} | {} | {}",
-                             chrono::Local::now().format("%H:%M:%S"),
-                             status_icon, info.method(), info.path(), info.status(),
-                             crate::utils::format_duration(info.elapsed()));
+                    crate::utils::STRING_BUFFER.with(|buf_cell| {
+                        let mut buffer = buf_cell.borrow_mut();
+                        buffer.clear();
+                        use std::fmt::Write;
+                        let _ = write!(buffer, "{} {} {} | {} | {}",
+                                       status_icon, info.method(), info.path(), info.status(),
+                                       crate::utils::format_duration(info.elapsed()));
+                        println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), buffer);
+                    });
                 }
             }
         });
 
-        // Concurrent request handling with proper body size validation
-        let routes = warp::method()
-            .and(warp::path::full())
-            .and(warp::body::json().or(warp::any().map(|| Value::Null)).unify())
-            .and_then(move |method: warp::http::Method, path: warp::path::FullPath, body: Value| {
-                let server = server.clone();
-                async move {
-                    handle_concurrent_request(server, method.to_string(), path.as_str().to_string(), body).await
-                }
-            })
-            .recover(handle_rejection)
-            .with(log.clone())
-            .boxed();
+        let with_server_state = warp::any().map(move || server_arc_routes.clone());
 
-        // Add metrics endpoint if enabled
+        let ollama_tags_route = warp::path!("api" / "tags")
+            .and(warp::get())
+            .and(with_server_state.clone())
+            .and_then(|s: Arc<ProxyServer>| async move {
+                let context = RequestContext {
+                    client: &s.client,
+                    logger: &s.logger,
+                    lmstudio_url: &s.config.lmstudio_url,
+                    timeout_seconds: s.config.request_timeout_seconds,
+                };
+                let token = CancellationToken::new();
+                handlers::ollama::handle_ollama_tags(context, token).await.map_err(warp::reject::custom)
+            });
+
+        let ollama_chat_route = warp::path!("api" / "chat")
+            .and(warp::post())
+            .and(warp::body::json())
+            .and(with_server_state.clone())
+            .and_then(|body: Value, s: Arc<ProxyServer>| async move {
+                let context = RequestContext {
+                    client: &s.client,
+                    logger: &s.logger,
+                    lmstudio_url: &s.config.lmstudio_url,
+                    timeout_seconds: s.config.request_timeout_seconds,
+                };
+                let token = CancellationToken::new();
+                let config_ref = s.config.as_ref();
+                handlers::ollama::handle_ollama_chat(context, body, token, config_ref).await.map_err(warp::reject::custom)
+            });
+
+        let ollama_generate_route = warp::path!("api" / "generate")
+            .and(warp::post())
+            .and(warp::body::json())
+            .and(with_server_state.clone())
+            .and_then(|body: Value, s: Arc<ProxyServer>| async move {
+                let context = RequestContext {
+                    client: &s.client,
+                    logger: &s.logger,
+                    lmstudio_url: &s.config.lmstudio_url,
+                    timeout_seconds: s.config.request_timeout_seconds,
+                };
+                let token = CancellationToken::new();
+                let config_ref = s.config.as_ref();
+                handlers::ollama::handle_ollama_generate(context, body, token, config_ref).await.map_err(warp::reject::custom)
+            });
+
+        let ollama_embeddings_route = warp::path!("api" / "embeddings")
+            .or(warp::path!("api" / "embed"))
+            .unify()
+            .and(warp::post())
+            .and(warp::body::json())
+            .and(with_server_state.clone())
+            .and_then(|body: Value, s: Arc<ProxyServer>| async move {
+                let context = RequestContext {
+                    client: &s.client,
+                    logger: &s.logger,
+                    lmstudio_url: &s.config.lmstudio_url,
+                    timeout_seconds: s.config.request_timeout_seconds,
+                };
+                let token = CancellationToken::new();
+                handlers::ollama::handle_ollama_embeddings(context, body, token).await.map_err(warp::reject::custom)
+            });
+
+        let ollama_show_route = warp::path!("api" / "show")
+            .and(warp::post())
+            .and(warp::body::json())
+            .and_then(handle_ollama_show_rejection_wrapper);
+
+        let ollama_ps_route = warp::path!("api" / "ps")
+            .and(warp::get())
+            .and(with_server_state.clone())
+            .and_then(|s: Arc<ProxyServer>| async move {
+                let context = RequestContext {
+                    client: &s.client,
+                    logger: &s.logger,
+                    lmstudio_url: &s.config.lmstudio_url,
+                    timeout_seconds: s.config.request_timeout_seconds,
+                };
+                let token = CancellationToken::new();
+                handlers::ollama::handle_ollama_ps(context, token).await.map_err(warp::reject::custom)
+            });
+
+        let ollama_version_route = warp::path!("api" / "version")
+            .and(warp::get())
+            .and_then(handle_ollama_version_rejection_wrapper);
+
+        let lmstudio_passthrough_route = warp::path("v1")
+            .and(warp::path::tail())
+            .and(warp::method())
+            .and(warp::body::json().or(warp::any().map(|| Value::Null)).unify())
+            .and(with_server_state.clone())
+            .and_then(|tail: warp::path::Tail, method: warp::http::Method, body: Value, s: Arc<ProxyServer>| async move {
+                let context = RequestContext {
+                    client: &s.client,
+                    logger: &s.logger,
+                    lmstudio_url: &s.config.lmstudio_url,
+                    timeout_seconds: s.config.request_timeout_seconds,
+                };
+                let token = CancellationToken::new();
+                let full_path = format!("/v1/{}", tail.as_str());
+                handlers::lmstudio::handle_lmstudio_passthrough(context, method.as_str(), &full_path, body, token).await.map_err(warp::reject::custom)
+            });
+
+        let health_route = warp::path("health")
+            .and(warp::get())
+            .and(with_server_state.clone())
+            .and_then(|s: Arc<ProxyServer>| async move {
+                let context = RequestContext {
+                    client: &s.client,
+                    logger: &s.logger,
+                    lmstudio_url: &s.config.lmstudio_url,
+                    timeout_seconds: s.config.request_timeout_seconds,
+                };
+                let token = CancellationToken::new();
+                match handlers::ollama::handle_health_check(context, token).await {
+                    Ok(status_json) => Ok(json_response(&status_json)),
+                    Err(e) => Err(warp::reject::custom(e)),
+                }
+            });
+
         let metrics_route = warp::path("metrics")
             .and(warp::get())
-            .and_then(handle_metrics_endpoint)
+            .and_then(handle_metrics_endpoint);
+
+        let unsupported_ollama_route = warp::path("api")
+            .and(warp::path::full())
+            .and_then(|path: warp::path::FullPath| async move {
+                handlers::ollama::handle_unsupported(path.as_str()).await.map_err(warp::reject::custom)
+            });
+
+        let app_routes = ollama_tags_route.boxed()
+            .or(ollama_chat_route.boxed())
+            .or(ollama_generate_route.boxed())
+            .or(ollama_embeddings_route.boxed())
+            .or(ollama_show_route.boxed())
+            .or(ollama_ps_route.boxed())
+            .or(ollama_version_route.boxed())
+            .or(lmstudio_passthrough_route.boxed())
+            .or(health_route.boxed())
+            .or(metrics_route.boxed())
+            .or(unsupported_ollama_route.boxed());
+
+        let final_routes = app_routes
             .recover(handle_rejection)
-            .with(log)
-            .boxed();
+            .with(log_filter);
 
-        let combined_routes = routes.or(metrics_route).boxed();
-
-        warp::serve(combined_routes).run(addr).await;
+        server_arc.logger.log("Starting server...");
+        warp::serve(final_routes).run(addr).await;
         Ok(())
     }
 
+    /// Print startup banner with configuration info
     fn print_startup_banner(&self) {
         if self.logger.enabled {
             println!();
-            println!("Ollama ↔ LM Studio Proxy");
             println!("------------------------------------------------------");
-            println!("Version: {}", crate::VERSION);
-            println!("Listen Address: {}", self.config.listen);
-            println!("LM Studio URL: {}", self.config.lmstudio_url);
-            println!("Logging: {}", if self.logger.enabled { "Enabled" } else { "Disabled" });
-            println!("Metrics: {}", if self.config.enable_metrics { "Enabled" } else { "Disabled" });
-            println!("Load Timeout: {}s", self.config.load_timeout_seconds);
-            println!("Request Timeout: {}s", self.config.request_timeout_seconds);
-            println!("Stream Timeout: {}s", self.config.stream_timeout_seconds);
-            println!("Max Buffer Size: {} bytes", self.config.max_buffer_size);
-            println!("Max Request Size: {} bytes", self.config.max_request_size);
-            println!("Chunk Recovery: {}", if self.config.enable_chunk_recovery { "Enabled" } else { "Disabled" });
+            println!("Ollama <-> LM Studio Proxy - Version: {}", crate::VERSION);
+            println!("------------------------------------------------------");
+            println!(" Listening on: {}", self.config.listen);
+            println!(" LM Studio URL: {}", self.config.lmstudio_url);
+            println!(" Logging: {}", if self.logger.enabled { "Enabled" } else { "Disabled" });
+            println!(" Metrics: {}", if self.config.enable_metrics { "Enabled (/metrics)" } else { "Disabled" });
+            println!(" Model Load Timeout: {}s", self.config.load_timeout_seconds);
+            println!(" Request Timeout: {}s", self.config.request_timeout_seconds);
+            println!(" Stream Timeout: {}s", self.config.stream_timeout_seconds);
+            println!(" Max SSE Buffer (capacity hint): {} bytes", self.config.max_buffer_size);
+            println!(" Chunk Recovery: {}", if get_runtime_config().enable_chunk_recovery { "Enabled" } else { "Disabled" });
+            println!("------------------------------------------------------");
+            println!(" INFO: Proxy request validation deferred to LM Studio backend.");
+            println!("------------------------------------------------------");
             println!();
-        }
-    }
-}
-
-/// Thread-safe connection tracker with proper synchronization
-struct ConnectionTracker {
-    token: CancellationToken,
-    completed: Arc<AtomicBool>,
-}
-
-impl ConnectionTracker {
-    fn new(token: CancellationToken) -> Self {
-        Self {
-            token,
-            completed: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    /// Mark request as completed successfully
-    fn mark_completed(&self) {
-        self.completed.store(true, Ordering::Release);
-    }
-}
-
-impl Drop for ConnectionTracker {
-    fn drop(&mut self) {
-        // Use atomic compare-and-swap to prevent race conditions
-        if self.completed.compare_exchange(
-            false,
-            true,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ).is_ok() {
-            // Only cancel if we successfully marked as completed
-            self.token.cancel();
-        }
-    }
-}
-
-/// Concurrent request handler with metrics integration
-async fn handle_concurrent_request(
-    server: Arc<ProxyServer>,
-    method: String,
-    path: String,
-    body: Value,
-) -> Result<warp::reply::Response, Rejection> {
-    let endpoint_key = format!("{} {}", method, path);
-
-    // Start metrics tracking if enabled
-    let timer = if let Some(metrics) = get_global_metrics() {
-        metrics.record_request_start(&endpoint_key)
-    } else {
-        None
-    };
-
-    // Validate request body size early
-    if !body.is_null() {
-        if let Err(e) = validate_request_size(&body) {
-            if let Some(timer) = timer {
-                timer.complete_failure().await;
-            }
-            return Err(warp::reject::custom(e));
-        }
-    }
-
-    let cancellation_token = CancellationToken::new();
-    let connection_tracker = ConnectionTracker::new(cancellation_token.clone());
-
-    // Create request context for concurrent access
-    let context = RequestContext {
-        client: &server.client,
-        logger: &server.logger,
-        lmstudio_url: &server.config.lmstudio_url,
-        timeout_seconds: server.config.request_timeout_seconds,
-    };
-
-    let result = match (method.as_str(), path.as_str()) {
-        // Ollama API endpoints
-        ("GET", "/api/tags") => {
-            handlers::handle_ollama_tags(context, cancellation_token).await
-        }
-        ("POST", "/api/chat") => {
-            handlers::handle_ollama_chat(context, body.clone(), cancellation_token, &server.config).await
-        }
-        ("POST", "/api/generate") => {
-            handlers::handle_ollama_generate(context, body.clone(), cancellation_token, &server.config).await
-        }
-        ("POST", "/api/embed") | ("POST", "/api/embeddings") => {
-            handlers::handle_ollama_embeddings(context, body.clone(), cancellation_token).await
-        }
-        ("POST", "/api/show") => handlers::handle_ollama_show(body).await,
-        ("GET", "/api/ps") => handlers::handle_ollama_ps().await,
-        ("GET", "/api/version") => handlers::handle_ollama_version().await,
-
-        // Unsupported Ollama endpoints
-        ("POST", "/api/create") | ("POST", "/api/pull") | ("POST", "/api/push") |
-        ("DELETE", "/api/delete") | ("POST", "/api/copy") =>
-            handlers::handle_unsupported(&path).await,
-
-        // LM Studio API passthrough
-        ("GET", "/v1/models") | ("POST", "/v1/chat/completions") |
-        ("POST", "/v1/completions") | ("POST", "/v1/embeddings") => {
-            match handlers::validate_lmstudio_endpoint(&path) {
-                Ok(_) => handlers::handle_lmstudio_passthrough(context, &method, &path, body.clone(), cancellation_token).await,
-                Err(e) => Err(e),
-            }
-        }
-
-        // Health check
-        ("GET", "/health") => {
-            match handlers::get_lmstudio_status(context, cancellation_token).await {
-                Ok(status) => Ok(warp::reply::json(&status).into_response()),
-                Err(e) => Err(e),
-            }
-        }
-
-        // Unknown endpoints
-        _ => Err(ProxyError::not_found(&format!("Unknown endpoint: {} {}", method, path))),
-    };
-
-    // Handle result with proper completion tracking
-    match result {
-        Ok(response) => {
-            connection_tracker.mark_completed();
-            if let Some(timer) = timer {
-                timer.complete_success().await;
-            }
-            Ok(response)
-        }
-        Err(e) if e.is_cancelled() => {
-            if let Some(timer) = timer {
-                timer.complete_cancelled();
-            }
-            let error_response = serde_json::json!({
-                "error": {
-                    "type": "request_cancelled",
-                    "message": ERROR_CANCELLED
-                }
-            });
-            Ok(warp::reply::with_status(
-                warp::reply::json(&error_response),
-                warp::http::StatusCode::REQUEST_TIMEOUT,
-            ).into_response())
-        }
-        Err(e) => {
-            connection_tracker.mark_completed();
-            if let Some(timer) = timer {
-                timer.complete_failure().await;
-            }
-            Err(warp::reject::custom(e))
         }
     }
 }
@@ -324,44 +317,73 @@ async fn handle_concurrent_request(
 /// Handle metrics endpoint
 async fn handle_metrics_endpoint() -> Result<impl Reply, Rejection> {
     match get_global_metrics() {
-        Some(metrics) => {
-            let metrics_data = metrics.get_metrics().await;
-            Ok(warp::reply::json(&metrics_data))
+        Some(metrics_collector) => {
+            let metrics_data = metrics_collector.get_metrics().await;
+            Ok(json_response(&metrics_data))
         }
         None => {
             let disabled_response = serde_json::json!({
-                "error": "Metrics collection is disabled"
+                "error": "Metrics collection is disabled in server configuration."
             });
-            Ok(warp::reply::json(&disabled_response))
+            Ok(json_response(&disabled_response))
         }
     }
 }
 
-/// Enhanced error handling with proper status codes
+/// Enhanced error handling with proper status codes and JSON response
 async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
-    let (code, message) = if err.is_not_found() {
-        (404, "Not Found".to_string())
-    } else if let Some(proxy_error) = err.find::<ProxyError>() {
-        (proxy_error.status_code, proxy_error.message.clone())
-    } else if err.find::<warp::reject::MethodNotAllowed>().is_some() {
-        (405, "Method Not Allowed".to_string())
-    } else if err.find::<warp::reject::PayloadTooLarge>().is_some() {
-        let max_size_mb = get_runtime_config().max_request_size_bytes / (1024 * 1024);
-        (413, format!("Payload Too Large (max: {}MB)", max_size_mb))
-    } else {
-        (500, "Internal Server Error".to_string())
-    };
+    let code;
+    let message;
+    let error_type;
 
-    let json = warp::reply::json(&serde_json::json!({
+    if err.is_not_found() {
+        code = warp::http::StatusCode::NOT_FOUND;
+        message = "Endpoint not found".to_string();
+        error_type = "not_found_error".to_string();
+    } else if let Some(proxy_error) = err.find::<ProxyError>() {
+        code = warp::http::StatusCode::from_u16(proxy_error.status_code)
+            .unwrap_or(warp::http::StatusCode::INTERNAL_SERVER_ERROR);
+        message = proxy_error.message.clone();
+        error_type = match proxy_error.status_code {
+            400 => "bad_request_error".to_string(),
+            401 => "authentication_error".to_string(),
+            403 => "permission_error".to_string(),
+            404 => "not_found_error".to_string(),
+            413 => "payload_too_large_error".to_string(),
+            429 => "rate_limit_error".to_string(),
+            499 => "client_closed_request".to_string(),
+            500 => "internal_server_error".to_string(),
+            501 => "not_implemented_error".to_string(),
+            503 => "service_unavailable_error".to_string(),
+            _ => "api_error".to_string(),
+        };
+    } else if err.find::<warp::reject::MethodNotAllowed>().is_some() {
+        code = warp::http::StatusCode::METHOD_NOT_ALLOWED;
+        message = "Method Not Allowed".to_string();
+        error_type = "method_not_allowed_error".to_string();
+    } else if err.find::<warp::reject::PayloadTooLarge>().is_some() {
+        code = warp::http::StatusCode::PAYLOAD_TOO_LARGE;
+        message = "Payload Too Large (check backend or underlying HTTP server limits)".to_string();
+        error_type = "payload_too_large_error".to_string();
+    } else if err.find::<warp::reject::UnsupportedMediaType>().is_some() {
+        code = warp::http::StatusCode::UNSUPPORTED_MEDIA_TYPE;
+        message = "Unsupported Media Type. Expected application/json.".to_string();
+        error_type = "unsupported_media_type_error".to_string();
+    } else {
+        eprintln!("[ERROR] Unhandled rejection: {:?}", err);
+        code = warp::http::StatusCode::INTERNAL_SERVER_ERROR;
+        message = "An unexpected internal error occurred.".to_string();
+        error_type = "internal_server_error".to_string();
+    }
+
+    let json_error = serde_json::json!({
         "error": {
-            "type": "api_error",
             "message": message,
+            "type": error_type,
+            "code": code.as_u16(),
             "timestamp": chrono::Utc::now().to_rfc3339()
         }
-    }));
+    });
 
-    Ok(warp::reply::with_status(
-        json,
-        warp::http::StatusCode::from_u16(code).unwrap_or(warp::http::StatusCode::INTERNAL_SERVER_ERROR),
-    ))
+    Ok(warp::reply::with_status(warp::reply::json(&json_error), code))
 }

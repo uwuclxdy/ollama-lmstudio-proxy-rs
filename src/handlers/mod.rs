@@ -1,4 +1,4 @@
-// src/handlers/mod.rs - Optimized module organization for single-client use
+/// src/handlers/mod.rs - Module exports for API endpoint handlers and utilities
 
 pub mod retry;
 pub mod streaming;
@@ -6,7 +6,6 @@ pub mod helpers;
 pub mod ollama;
 pub mod lmstudio;
 
-// Ollama API handlers (updated signatures)
 pub use ollama::{
     handle_ollama_tags,
     handle_ollama_chat,
@@ -16,30 +15,27 @@ pub use ollama::{
     handle_ollama_show,
     handle_ollama_version,
     handle_unsupported,
+    handle_health_check,
 };
 
-// LM Studio handlers (updated signatures)
 pub use lmstudio::{
     handle_lmstudio_passthrough,
-    validate_lmstudio_endpoint,
     get_lmstudio_status,
 };
 
-// Streaming functions (optimized)
 pub use streaming::{
     handle_streaming_response,
     handle_passthrough_streaming_response,
     is_streaming_request,
 };
 
-// Retry functions (simplified)
 pub use retry::{
     trigger_model_loading,
     with_retry_and_cancellation,
     with_simple_retry,
+    trigger_model_loading_for_ollama,
 };
 
-// Helper functions and utilities (optimized)
 pub use helpers::{
     json_response,
     ResponseTransformer,
@@ -49,4 +45,6 @@ pub use helpers::{
     create_error_chunk,
     create_cancellation_chunk,
     create_final_chunk,
+    execute_request_with_retry,
+    LMStudioRequestType,
 };

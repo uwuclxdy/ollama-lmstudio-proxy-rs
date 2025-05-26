@@ -1,4 +1,4 @@
-// src/metrics.rs - Comprehensive metrics collection system
+/// src/metrics.rs - Comprehensive metrics collection system
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -249,7 +249,7 @@ impl MetricsCollector {
 
         self.total_latency_ns.fetch_add(duration_ns, Ordering::Relaxed);
 
-        // Update min latency
+        // Update min latency atomically
         let mut current_min = self.min_latency_ns.load(Ordering::Relaxed);
         while duration_ns < current_min {
             match self.min_latency_ns.compare_exchange_weak(
@@ -263,7 +263,7 @@ impl MetricsCollector {
             }
         }
 
-        // Update max latency
+        // Update max latency atomically
         let mut current_max = self.max_latency_ns.load(Ordering::Relaxed);
         while duration_ns > current_max {
             match self.max_latency_ns.compare_exchange_weak(
@@ -321,7 +321,7 @@ impl<'a> RequestTimer<'a> {
         self.metrics.record_request_failure(&self.endpoint, duration).await;
     }
 
-    /// Complete request as cancelled
+    /// Complete request as canceled
     pub fn complete_cancelled(self) {
         self.metrics.record_request_cancelled();
     }

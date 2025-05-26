@@ -1,4 +1,4 @@
-// src/model.rs - Simplified programmatic model handling without hardcoded JSON
+/// src/model.rs - Enhanced programmatic model handling with robust fabrication
 
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
@@ -8,125 +8,182 @@ use crate::constants::*;
 use crate::metrics::get_global_metrics;
 use crate::utils::ProxyError;
 
-/// Simplified model information extracted programmatically
+/// Enhanced model information with more detailed fabrication logic
 #[derive(Debug, Clone)]
 pub struct ModelInfo {
-    pub name: String,
+    pub id_from_lm_studio: String,
+    pub ollama_name: String,
     pub family: String,
-    pub parameter_size: String,
+    pub parameter_size_str: String,
     pub size_bytes: u64,
     pub architecture: String,
     pub quantization_level: String,
 }
 
 impl ModelInfo {
-    /// Create model info programmatically from name
-    pub fn from_name(name: &str) -> Self {
-        let lower = name.to_lowercase();
+    /// Create model info programmatically from an LM Studio model ID
+    pub fn from_lm_studio_id(lm_studio_id: &str) -> Self {
+        let lower_id = lm_studio_id.to_lowercase();
 
-        // Extract family from model name
-        let family = extract_model_family(&lower);
+        let family = extract_model_family(&lower_id);
+        let (parameter_size_str, size_bytes) = extract_model_size(&lower_id);
+        let architecture = extract_architecture(&lower_id, &family);
+        let quantization_level = extract_quantization_level(&lower_id);
 
-        // Extract parameter size
-        let (parameter_size, size_bytes) = extract_model_size(&lower);
-
-        // Determine architecture based on family
-        let architecture = match family.as_str() {
-            "llama" | "deepseek" => "llama",
-            "qwen" => "qwen2",
-            "mistral" => "mistral",
-            "gemma" => "gemma",
-            "phi" => "phi",
-            _ => "transformer",
-        }.to_string();
-
-        // Determine quantization level
-        let quantization_level = extract_quantization_level(&lower);
+        let ollama_name = if lm_studio_id.contains(':') {
+            lm_studio_id.to_string()
+        } else {
+            format!("{}:latest", lm_studio_id)
+        };
 
         Self {
-            name: name.to_string(),
+            id_from_lm_studio: lm_studio_id.to_string(),
+            ollama_name,
             family,
-            parameter_size,
+            parameter_size_str,
             size_bytes,
             architecture,
             quantization_level,
         }
     }
 
-    /// Generate Ollama-compatible model entry programmatically
-    pub fn to_ollama_model(&self) -> Value {
-        // Ensure model name has :latest suffix for Ollama compatibility
-        let ollama_name = if self.name.contains(':') {
-            self.name.clone()
-        } else {
-            format!("{}:latest", self.name)
-        };
-        
+    /// Determine model capabilities based on name and family
+    fn determine_capabilities(&self) -> Vec<String> {
+        let mut caps = Vec::new();
+        let lower_name = self.ollama_name.to_lowercase();
+        let lower_family = self.family.to_lowercase();
+
+        caps.push("completion".to_string());
+
+        if lower_name.contains("instruct") || lower_name.contains("chat") ||
+            lower_family.contains("instruct") || lower_family.contains("chat") {
+            if !caps.contains(&"chat".to_string()) {
+                caps.push("chat".to_string());
+            }
+        }
+
+        if lower_name.contains("llava") || lower_name.contains("vision") || lower_name.contains("bakllava") ||
+            lower_family.contains("llava") || lower_family.contains("vision") || lower_family.contains("bakllava") {
+            if !caps.contains(&"vision".to_string()) {
+                caps.push("vision".to_string());
+            }
+        }
+
+        if lower_family == "embedding" || lower_name.contains("embed") {
+            if !caps.contains(&"embedding".to_string()) {
+                caps.push("embedding".to_string());
+            }
+        }
+
+        // Ensure completion capability for chat models
+        if caps.contains(&"chat".to_string()) && !caps.contains(&"completion".to_string()) {
+            caps.push("completion".to_string());
+        }
+
+        if caps.is_empty() {
+            caps.push("completion".to_string());
+        }
+
+        caps
+    }
+
+    /// Generate Ollama-compatible model entry for /api/tags
+    pub fn to_ollama_tags_model(&self) -> Value {
         json!({
-            "name": ollama_name,
-            "model": ollama_name,
+            "name": self.ollama_name,
+            "model": self.ollama_name,
             "modified_at": chrono::Utc::now().to_rfc3339(),
             "size": self.size_bytes,
-            "digest": format!("{:x}", md5::compute(ollama_name.as_bytes())),
+            "digest": format!("{:x}", md5::compute(self.ollama_name.as_bytes())),
             "details": {
                 "parent_model": "",
-                "format": "gguf", 
+                "format": "gguf",
                 "family": self.family,
-                "families": [self.family],
-                "parameter_size": self.parameter_size,
+                "families": if self.family.is_empty() { json!([]) } else { json!([self.family]) },
+                "parameter_size": self.parameter_size_str,
                 "quantization_level": self.quantization_level
             }
         })
     }
 
-    /// Generate model show response programmatically
-    pub fn to_show_response(&self) -> Value {
-        // Ensure model name has :latest suffix for Ollama compatibility
-        let ollama_name = if self.name.contains(':') {
-            self.name.clone()
-        } else {
-            format!("{}:latest", self.name)
-        };
-        
-        let model_info = self.create_model_info();
-
+    /// Generate Ollama-compatible model entry for /api/ps
+    pub fn to_ollama_ps_model(&self) -> Value {
         json!({
-            "modelfile": format!("# Modelfile for {}\nFROM {}", ollama_name, ollama_name),
-            "parameters": format!("temperature {}\ntop_p {}\ntop_k {}",
-                DEFAULT_TEMPERATURE, DEFAULT_TOP_P, DEFAULT_TOP_K),
-            "template": "{{ if .System }}{{ .System }}\n{{ end }}{{ .Prompt }}",
+            "name": self.ollama_name,
+            "model": self.ollama_name,
+            "size": self.size_bytes,
+            "digest": format!("{:x}", md5::compute(self.ollama_name.as_bytes())),
             "details": {
                 "parent_model": "",
                 "format": "gguf",
                 "family": self.family,
-                "families": [self.family],
-                "parameter_size": self.parameter_size,
+                "families": if self.family.is_empty() { json!([]) } else { json!([self.family]) },
+                "parameter_size": self.parameter_size_str,
                 "quantization_level": self.quantization_level
             },
-            "model_info": model_info,
-            "digest": format!("{:x}", md5::compute(ollama_name.as_bytes())),
+            "expires_at": (chrono::Utc::now() + chrono::Duration::minutes(DEFAULT_KEEP_ALIVE_MINUTES)).to_rfc3339(),
+            "size_vram": self.size_bytes
+        })
+    }
+
+    /// Generate model show response for /api/show
+    pub fn to_show_response(&self) -> Value {
+        let model_info_details = self.create_fabricated_model_info_details();
+        let capabilities = self.determine_capabilities();
+
+        json!({
+            "modelfile": format!("# Modelfile for {}\nFROM {} # (Fabricated by proxy)\n\nPARAMETER temperature {}\nPARAMETER top_p {}\nPARAMETER top_k {}\n\nTEMPLATE \"\"\"{{ if .System }}{{ .System }} {{ end }}{{ .Prompt }}\"\"\"",
+                self.ollama_name, self.ollama_name, DEFAULT_TEMPERATURE, DEFAULT_TOP_P, DEFAULT_TOP_K
+            ),
+            "parameters": format!("temperature {}\ntop_p {}\ntop_k {}\nrepeat_penalty {}",
+                DEFAULT_TEMPERATURE, DEFAULT_TOP_P, DEFAULT_TOP_K, DEFAULT_REPEAT_PENALTY),
+            "template": "{{ if .System }}{{ .System }}\\n{{ end }}{{ .Prompt }}",
+            "details": {
+                "parent_model": "",
+                "format": "gguf",
+                "family": self.family,
+                "families": if self.family.is_empty() { json!([]) } else { json!([self.family]) },
+                "parameter_size": self.parameter_size_str,
+                "quantization_level": self.quantization_level
+            },
+            "model_info": model_info_details,
+            "capabilities": capabilities,
+            "digest": format!("{:x}", md5::compute(self.ollama_name.as_bytes())),
             "size": self.size_bytes,
             "modified_at": chrono::Utc::now().to_rfc3339()
         })
     }
 
-    /// Create architecture-specific model info programmatically
-    fn create_model_info(&self) -> Value {
-        let base_params = self.get_base_architecture_params();
+    /// Create the nested "model_info" object for /api/show with fabricated details
+    fn create_fabricated_model_info_details(&self) -> Value {
         let mut model_info = json!({
             "general.architecture": self.architecture,
             "general.file_type": 2,
-            "general.parameter_count": self.size_bytes / 4,
+            "general.parameter_count": self.size_bytes / estimate_bytes_per_parameter(&self.quantization_level),
             "general.quantization_version": 2,
         });
 
-        // Add architecture-specific parameters
+        let arch_params = self.get_base_architecture_params();
         if let Some(obj) = model_info.as_object_mut() {
-            if let Some(base_obj) = base_params.as_object() {
+            if let Some(base_obj) = arch_params.as_object() {
                 for (key, value) in base_obj {
                     obj.insert(key.clone(), value.clone());
                 }
             }
+        }
+
+        if let Some(obj) = model_info.as_object_mut() {
+            obj.insert("tokenizer.ggml.model".to_string(), json!(self.family.split('-').next().unwrap_or("unknown")));
+            obj.insert("tokenizer.ggml.tokens_count".to_string(), json!(32000));
+            obj.insert("tokenizer.ggml.token_type_count".to_string(), json!(1));
+            obj.insert("tokenizer.ggml.bos_token_id".to_string(), json!(1));
+            obj.insert("tokenizer.ggml.eos_token_id".to_string(), json!(2));
+            obj.insert("tokenizer.ggml.unknown_token_id".to_string(), json!(0));
+            obj.insert("tokenizer.ggml.padding_token_id".to_string(), json!(null));
+            obj.insert("tokenizer.ggml.merges".to_string(), json!([]));
+            obj.insert("tokenizer.ggml.tokens".to_string(), json!([]));
+            obj.insert("tokenizer.ggml.token_type".to_string(), json!([]));
+            obj.insert("tokenizer.ggml.pre".to_string(), json!(self.architecture.to_lowercase()));
         }
 
         model_info
@@ -138,72 +195,72 @@ impl ModelInfo {
             "llama" => json!({
                 "llama.attention.head_count": 32,
                 "llama.attention.head_count_kv": 8,
-                "llama.attention.layer_norm_rms_epsilon": 0.00001,
                 "llama.block_count": 32,
-                "llama.context_length": 8192,
                 "llama.embedding_length": 4096,
-                "llama.feed_forward_length": 14336,
+                "llama.context_length": if self.parameter_size_str.contains("8b") || self.parameter_size_str.contains("3.1") || self.parameter_size_str.contains("32k") || self.parameter_size_str.contains("128k") || self.parameter_size_str.contains("8192") { 8192 } else { 4096 },
                 "llama.rope.dimension_count": 128,
-                "llama.rope.freq_base": 500000,
-                "llama.vocab_size": 128256,
-                "tokenizer.ggml.bos_token_id": 128000,
-                "tokenizer.ggml.eos_token_id": 128009,
-                "tokenizer.ggml.model": "gpt2",
-                "tokenizer.ggml.pre": "llama-bpe"
+                "llama.attention.layer_norm_rms_epsilon": 1e-5,
+                "llama.rope.freq_base": if self.ollama_name.contains("codellama") { 1_000_000.0 } else { 10_000.0 },
+                "llama.vocab_size": 32000,
             }),
             "qwen2" => json!({
                 "qwen2.attention.head_count": 32,
-                "qwen2.attention.head_count_kv": 32,
-                "qwen2.attention.layer_norm_rms_epsilon": 0.000001,
-                "qwen2.block_count": 28,
+                "qwen2.attention.head_count_kv": if self.parameter_size_str.contains("0.5b") { 4 } else { 8 },
+                "qwen2.block_count": if self.parameter_size_str.contains("0.5b") { 24 } else { 28 },
+                "qwen2.embedding_length": if self.parameter_size_str.contains("0.5b") { 1024 } else { 3584 },
                 "qwen2.context_length": 32768,
-                "qwen2.embedding_length": 3584,
-                "qwen2.feed_forward_length": 18944,
-                "qwen2.rope.dimension_count": 128,
-                "qwen2.rope.freq_base": 1000000,
+                "qwen2.attention.layer_norm_rms_epsilon": 1e-6,
+                "qwen2.feed_forward_length": if self.parameter_size_str.contains("0.5b") { 2816 } else { 9728 },
+                "qwen2.rope.freq_base": 1_000_000.0,
                 "qwen2.vocab_size": 151936,
-                "tokenizer.ggml.bos_token_id": 151643,
-                "tokenizer.ggml.eos_token_id": 151645,
-                "tokenizer.ggml.model": "gpt2",
-                "tokenizer.ggml.pre": "qwen2"
             }),
-            "mistral" => json!({
+            "mistral" | "mixtral" => json!({
                 "mistral.attention.head_count": 32,
                 "mistral.attention.head_count_kv": 8,
-                "mistral.attention.layer_norm_rms_epsilon": 0.00001,
                 "mistral.block_count": 32,
-                "mistral.context_length": 32768,
                 "mistral.embedding_length": 4096,
+                "mistral.context_length": 32768,
+                "mistral.attention.layer_norm_rms_epsilon": 1e-5,
                 "mistral.feed_forward_length": 14336,
                 "mistral.rope.dimension_count": 128,
-                "mistral.rope.freq_base": 1000000,
+                "mistral.rope.freq_base": 1_000_000.0,
                 "mistral.vocab_size": 32000,
-                "tokenizer.ggml.bos_token_id": 1,
-                "tokenizer.ggml.eos_token_id": 2,
-                "tokenizer.ggml.model": "llama",
-                "tokenizer.ggml.pre": "default"
             }),
-            _ => json!({
-                "tokenizer.ggml.bos_token_id": 1,
-                "tokenizer.ggml.eos_token_id": 2,
-                "tokenizer.ggml.model": "gpt2",
-                "tokenizer.ggml.pre": "default"
-            })
+            "gemma" => json!({
+                "gemma.attention.head_count": if self.parameter_size_str.contains("2b") {8} else {16},
+                "gemma.attention.head_count_kv": 1,
+                "gemma.block_count": if self.parameter_size_str.contains("2b") {18} else {28},
+                "gemma.embedding_length": if self.parameter_size_str.contains("2b") {2048} else {3072},
+                "gemma.context_length": 8192,
+                "gemma.attention.layer_norm_rms_epsilon": 1e-6,
+                "gemma.feed_forward_length": if self.parameter_size_str.contains("2b") {16384} else {24576},
+                "gemma.vocab_size": 256000,
+            }),
+            _ => json!({})
         }
     }
+}
+
+/// Helper to estimate bytes per parameter based on quantization
+fn estimate_bytes_per_parameter(quant_level: &str) -> u64 {
+    let q_lower = quant_level.to_lowercase();
+    // Rough estimates for effective bytes per parameter
+    if q_lower.contains("q2") { 1 } else if q_lower.contains("q3") { 1 } else if q_lower.contains("q4") { 1 } else if q_lower.contains("q5") { 1 } else if q_lower.contains("q6") { 1 } else if q_lower.contains("q8_0") { 1 } else if q_lower.contains("f16") { 2 } else if q_lower.contains("f32") { 4 } else { 1 }
 }
 
 /// Extract model family from name programmatically
 fn extract_model_family(name: &str) -> String {
     const FAMILY_PATTERNS: &[(&str, &str)] = &[
-        ("llama", "llama"),
+        ("llama", "llama"), ("codellama", "llama"),
         ("qwen", "qwen2"),
-        ("mistral", "mistral"),
-        ("deepseek", "llama"), // DeepSeek uses Llama architecture
+        ("mistral", "mistral"), ("mixtral", "mixtral"),
+        ("deepseek-coder", "deepseek"), ("deepseek-moe", "deepseek"), ("deepseek-llm", "deepseek"), ("deepseek", "deepseek"),
         ("gemma", "gemma"),
         ("phi", "phi"),
-        ("embed", "embedding"),
-        ("nomic", "embedding"),
+        ("starcoder", "starcoder"),
+        ("stablelm", "stablelm"),
+        ("command-r", "cohere"), ("cohere", "cohere"),
+        ("all-minilm", "embedding"), ("nomic-embed", "embedding"), ("bge-", "embedding"), ("gte-", "embedding"), ("embed", "embedding"),
     ];
 
     for (pattern, family) in FAMILY_PATTERNS {
@@ -211,62 +268,118 @@ fn extract_model_family(name: &str) -> String {
             return family.to_string();
         }
     }
+    name.split(&['-', ':', '/'][..]).next().unwrap_or("unknown").to_string()
+}
 
-    "llama".to_string() // Default fallback
+/// Extract model architecture from name and family
+fn extract_architecture(name: &str, family: &str) -> String {
+    match family {
+        "llama" | "deepseek" | "mixtral" | "stablelm" => return "llama".to_string(),
+        "qwen2" => return "qwen2".to_string(),
+        "mistral" => return "mistral".to_string(),
+        "gemma" => return "gemma".to_string(),
+        "phi" => return "phi".to_string(),
+        "starcoder" => return "gpt_bigcode".to_string(),
+        "cohere" => return "cohere".to_string(),
+        "embedding" => return "bert".to_string(),
+        _ => {}
+    }
+    if name.contains("qwen") { return "qwen2".to_string(); }
+    if name.contains("llama") || name.contains("codellama") { return "llama".to_string(); }
+    if name.contains("mistral") || name.contains("mixtral") { return "mistral".to_string(); }
+
+    if !family.is_empty() && family != "unknown" {
+        family.to_string()
+    } else {
+        "transformer".to_string()
+    }
 }
 
 /// Extract model size programmatically
 fn extract_model_size(name: &str) -> (String, u64) {
     const SIZE_PATTERNS: &[(&str, &str, u64)] = &[
-        ("0.5b", "0.5B", 500_000_000),
+        ("0.5b", "0.5B", 500_000_000), ("500m", "0.5B", 500_000_000),
+        ("1.5b", "1.5B", 1_500_000_000), ("1b5", "1.5B", 1_500_000_000),
+        ("1.6b", "1.6B", 1_600_000_000),
+        ("1.8b", "1.8B", 1_800_000_000),
+        ("2.7b", "2.7B", 2_700_000_000), ("2b7", "2.7B", 2_700_000_000),
+        ("3.1b", "3.1B", 3_100_000_000),
+        ("3.8b", "3.8B", 3_800_000_000),
         ("1b", "1B", 1_000_000_000),
-        ("1.5b", "1.5B", 1_500_000_000),
         ("2b", "2B", 2_000_000_000),
         ("3b", "3B", 3_000_000_000),
+        ("4b", "4B", 4_000_000_000),
+        ("6b", "6B", 6_000_000_000),
         ("7b", "7B", 7_000_000_000),
         ("8b", "8B", 8_000_000_000),
         ("9b", "9B", 9_000_000_000),
+        ("11b", "11B", 11_000_000_000),
         ("13b", "13B", 13_000_000_000),
         ("14b", "14B", 14_000_000_000),
+        ("15b", "15B", 15_000_000_000),
+        ("16b", "16B", 16_000_000_000),
+        ("20b", "20B", 20_000_000_000),
+        ("22b", "22B", 22_000_000_000),
+        ("30b", "30B", 30_000_000_000),
+        ("32b", "32B", 32_000_000_000),
+        ("34b", "34B", 34_000_000_000),
+        ("40b", "40B", 40_000_000_000),
+        ("65b", "65B", 65_000_000_000),
         ("70b", "70B", 70_000_000_000),
         ("72b", "72B", 72_000_000_000),
+        ("8x7b", "56B", 56_000_000_000),
+        ("8x22b", "176B", 176_000_000_000),
+        ("120b", "120B", 120_000_000_000),
+        ("128b", "128B", 128_000_000_000),
+        ("175b", "175B", 175_000_000_000),
+        ("180b", "180B", 180_000_000_000),
         ("405b", "405B", 405_000_000_000),
-        // Handle common variations
-        ("1.8b", "1.8B", 1_800_000_000),
-        ("3.2b", "3.2B", 3_200_000_000),
-        ("11b", "11B", 11_000_000_000),
-        ("22b", "22B", 22_000_000_000),
-        ("34b", "34B", 34_000_000_000),
     ];
 
-    for (pattern, size_str, size_bytes) in SIZE_PATTERNS {
+    for (pattern, size_str, size_bytes_val) in SIZE_PATTERNS {
         if name.contains(pattern) {
-            return (size_str.to_string(), *size_bytes);
+            // Adjust size based on quantization
+            let quant = extract_quantization_level(name);
+            let multiplier = match quant.as_str() {
+                "Q2_K" | "Q2_K_S" => 0.35,
+                "Q3_K_S" | "Q3_K_M" | "Q3_K_L" => 0.45,
+                "Q4_0" | "Q4_1" => 0.5,
+                "Q4_K_S" | "Q4_K_M" => 0.55,
+                "Q5_0" | "Q5_1" => 0.625,
+                "Q5_K_S" | "Q5_K_M" => 0.675,
+                "Q6_K" => 0.75,
+                "Q8_0" => 1.0,
+                "F16" => 2.0,
+                "F32" => 4.0,
+                _ => 0.55,
+            };
+            let estimated_file_size = (*size_bytes_val as f64 * multiplier) as u64;
+
+            return (size_str.to_string(), estimated_file_size.max(100_000_000));
         }
     }
-
-    ("7B".to_string(), DEFAULT_MODEL_SIZE_BYTES) // Default fallback
+    ("unknown".to_string(), DEFAULT_MODEL_SIZE_BYTES)
 }
 
 /// Extract quantization level programmatically
 fn extract_quantization_level(name: &str) -> String {
     const QUANT_PATTERNS: &[(&str, &str)] = &[
-        ("q2_k", "Q2_K"),
-        ("q3_k", "Q3_K"),
-        ("q4_k", "Q4_K"),
-        ("q4_k_m", "Q4_K_M"),
-        ("q4_k_s", "Q4_K_S"),
-        ("q5_k", "Q5_K"),
-        ("q5_k_m", "Q5_K_M"),
-        ("q5_k_s", "Q5_K_S"),
+        ("q2_k_s", "Q2_K_S"), ("q2_k", "Q2_K"),
+        ("q3_k_s", "Q3_K_S"), ("q3_k_m", "Q3_K_M"), ("q3_k_l", "Q3_K_L"), ("q3_k", "Q3_K"),
+        ("q4_0", "Q4_0"), ("q4_1", "Q4_1"),
+        ("q4_k_s", "Q4_K_S"), ("q4_k_m", "Q4_K_M"), ("q4_k", "Q4_K"),
+        ("q5_0", "Q5_0"), ("q5_1", "Q5_1"),
+        ("q5_k_s", "Q5_K_S"), ("q5_k_m", "Q5_K_M"), ("q5_k", "Q5_K"),
         ("q6_k", "Q6_K"),
-        ("q8_0", "Q8_0"),
-        ("f16", "F16"),
-        ("f32", "F32"),
-        ("iq1", "IQ1"),
-        ("iq2", "IQ2"),
-        ("iq3", "IQ3"),
-        ("iq4", "IQ4"),
+        ("q8_0", "Q8_0"), ("q8_1", "Q8_1"), ("q8_k_s", "Q8_K_S"), ("q8_k", "Q8_K"),
+        ("iq1_s", "IQ1_S"), ("iq1_m", "IQ1_M"),
+        ("iq2_xs", "IQ2_XS"), ("iq2_s", "IQ2_S"), ("iq2_m", "IQ2_M"), ("iq2_xxs", "IQ2_XXS"),
+        ("iq3_s", "IQ3_S"), ("iq3_m", "IQ3_M"), ("iq3_xs", "IQ3_XS"), ("iq3_xxs", "IQ3_XXS"),
+        ("iq4_xs", "IQ4_XS"), ("iq4_nl", "IQ4_NL"),
+        ("bpw", "BPW"),
+        ("f16", "F16"), ("fp16", "F16"),
+        ("f32", "F32"), ("fp32", "F32"),
+        ("gguf", "GGUF"),
     ];
 
     for (pattern, quant) in QUANT_PATTERNS {
@@ -274,8 +387,7 @@ fn extract_quantization_level(name: &str) -> String {
             return quant.to_string();
         }
     }
-
-    "Q4_K_M".to_string() // Default fallback
+    if name.contains("gguf") { "Q4_K_M".to_string() } else { "unknown".to_string() }
 }
 
 /// Optimized model name cleaning
@@ -283,22 +395,17 @@ pub fn clean_model_name(name: &str) -> &str {
     if name.is_empty() {
         return name;
     }
-
-    // Remove :latest suffix
     let after_latest = if let Some(pos) = name.rfind(":latest") {
         &name[..pos]
     } else {
         name
     };
-
-    // Remove numeric suffixes like :1, :2, etc.
     if let Some(colon_pos) = after_latest.rfind(':') {
         let suffix = &after_latest[colon_pos + 1..];
         if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) && colon_pos > 0 {
             return &after_latest[..colon_pos];
         }
     }
-
     after_latest
 }
 
@@ -308,6 +415,7 @@ pub struct ModelResolver<'a> {
 }
 
 impl<'a> ModelResolver<'a> {
+    /// Create new model resolver
     pub fn new(context: RequestContext<'a>) -> Self {
         Self { context }
     }
@@ -315,31 +423,32 @@ impl<'a> ModelResolver<'a> {
     /// Direct model resolution with fail-fast approach
     pub async fn resolve_model_name(
         &self,
-        ollama_model: &str,
+        ollama_model_name_requested: &str,
         cancellation_token: CancellationToken,
     ) -> Result<String, ProxyError> {
-        let cleaned_ollama = clean_model_name(ollama_model);
+        let cleaned_ollama_request = clean_model_name(ollama_model_name_requested);
 
-        // Record model load attempt in metrics
         if let Some(metrics) = get_global_metrics() {
-            metrics.record_model_load(cleaned_ollama, true).await;
+            let model_name_for_metrics = cleaned_ollama_request.to_string();
+            tokio::spawn(async move {
+                metrics.record_model_load(&model_name_for_metrics, true).await;
+            });
         }
 
-        // Get available models from LM Studio with fail-fast
-        match self.get_available_models(cancellation_token).await {
-            Ok(available_models) => {
-                // Find the best match
-                if let Some(matched_model) = self.find_best_match(cleaned_ollama, &available_models) {
-                    Ok(matched_model)
+        match self.get_available_lm_studio_models(cancellation_token).await {
+            Ok(available_lm_studio_ids) => {
+                if let Some(matched_lm_studio_id) = self.find_best_match(cleaned_ollama_request, &available_lm_studio_ids) {
+                    Ok(matched_lm_studio_id)
                 } else {
-                    // Return cleaned name if no match found
-                    Ok(cleaned_ollama.to_string())
+                    Ok(cleaned_ollama_request.to_string())
                 }
-            },
+            }
             Err(e) => {
-                // Fail fast - don't continue if LM Studio is unavailable
                 if let Some(metrics) = get_global_metrics() {
-                    metrics.record_model_load(cleaned_ollama, false).await;
+                    let model_name_for_metrics = cleaned_ollama_request.to_string();
+                    tokio::spawn(async move {
+                        metrics.record_model_load(&model_name_for_metrics, false).await;
+                    });
                 }
                 Err(e)
             }
@@ -347,7 +456,7 @@ impl<'a> ModelResolver<'a> {
     }
 
     /// Get available models from LM Studio with fail-fast strategy
-    async fn get_available_models(&self, cancellation_token: CancellationToken) -> Result<Vec<String>, ProxyError> {
+    async fn get_available_lm_studio_models(&self, cancellation_token: CancellationToken) -> Result<Vec<String>, ProxyError> {
         let url = format!("{}/v1/models", self.context.lmstudio_url);
         let request = CancellableRequest::new(self.context.clone(), cancellation_token);
 
@@ -355,89 +464,104 @@ impl<'a> ModelResolver<'a> {
 
         if !response.status().is_success() {
             return Err(ProxyError::new(
-                ERROR_LM_STUDIO_UNAVAILABLE.to_string(),
-                response.status().as_u16()
+                format!("{}: {}", ERROR_LM_STUDIO_UNAVAILABLE, response.status()),
+                response.status().as_u16(),
             ));
         }
 
         let models_response = response.json::<Value>().await
-            .map_err(|_| ProxyError::internal_server_error("Invalid JSON from LM Studio models endpoint"))?;
+            .map_err(|e| ProxyError::internal_server_error(&format!("Invalid JSON from LM Studio /v1/models: {}", e)))?;
 
-        let mut model_names = Vec::new();
+        let mut model_ids = Vec::new();
         if let Some(data) = models_response.get("data").and_then(|d| d.as_array()) {
-            for model in data {
-                if let Some(model_id) = model.get("id").and_then(|id| id.as_str()) {
-                    model_names.push(model_id.to_string());
+            for model_entry in data {
+                if let Some(model_id) = model_entry.get("id").and_then(|id| id.as_str()) {
+                    model_ids.push(model_id.to_string());
+                }
+            }
+        }
+        Ok(model_ids)
+    }
+
+    /// Enhanced model matching with better scoring
+    fn find_best_match(&self, ollama_name_cleaned: &str, available_lm_studio_ids: &[String]) -> Option<String> {
+        let lower_ollama = ollama_name_cleaned.to_lowercase();
+
+        // Exact match first
+        for lm_id in available_lm_studio_ids {
+            if lm_id.to_lowercase() == lower_ollama {
+                return Some(lm_id.clone());
+            }
+        }
+
+        // Substring match
+        for lm_id in available_lm_studio_ids {
+            if lm_id.to_lowercase().contains(&lower_ollama) {
+                if lower_ollama.len() > lm_id.len() / 2 || lower_ollama.len() > 10 {
+                    return Some(lm_id.clone());
                 }
             }
         }
 
-        Ok(model_names)
-    }
-
-    /// Enhanced model matching with better scoring
-    fn find_best_match(&self, ollama_name: &str, available_models: &[String]) -> Option<String> {
-        let lower_ollama = ollama_name.to_lowercase();
-
-        // 1. Exact match (highest priority)
-        for model in available_models {
-            if model.to_lowercase() == lower_ollama {
-                return Some(model.clone());
-            }
-        }
-
-        // 2. Find best scoring match with improved algorithm
+        // Enhanced scoring match
         let mut best_match = None;
         let mut best_score = 0;
-
-        for model in available_models {
-            let score = self.calculate_enhanced_match_score(&lower_ollama, &model.to_lowercase());
-            if score > best_score && score >= 3 { // Raised threshold for better matches
+        for lm_id in available_lm_studio_ids {
+            let score = self.calculate_enhanced_match_score(&lower_ollama, &lm_id.to_lowercase());
+            if score > best_score && score >= 3 {
                 best_score = score;
-                best_match = Some(model.clone());
+                best_match = Some(lm_id.clone());
             }
         }
 
+        if best_match.is_none() && ollama_name_cleaned.contains('/') && ollama_name_cleaned.to_lowercase().ends_with(".gguf") {
+            return Some(ollama_name_cleaned.to_string());
+        }
         best_match
     }
 
     /// Enhanced match scoring algorithm
     fn calculate_enhanced_match_score(&self, ollama_name: &str, lm_name: &str) -> usize {
         let ollama_parts: Vec<&str> = ollama_name
-            .split(&['-', '_', ':', '.', ' '])
-            .filter(|s| s.len() > 1) // Filter very short parts
+            .split(&['-', '_', ':', '.', '/', ' '])
+            .filter(|s| !s.is_empty() && s.len() > 1)
             .collect();
-
         let lm_parts: Vec<&str> = lm_name
-            .split(&['-', '_', ':', '.', ' '])
-            .filter(|s| s.len() > 1)
+            .split(&['-', '_', ':', '.', '/', ' '])
+            .filter(|s| !s.is_empty() && s.len() > 1)
             .collect();
 
         let mut score = 0;
 
-        // Score exact part matches
+        // Part matching
         for ollama_part in &ollama_parts {
             for lm_part in &lm_parts {
                 if ollama_part == lm_part {
-                    score += ollama_part.len() * 2; // Exact matches get double score
+                    score += ollama_part.len() * 2; // exact part
                 } else if lm_part.contains(ollama_part) || ollama_part.contains(lm_part) {
-                    score += ollama_part.len().min(lm_part.len()); // Partial matches
+                    score += ollama_part.len().min(lm_part.len()); // partial match
                 }
             }
         }
 
-        // Bonus for model family matches
+        // Family matching bonus
         let ollama_family = extract_model_family(ollama_name);
         let lm_family = extract_model_family(lm_name);
-        if ollama_family == lm_family {
+        if ollama_family == lm_family && ollama_family != "unknown" {
             score += 5;
         }
 
-        // Bonus for size matches
-        let (ollama_size, _) = extract_model_size(ollama_name);
-        let (lm_size, _) = extract_model_size(lm_name);
-        if ollama_size == lm_size {
+        // Size matching bonus
+        let (ollama_size_str, _) = extract_model_size(ollama_name);
+        let (lm_size_str, _) = extract_model_size(lm_name);
+        if ollama_size_str == lm_size_str && ollama_size_str != "unknown" {
             score += 3;
+        }
+
+        // Prefix matching bonus
+        let cleaned_lm_name = lm_name.split('/').last().unwrap_or(lm_name);
+        if cleaned_lm_name.starts_with(ollama_name) {
+            score += ollama_name.len();
         }
 
         score

@@ -1,4 +1,4 @@
-// src/utils.rs - Consolidated utilities with enhanced error handling
+/// src/utils.rs - Consolidated utilities with enhanced error handling
 
 use std::cell::RefCell;
 use std::error::Error;
@@ -10,7 +10,7 @@ use crate::constants::*;
 
 // Thread-local string buffer for reuse
 thread_local! {
-    static STRING_BUFFER: RefCell<String> = RefCell::new(String::with_capacity(get_runtime_config().string_buffer_size));
+    pub static STRING_BUFFER: RefCell<String> = RefCell::new(String::with_capacity(get_runtime_config().string_buffer_size));
 }
 
 /// Macro for efficient error handling in handlers
@@ -19,8 +19,9 @@ macro_rules! handle_lm_error {
     ($response:expr) => {
         if !$response.status().is_success() {
             let status = $response.status();
+            let error_body = $response.text().await.unwrap_or_else(|_| "Unknown error body".to_string());
             return Err(ProxyError::new(
-                format!("LM Studio error: {}", status),
+                format!("LM Studio error: {} - {}", status, error_body),
                 status.as_u16()
             ));
         }
@@ -73,6 +74,7 @@ enum ProxyErrorKind {
 }
 
 impl ProxyError {
+    /// Create new proxy error
     pub fn new(message: String, status_code: u16) -> Self {
         Self {
             message,
@@ -81,6 +83,7 @@ impl ProxyError {
         }
     }
 
+    /// Create internal server error
     pub fn internal_server_error(message: &str) -> Self {
         Self {
             message: message.to_string(),
@@ -89,6 +92,7 @@ impl ProxyError {
         }
     }
 
+    /// Create bad request error
     pub fn bad_request(message: &str) -> Self {
         Self {
             message: message.to_string(),
@@ -97,6 +101,7 @@ impl ProxyError {
         }
     }
 
+    /// Create not found error
     pub fn not_found(message: &str) -> Self {
         Self {
             message: message.to_string(),
@@ -105,6 +110,7 @@ impl ProxyError {
         }
     }
 
+    /// Create not implemented error
     pub fn not_implemented(message: &str) -> Self {
         Self {
             message: message.to_string(),
@@ -113,6 +119,7 @@ impl ProxyError {
         }
     }
 
+    /// Create request cancelled error
     pub fn request_cancelled() -> Self {
         Self {
             message: ERROR_CANCELLED.to_string(),
@@ -121,6 +128,7 @@ impl ProxyError {
         }
     }
 
+    /// Create LM Studio unavailable error
     pub fn lm_studio_unavailable(message: &str) -> Self {
         Self {
             message: message.to_string(),
@@ -129,10 +137,12 @@ impl ProxyError {
         }
     }
 
+    /// Check if request is canceled
     pub fn is_cancelled(&self) -> bool {
         matches!(self.kind, ProxyErrorKind::RequestCancelled)
     }
 
+    /// Check if LM Studio is unavailable
     pub fn is_lm_studio_unavailable(&self) -> bool {
         matches!(self.kind, ProxyErrorKind::LMStudioUnavailable)
     }
@@ -154,11 +164,12 @@ pub struct Logger {
 }
 
 impl Logger {
+    /// Create a new logger
     pub fn new(enabled: bool) -> Self {
         Self { enabled }
     }
 
-    /// Log with timing information using efficient string buffer
+    /// Log with timing information using string buffer
     pub fn log_timed(&self, prefix: &str, operation: &str, start: Instant) {
         if self.enabled {
             let duration = start.elapsed();
@@ -174,7 +185,7 @@ impl Logger {
     /// Simple log without timing
     pub fn log(&self, message: &str) {
         if self.enabled {
-            println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), message);
+            println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), sanitize_log_message(message));
         }
     }
 
@@ -185,8 +196,8 @@ impl Logger {
                 let mut buffer = buf.borrow_mut();
                 buffer.clear();
                 match model {
-                    Some(m) => write!(buffer, "{} {} {} (model: {})", LOG_PREFIX_REQUEST, method, path, m).unwrap(),
-                    None => write!(buffer, "{} {} {}", LOG_PREFIX_REQUEST, method, path).unwrap(),
+                    Some(m) => write!(buffer, "{} {} {} (model: {})", LOG_PREFIX_REQUEST, method, sanitize_log_message(path), sanitize_log_message(m)).unwrap(),
+                    None => write!(buffer, "{} {} {}", LOG_PREFIX_REQUEST, method, sanitize_log_message(path)).unwrap(),
                 }
                 println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), buffer);
             });
@@ -199,7 +210,7 @@ impl Logger {
             STRING_BUFFER.with(|buf| {
                 let mut buffer = buf.borrow_mut();
                 buffer.clear();
-                write!(buffer, "{} {} failed: {}", LOG_PREFIX_ERROR, operation, error).unwrap();
+                write!(buffer, "{} {} failed: {}", LOG_PREFIX_ERROR, sanitize_log_message(operation), sanitize_log_message(error)).unwrap();
                 println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), buffer);
             });
         }
@@ -211,7 +222,7 @@ impl Logger {
             STRING_BUFFER.with(|buf| {
                 let mut buffer = buf.borrow_mut();
                 buffer.clear();
-                write!(buffer, "{} {} warning: {}", LOG_PREFIX_WARNING, operation, warning).unwrap();
+                write!(buffer, "{} {} warning: {}", LOG_PREFIX_WARNING, sanitize_log_message(operation), sanitize_log_message(warning)).unwrap();
                 println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), buffer);
             });
         }
@@ -222,11 +233,10 @@ impl Logger {
 pub fn is_model_loading_error(message: &str) -> bool {
     let lower = message.to_lowercase();
 
-    // More comprehensive error pattern matching
     let error_indicators = [
         "no model", "not loaded", "model not found", "model unavailable",
         "model not available", "invalid model", "unknown model",
-        "failed to load", "loading failed", "model error"
+        "failed to load", "loading failed", "model error", "is not embedding"
     ];
 
     error_indicators.iter().any(|&pattern| lower.contains(pattern)) ||
@@ -239,42 +249,15 @@ pub fn is_model_loading_error(message: &str) -> bool {
 pub fn format_duration(duration: Duration) -> String {
     let total_nanos = duration.as_nanos();
 
-    if total_nanos < 1_000 { // Less than 1µs
+    if total_nanos < 1_000 {
         format!("{}ns", total_nanos)
-    } else if total_nanos < 1_000_000 { // Less than 1ms
+    } else if total_nanos < 1_000_000 {
         format!("{:.1}µs", total_nanos as f64 / 1_000.0)
-    } else if total_nanos < 1_000_000_000 { // Less than 1s
+    } else if total_nanos < 1_000_000_000 {
         format!("{:.2}ms", total_nanos as f64 / 1_000_000.0)
-    } else { // 1s or more
+    } else {
         format!("{:.3}s", total_nanos as f64 / 1_000_000_000.0)
     }
-}
-
-/// Consolidated model name validation
-pub fn validate_model_name(name: &str) -> Result<(), String> {
-    if name.is_empty() {
-        return Err("Model name cannot be empty".to_string());
-    }
-
-    if name.len() > 200 {
-        return Err("Model name too long (max: 200 characters)".to_string());
-    }
-
-    // Check for control characters (except common whitespace)
-    if name.chars().any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r')) {
-        return Err("Model name contains invalid control characters".to_string());
-    }
-
-    // Check for suspicious patterns
-    if name.contains("::") {
-        return Err("Model name contains multiple consecutive colons".to_string());
-    }
-
-    if name.matches(':').count() > 4 {
-        return Err("Model name contains too many colons".to_string());
-    }
-
-    Ok(())
 }
 
 /// Enhanced config validation
@@ -282,26 +265,18 @@ pub fn validate_config(config: &crate::server::Config) -> Result<(), String> {
     if config.request_timeout_seconds == 0 {
         return Err("Request timeout must be greater than 0".to_string());
     }
-
     if config.stream_timeout_seconds == 0 {
         return Err("Stream timeout must be greater than 0".to_string());
     }
-
     if config.load_timeout_seconds == 0 {
         return Err("Load timeout must be greater than 0".to_string());
     }
-
-    // Validate listen address
     if config.listen.parse::<std::net::SocketAddr>().is_err() {
         return Err(format!("Invalid listen address: {}", config.listen));
     }
-
-    // Enhanced URL validation
     if !config.lmstudio_url.starts_with("http://") && !config.lmstudio_url.starts_with("https://") {
         return Err(format!("Invalid LM Studio URL (must start with http:// or https://): {}", config.lmstudio_url));
     }
-
-    // Validate URL format more thoroughly
     if let Err(e) = url::Url::parse(&config.lmstudio_url) {
         return Err(format!("Invalid LM Studio URL format: {}", e));
     }
@@ -311,29 +286,11 @@ pub fn validate_config(config: &crate::server::Config) -> Result<(), String> {
         return Err("Max buffer size must be greater than 0".to_string());
     }
 
-    if config.max_chunk_count == 0 {
-        return Err("Max chunk count must be greater than 0".to_string());
-    }
-
-    if config.max_request_size == 0 {
-        return Err("Max request size must be greater than 0".to_string());
-    }
-
-    // Reasonable limits validation
-    if config.max_buffer_size > 100 * 1024 * 1024 { // 100MB
-        return Err("Max buffer size too large (max: 100MB)".to_string());
-    }
-
-    if config.max_request_size > 1024 * 1024 * 1024 { // 1GB
-        return Err("Max request size too large (max: 1GB)".to_string());
-    }
-
     Ok(())
 }
 
-/// Check if endpoint requires authentication (for future use)
+/// Check if endpoint requires authentication
 pub fn is_protected_endpoint(path: &str) -> bool {
-    // Currently no protected endpoints, but framework for future use
     matches!(path, "/admin/*" | "/config/*")
 }
 
@@ -345,20 +302,17 @@ pub fn sanitize_log_message(message: &str) -> String {
         .collect()
 }
 
-/// Extract client IP from request headers (for logging/metrics)
+/// Extract client IP from request headers
 pub fn extract_client_ip(headers: &warp::http::HeaderMap) -> Option<String> {
-    // Check common headers for client IP
     let ip_headers = [
         "x-forwarded-for",
         "x-real-ip",
         "cf-connecting-ip",
         "x-client-ip"
     ];
-
     for header_name in &ip_headers {
         if let Some(header_value) = headers.get(*header_name) {
             if let Ok(ip_str) = header_value.to_str() {
-                // Take first IP if comma-separated list
                 let ip = ip_str.split(',').next().unwrap_or(ip_str).trim();
                 if !ip.is_empty() {
                     return Some(ip.to_string());
@@ -366,6 +320,5 @@ pub fn extract_client_ip(headers: &warp::http::HeaderMap) -> Option<String> {
             }
         }
     }
-
     None
 }

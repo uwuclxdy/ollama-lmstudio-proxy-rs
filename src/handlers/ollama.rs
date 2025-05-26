@@ -1,4 +1,4 @@
-// src/handlers/ollama.rs - Enhanced Ollama handlers with metrics and consolidated patterns
+/// src/handlers/ollama.rs - Ollama API endpoint handlers with streaming support and model resolution
 
 use serde_json::{json, Value};
 use std::time::Instant;
@@ -8,18 +8,19 @@ use crate::common::{extract_model_name, handle_json_response, CancellableRequest
 use crate::constants::*;
 use crate::handle_lm_error;
 use crate::handlers::helpers::{
-    json_response, ResponseTransformer, LMStudioRequestType, build_lm_studio_request,
-    execute_request_with_retry
+    json_response, ResponseTransformer, build_lm_studio_request,
+    execute_request_with_retry, LMStudioRequestType,
 };
 use crate::handlers::streaming::{handle_streaming_response, is_streaming_request};
-use crate::model::{clean_model_name, ModelInfo, ModelResolver};
+use crate::handlers::retry::trigger_model_loading_for_ollama;
+use crate::model::{ModelInfo, ModelResolver};
 use crate::server::Config;
 use crate::utils::ProxyError;
 
 /// Handle GET /api/tags - list available models
 pub async fn handle_ollama_tags(
     context: RequestContext<'_>,
-    cancellation_token: CancellationToken
+    cancellation_token: CancellationToken,
 ) -> Result<warp::reply::Response, ProxyError> {
     let start_time = Instant::now();
 
@@ -32,19 +33,17 @@ pub async fn handle_ollama_tags(
             context.logger.log_request("GET", &url, None);
 
             let response = request.make_request(reqwest::Method::GET, &url, None).await?;
-            handle_lm_error!(response);
 
-            let lm_response = handle_json_response(response, cancellation_token).await?;
+            let lm_response_value = handle_json_response(response, cancellation_token).await?;
 
-            // Transform to Ollama format using programmatic model info
-            let models = if let Some(data) = lm_response.get("data").and_then(|d| d.as_array()) {
-                data.iter().map(|model| {
-                    let model_id = model.get("id").and_then(|id| id.as_str()).unwrap_or("unknown");
-                    let cleaned_model = clean_model_name(model_id);
-                    let model_info = ModelInfo::from_name(cleaned_model);
-                    model_info.to_ollama_model()
+            let models = if let Some(data) = lm_response_value.get("data").and_then(|d| d.as_array()) {
+                data.iter().map(|model_entry| {
+                    let lm_studio_model_id = model_entry.get("id").and_then(|id| id.as_str()).unwrap_or("unknown");
+                    let model_info = ModelInfo::from_lm_studio_id(lm_studio_model_id);
+                    model_info.to_ollama_tags_model()
                 }).collect::<Vec<_>>()
             } else {
+                context.logger.log_warning("/v1/models response", "LM Studio response missing 'data' array or not an array, returning empty models list.");
                 vec![]
             };
 
@@ -54,12 +53,15 @@ pub async fn handle_ollama_tags(
 
     let result = execute_request_with_retry(
         &context,
-        "tags", // Not model-specific, but needed for function signature
+        "_system_tags_",
         operation,
-        false, // No model-specific retry needed
+        false,
         0,
         cancellation_token.clone(),
-    ).await?;
+    ).await.unwrap_or_else(|e| {
+        context.logger.log_error("Ollama tags fetch", &e.message);
+        json!({"models": []})
+    });
 
     context.logger.log_timed(LOG_PREFIX_SUCCESS, "Ollama tags", start_time);
     Ok(json_response(&result))
@@ -73,52 +75,77 @@ pub async fn handle_ollama_chat(
     config: &Config,
 ) -> Result<warp::reply::Response, ProxyError> {
     let start_time = Instant::now();
-    let model = extract_model_name(&body, "model")?;
+    let ollama_model_name = extract_model_name(&body, "model")?;
+
+    let messages = body.get("messages").and_then(|m| m.as_array())
+        .ok_or_else(|| ProxyError::bad_request(ERROR_MISSING_MESSAGES))?;
+
+    // Empty messages trigger
+    if messages.is_empty() {
+        context.logger.log(&format!("Empty messages for /api/chat with model '{}', treating as load hint.", ollama_model_name));
+        trigger_model_loading_for_ollama(&context, ollama_model_name, cancellation_token.clone()).await?;
+        let fabricated_response = json!({
+            "model": ollama_model_name,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "message": {"role": "assistant", "content": ""},
+            "done_reason": "load",
+            "done": true
+        });
+        context.logger.log_timed(LOG_PREFIX_SUCCESS, "Ollama chat (load hint)", start_time);
+        return Ok(json_response(&fabricated_response));
+    }
 
     let operation = || {
         let context = context.clone();
-        let body = body.clone();
-        let cancellation_token = cancellation_token.clone();
-        let config = config.clone();
+        let body_clone = body.clone();
+        let cancellation_token_clone = cancellation_token.clone();
+        let config_clone = config.clone();
+        let ollama_model_name_clone = ollama_model_name.to_string();
+
         async move {
-            let model = extract_model_name(&body, "model")?;
-            let messages = body.get("messages").and_then(|m| m.as_array())
+            let current_ollama_model_name = extract_model_name(&body_clone, "model")?;
+            let current_messages = body_clone.get("messages").and_then(|m| m.as_array())
                 .ok_or_else(|| ProxyError::bad_request(ERROR_MISSING_MESSAGES))?;
-            let stream = is_streaming_request(&body);
+            let stream = is_streaming_request(&body_clone);
+            let ollama_options = body_clone.get("options");
+            let ollama_tools = body_clone.get("tools");
 
-            // Resolve model name
             let resolver = ModelResolver::new(context.clone());
-            let lmstudio_model = resolver.resolve_model_name(model, cancellation_token.clone()).await?;
+            let lm_studio_model_id = resolver.resolve_model_name(current_ollama_model_name, cancellation_token_clone.clone()).await?;
 
-            // Build request using consolidated helper
             let lm_request = build_lm_studio_request(
-                &lmstudio_model,
-                LMStudioRequestType::Chat { messages: &json!(messages), stream },
-                body.get("options")
+                &lm_studio_model_id,
+                LMStudioRequestType::Chat { messages: &json!(current_messages), stream },
+                ollama_options,
+                ollama_tools,
             );
 
-            let request = CancellableRequest::new(context.clone(), cancellation_token.clone());
+            let request_obj = CancellableRequest::new(context.clone(), cancellation_token_clone.clone());
             let url = format!("{}/v1/chat/completions", context.lmstudio_url);
-            context.logger.log_request("POST", &url, Some(&lmstudio_model));
+            context.logger.log_request("POST", &url, Some(&lm_studio_model_id));
 
-            let response = request.make_request(reqwest::Method::POST, &url, Some(lm_request)).await?;
+            let response = request_obj.make_request(reqwest::Method::POST, &url, Some(lm_request)).await?;
 
             if stream {
-                // Check error status before streaming
-                if !response.status().is_success() {
-                    let status = response.status();
-                    return Err(ProxyError::new(
-                        format!("LM Studio streaming error: {}", status),
-                        status.as_u16()
-                    ));
-                }
+                handle_lm_error!(response);
                 handle_streaming_response(
-                    response, true, model, start_time, cancellation_token.clone(),
-                    context.logger, config.stream_timeout_seconds
+                    response,
+                    true,
+                    &ollama_model_name_clone,
+                    start_time,
+                    cancellation_token_clone.clone(),
+                    context.logger,
+                    config_clone.stream_timeout_seconds,
                 ).await
             } else {
-                let lm_response = handle_json_response(response, cancellation_token).await?;
-                let ollama_response = ResponseTransformer::convert_to_ollama_chat(&lm_response, model, messages, start_time);
+                handle_lm_error!(response);
+                let lm_response_value = handle_json_response(response, cancellation_token_clone).await?;
+                let ollama_response = ResponseTransformer::convert_to_ollama_chat(
+                    &lm_response_value,
+                    &ollama_model_name_clone,
+                    current_messages.len(),
+                    start_time,
+                );
                 Ok(json_response(&ollama_response))
             }
         }
@@ -126,9 +153,9 @@ pub async fn handle_ollama_chat(
 
     let result = execute_request_with_retry(
         &context,
-        model,
+        ollama_model_name,
         operation,
-        true, // Use model-specific retry
+        true,
         config.load_timeout_seconds,
         cancellation_token.clone(),
     ).await?;
@@ -145,49 +172,89 @@ pub async fn handle_ollama_generate(
     config: &Config,
 ) -> Result<warp::reply::Response, ProxyError> {
     let start_time = Instant::now();
-    let model = extract_model_name(&body, "model")?;
+    let ollama_model_name = extract_model_name(&body, "model")?;
+
+    let prompt = body.get("prompt").and_then(|p| p.as_str())
+        .ok_or_else(|| ProxyError::bad_request(ERROR_MISSING_PROMPT))?;
+    let images = body.get("images");
+
+    // Empty prompt trigger
+    if prompt.is_empty() && images.map_or(true, |i| i.as_array().map_or(true, |a| a.is_empty())) {
+        context.logger.log(&format!("Empty prompt for /api/generate with model '{}', treating as load hint.", ollama_model_name));
+        trigger_model_loading_for_ollama(&context, ollama_model_name, cancellation_token.clone()).await?;
+        let fabricated_response = json!({
+            "model": ollama_model_name,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "response": "",
+            "done": true
+        });
+        context.logger.log_timed(LOG_PREFIX_SUCCESS, "Ollama generate (load hint)", start_time);
+        return Ok(json_response(&fabricated_response));
+    }
 
     let operation = || {
         let context = context.clone();
-        let body = body.clone();
-        let cancellation_token = cancellation_token.clone();
-        let config = config.clone();
+        let body_clone = body.clone();
+        let cancellation_token_clone = cancellation_token.clone();
+        let config_clone = config.clone();
+        let ollama_model_name_clone = ollama_model_name.to_string();
+
         async move {
-            let model = extract_model_name(&body, "model")?;
-            let prompt = body.get("prompt").and_then(|p| p.as_str())
+            let current_ollama_model_name = extract_model_name(&body_clone, "model")?;
+            let current_prompt = body_clone.get("prompt").and_then(|p| p.as_str())
                 .ok_or_else(|| ProxyError::bad_request(ERROR_MISSING_PROMPT))?;
-            let stream = is_streaming_request(&body);
+            let current_images = body_clone.get("images");
+            let stream = is_streaming_request(&body_clone);
+            let ollama_options = body_clone.get("options");
 
             let resolver = ModelResolver::new(context.clone());
-            let lmstudio_model = resolver.resolve_model_name(model, cancellation_token.clone()).await?;
+            let lm_studio_model_id = resolver.resolve_model_name(current_ollama_model_name, cancellation_token_clone.clone()).await?;
+
+            // Images use chat
+            let (lm_studio_target_url, lm_request_type) = if current_images.is_some() && current_images.unwrap().as_array().map_or(false, |a| !a.is_empty()) {
+                (
+                    format!("{}/v1/chat/completions", context.lmstudio_url),
+                    LMStudioRequestType::Completion { prompt: current_prompt, stream, images: current_images }
+                )
+            } else {
+                (
+                    format!("{}/v1/completions", context.lmstudio_url),
+                    LMStudioRequestType::Completion { prompt: current_prompt, stream, images: None }
+                )
+            };
 
             let lm_request = build_lm_studio_request(
-                &lmstudio_model,
-                LMStudioRequestType::Completion { prompt, stream },
-                body.get("options")
+                &lm_studio_model_id,
+                lm_request_type,
+                ollama_options,
+                None,
             );
 
-            let request = CancellableRequest::new(context.clone(), cancellation_token.clone());
-            let url = format!("{}/v1/completions", context.lmstudio_url);
-            context.logger.log_request("POST", &url, Some(&lmstudio_model));
+            let request_obj = CancellableRequest::new(context.clone(), cancellation_token_clone.clone());
+            context.logger.log_request("POST", &lm_studio_target_url, Some(&lm_studio_model_id));
 
-            let response = request.make_request(reqwest::Method::POST, &url, Some(lm_request)).await?;
+            let response = request_obj.make_request(reqwest::Method::POST, &lm_studio_target_url, Some(lm_request)).await?;
 
             if stream {
-                if !response.status().is_success() {
-                    let status = response.status();
-                    return Err(ProxyError::new(
-                        format!("LM Studio streaming error: {}", status),
-                        status.as_u16()
-                    ));
-                }
+                handle_lm_error!(response);
                 handle_streaming_response(
-                    response, false, model, start_time, cancellation_token.clone(),
-                    context.logger, config.stream_timeout_seconds
+                    response,
+                    false,
+                    &ollama_model_name_clone,
+                    start_time,
+                    cancellation_token_clone.clone(),
+                    context.logger,
+                    config_clone.stream_timeout_seconds,
                 ).await
             } else {
-                let lm_response = handle_json_response(response, cancellation_token).await?;
-                let ollama_response = ResponseTransformer::convert_to_ollama_generate(&lm_response, model, prompt, start_time);
+                handle_lm_error!(response);
+                let lm_response_value = handle_json_response(response, cancellation_token_clone).await?;
+                let ollama_response = ResponseTransformer::convert_to_ollama_generate(
+                    &lm_response_value,
+                    &ollama_model_name_clone,
+                    current_prompt,
+                    start_time,
+                );
                 Ok(json_response(&ollama_response))
             }
         }
@@ -195,7 +262,7 @@ pub async fn handle_ollama_generate(
 
     let result = execute_request_with_retry(
         &context,
-        model,
+        ollama_model_name,
         operation,
         true,
         config.load_timeout_seconds,
@@ -213,43 +280,80 @@ pub async fn handle_ollama_embeddings(
     cancellation_token: CancellationToken,
 ) -> Result<warp::reply::Response, ProxyError> {
     let start_time = Instant::now();
-    let model = extract_model_name(&body, "model")?;
+    let ollama_model_name = extract_model_name(&body, "model")?;
 
     let operation = || {
         let context = context.clone();
-        let body = body.clone();
-        let cancellation_token = cancellation_token.clone();
+        let body_clone = body.clone();
+        let cancellation_token_clone = cancellation_token.clone();
+        let ollama_model_name_clone = ollama_model_name.to_string();
+
         async move {
-            let model = extract_model_name(&body, "model")?;
-            let input = body.get("input").or_else(|| body.get("prompt"))
+            let current_ollama_model_name = extract_model_name(&body_clone, "model")?;
+            let mut input_value = body_clone.get("input").or_else(|| body_clone.get("prompt"))
+                .cloned()
                 .ok_or_else(|| ProxyError::bad_request(ERROR_MISSING_INPUT))?;
 
+            let ollama_options = body_clone.get("options");
+            let truncate = ollama_options
+                .and_then(|opts| opts.get("truncate"))
+                .and_then(|t| t.as_bool())
+                .unwrap_or(true);
+
+            // Truncate if enabled
+            if truncate {
+                if let Some(s_input) = input_value.as_str() {
+                    if s_input.chars().count() > EMBEDDING_TRUNCATE_CHAR_LIMIT {
+                        let truncated_input: String = s_input.chars().take(EMBEDDING_TRUNCATE_CHAR_LIMIT).collect();
+                        input_value = Value::String(truncated_input);
+                        context.logger.log_warning("Embeddings input", "Input string truncated due to length.");
+                    }
+                } else if let Some(arr_input) = input_value.as_array_mut() {
+                    for val in arr_input.iter_mut() {
+                        if let Some(s) = val.as_str() {
+                            if s.chars().count() > EMBEDDING_TRUNCATE_CHAR_LIMIT {
+                                let truncated_s: String = s.chars().take(EMBEDDING_TRUNCATE_CHAR_LIMIT).collect();
+                                *val = Value::String(truncated_s);
+                                context.logger.log_warning("Embeddings input", "An input string in array truncated.");
+                            }
+                        }
+                    }
+                }
+            }
+
             let resolver = ModelResolver::new(context.clone());
-            let lmstudio_model = resolver.resolve_model_name(model, cancellation_token.clone()).await?;
+            let lm_studio_model_id = resolver.resolve_model_name(current_ollama_model_name, cancellation_token_clone.clone()).await?;
 
             let lm_request = build_lm_studio_request(
-                &lmstudio_model,
-                LMStudioRequestType::Embeddings { input },
-                None
+                &lm_studio_model_id,
+                LMStudioRequestType::Embeddings { input: &input_value },
+                None,
+                None,
             );
 
-            let request = CancellableRequest::new(context.clone(), cancellation_token.clone());
+            let request_obj = CancellableRequest::new(context.clone(), cancellation_token_clone.clone());
             let url = format!("{}/v1/embeddings", context.lmstudio_url);
-            context.logger.log_request("POST", &url, Some(&lmstudio_model));
+            context.logger.log_request("POST", &url, Some(&lm_studio_model_id));
 
-            let response = request.make_request(reqwest::Method::POST, &url, Some(lm_request)).await?;
-            let lm_response = handle_json_response(response, cancellation_token).await?;
-            let ollama_response = ResponseTransformer::convert_to_ollama_embeddings(&lm_response, model, start_time);
+            let response = request_obj.make_request(reqwest::Method::POST, &url, Some(lm_request)).await?;
+            handle_lm_error!(response);
+            let lm_response_value = handle_json_response(response, cancellation_token_clone).await?;
+
+            let ollama_response = ResponseTransformer::convert_to_ollama_embeddings(
+                &lm_response_value,
+                &ollama_model_name_clone,
+                start_time,
+            );
             Ok(ollama_response)
         }
     };
 
     let result = execute_request_with_retry(
         &context,
-        model,
+        ollama_model_name,
         operation,
         true,
-        3, // Short timeout for embeddings
+        5,
         cancellation_token.clone(),
     ).await?;
 
@@ -257,18 +361,59 @@ pub async fn handle_ollama_embeddings(
     Ok(json_response(&result))
 }
 
-/// Handle GET /api/ps - list running models (simplified for proxy)
-pub async fn handle_ollama_ps() -> Result<warp::reply::Response, ProxyError> {
-    // For a proxy, we don't track running models locally
-    let response = json!({"models": []});
-    Ok(json_response(&response))
+/// Handle GET /api/ps - list running models
+pub async fn handle_ollama_ps(
+    context: RequestContext<'_>,
+    cancellation_token: CancellationToken,
+) -> Result<warp::reply::Response, ProxyError> {
+    let start_time = Instant::now();
+    context.logger.log_request("GET", "/api/ps", None);
+
+    let operation = || {
+        let context = context.clone();
+        let cancellation_token = cancellation_token.clone();
+        async move {
+            let request = CancellableRequest::new(context.clone(), cancellation_token.clone());
+            let url = format!("{}/v1/models", context.lmstudio_url);
+
+            let response = request.make_request(reqwest::Method::GET, &url, None).await?;
+
+            let lm_response_value = handle_json_response(response, cancellation_token).await?;
+
+            let models = if let Some(data) = lm_response_value.get("data").and_then(|d| d.as_array()) {
+                data.iter().map(|model_entry| {
+                    let lm_studio_model_id = model_entry.get("id").and_then(|id| id.as_str()).unwrap_or("unknown/error");
+                    let model_info = ModelInfo::from_lm_studio_id(lm_studio_model_id);
+                    model_info.to_ollama_ps_model()
+                }).collect::<Vec<_>>()
+            } else {
+                context.logger.log_warning("/v1/models response for /api/ps", "LM Studio response missing 'data' array or not an array, returning empty models list.");
+                vec![]
+            };
+            Ok(json!({"models": models}))
+        }
+    };
+
+    let result = execute_request_with_retry(
+        &context,
+        "_system_ps_",
+        operation,
+        false,
+        0,
+        cancellation_token.clone(),
+    ).await.unwrap_or_else(|e| {
+        context.logger.log_error("Ollama ps fetch", &e.message);
+        json!({"models": []})
+    });
+
+    context.logger.log_timed(LOG_PREFIX_SUCCESS, "Ollama ps", start_time);
+    Ok(json_response(&result))
 }
 
 /// Handle POST /api/show - show model info programmatically
 pub async fn handle_ollama_show(body: Value) -> Result<warp::reply::Response, ProxyError> {
-    let model = extract_model_name(&body, "model")?;
-    let cleaned_model = clean_model_name(model);
-    let model_info = ModelInfo::from_name(cleaned_model);
+    let ollama_model_name = extract_model_name(&body, "model")?;
+    let model_info = ModelInfo::from_lm_studio_id(ollama_model_name);
     let response = model_info.to_show_response();
     Ok(json_response(&response))
 }
@@ -277,8 +422,7 @@ pub async fn handle_ollama_show(body: Value) -> Result<warp::reply::Response, Pr
 pub async fn handle_ollama_version() -> Result<warp::reply::Response, ProxyError> {
     let response = json!({
         "version": crate::VERSION,
-        "proxy": true,
-        "backend": "lmstudio"
+        "proxy_backend": "lmstudio"
     });
     Ok(json_response(&response))
 }
@@ -307,8 +451,8 @@ pub async fn handle_unsupported(endpoint: &str) -> Result<warp::reply::Response,
             "Use LM Studio for model operations"
         ),
         _ => (
-            "Endpoint requires direct Ollama functionality",
-            "This proxy focuses on inference operations"
+            "Endpoint requires direct Ollama functionality not available via this LM Studio proxy",
+            "This proxy focuses on inference and basic model listing operations"
         ),
     };
 
@@ -318,14 +462,12 @@ pub async fn handle_unsupported(endpoint: &str) -> Result<warp::reply::Response,
     )))
 }
 
-/// Enhanced health check that tests actual model availability
+/// Handle health check that tests actual model availability
 pub async fn handle_health_check(
     context: RequestContext<'_>,
     cancellation_token: CancellationToken,
 ) -> Result<Value, ProxyError> {
     let start_time = Instant::now();
-
-    // Basic connectivity test
     let url = format!("{}/v1/models", context.lmstudio_url);
     let request = CancellableRequest::new(context.clone(), cancellation_token.clone());
 
@@ -333,43 +475,40 @@ pub async fn handle_health_check(
         Ok(response) => {
             let status = response.status();
             let is_healthy = status.is_success();
+            let mut model_count = 0;
 
-            // If basic connectivity works, try to get model list
-            let model_count = if is_healthy {
+            if is_healthy {
                 match response.json::<Value>().await {
                     Ok(models_response) => {
-                        models_response
+                        model_count = models_response
                             .get("data")
                             .and_then(|d| d.as_array())
                             .map(|arr| arr.len())
-                            .unwrap_or(0)
-                    },
-                    Err(_) => 0,
+                            .unwrap_or(0);
+                    }
+                    Err(_) => {}
                 }
-            } else {
-                0
-            };
+            }
 
             let duration_ms = start_time.elapsed().as_millis();
-
             Ok(json!({
                 "status": if is_healthy { "healthy" } else { "unhealthy" },
                 "lmstudio_url": context.lmstudio_url,
                 "http_status": status.as_u16(),
-                "models_available": model_count,
+                "models_known_to_lmstudio": model_count,
                 "response_time_ms": duration_ms,
                 "timestamp": chrono::Utc::now().to_rfc3339(),
                 "proxy_version": crate::VERSION
             }))
-        },
+        }
         Err(e) if e.is_cancelled() => Err(ProxyError::request_cancelled()),
-        Err(_) => {
+        Err(e) => {
             let duration_ms = start_time.elapsed().as_millis();
-
             Ok(json!({
                 "status": "unreachable",
                 "lmstudio_url": context.lmstudio_url,
-                "error": ERROR_LM_STUDIO_UNAVAILABLE,
+                "error_message": e.message,
+                "error_details": ERROR_LM_STUDIO_UNAVAILABLE,
                 "response_time_ms": duration_ms,
                 "timestamp": chrono::Utc::now().to_rfc3339(),
                 "proxy_version": crate::VERSION
@@ -385,7 +524,7 @@ mod tests {
 
     #[test]
     fn test_extract_model_name_validation() {
-        let valid_body = json!({"model": "llama3.2:7b"});
+        let valid_body = json!({"model": "llama3.1:8b"});
         assert!(extract_model_name(&valid_body, "model").is_ok());
 
         let invalid_body = json!({"prompt": "hello"});
@@ -397,7 +536,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_ollama_show() {
-        let body = json!({"model": "llama3.2:7b"});
+        let body = json!({"model": "qwen2:7b-instruct-q4_k_m"});
         let result = handle_ollama_show(body).await;
         assert!(result.is_ok());
     }
@@ -409,16 +548,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_ollama_ps() {
-        let result = handle_ollama_ps().await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
     async fn test_handle_unsupported() {
         let result = handle_unsupported("/api/create").await;
         assert!(result.is_err());
-
         if let Err(e) = result {
             assert_eq!(e.status_code, 501);
             assert!(e.message.contains("not supported"));

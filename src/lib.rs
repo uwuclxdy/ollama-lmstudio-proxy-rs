@@ -1,4 +1,4 @@
-// src/lib.rs - Enhanced module organization with metrics and runtime configuration
+/// src/lib.rs - Main library file, re-exporting core modules and constants
 
 // Core modules
 pub mod constants;
@@ -16,8 +16,10 @@ pub use model::{ModelInfo, ModelResolver, clean_model_name};
 pub use common::RequestContext;
 pub use metrics::{MetricsCollector, get_global_metrics, init_global_metrics};
 
-/// Version information
+/// Version information for the application
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Name of the application
 pub const NAME: &str = env!("CARGO_PKG_NAME");
 
 /// Re-export runtime configuration functions
@@ -42,7 +44,7 @@ pub use constants::{
     DEFAULT_TOP_K,
     DEFAULT_REPEAT_PENALTY,
 
-    // Error messages (static str for efficiency)
+    // Error messages
     ERROR_MISSING_MODEL,
     ERROR_MISSING_MESSAGES,
     ERROR_MISSING_PROMPT,
