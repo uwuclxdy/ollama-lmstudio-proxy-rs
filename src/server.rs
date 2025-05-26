@@ -364,7 +364,6 @@ impl ProxyServer {
 
         let final_routes = app_routes.recover(handle_rejection).with(log_filter);
 
-        log_info("Starting server...");
         warp::serve(final_routes).run(addr).await;
         Ok(())
     }
@@ -374,23 +373,23 @@ impl ProxyServer {
         if is_logging_enabled() {
             println!();
             println!("✨ Ollama <-> LM Studio Proxy - Version: {} ✨", crate::VERSION);
-            println!();
-            println!("📡 Listening on: {}", self.config.listen);
-            println!("🔗 LM Studio URL: {}", self.config.lmstudio_url);
-            println!("📝 Logging: {}", if is_logging_enabled() { "Enabled" } else { "Disabled" });
-            println!("⏱️  Model Load Timeout: {}s", self.config.load_timeout_seconds);
-            println!("🕒 Model Resolution Cache TTL: {}s", self.config.model_resolution_cache_ttl_seconds);
-            println!("📊 Initial SSE Buffer: {} bytes", self.config.max_buffer_size);
-            println!("🔄 Chunk Recovery: {}",
-                     if get_runtime_config().enable_chunk_recovery { "Enabled" } else { "Disabled" });
-            println!("🔌 API Mode: {}",
-                     if self.config.legacy { "Legacy (OpenAI-compatible)" } else { "LM Studio REST API - beta" });
+            println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+            // Configuration information
+            println!("📡 | Listening on: {}", self.config.listen);
+            println!("🔗 | LM Studio URL: {}", self.config.lmstudio_url);
+            println!("📝 | Logging: {}", if is_logging_enabled() { "Enabled" } else { "Disabled" });
+            println!("⏱️ | Model Load Timeout: {}s", self.config.load_timeout_seconds);
+            println!("⏱️ | Cache TTL: {}s", self.config.model_resolution_cache_ttl_seconds);
+            println!("📊 | Initial SSE Buffer: {} bytes", self.config.max_buffer_size);
+            println!("🔄 | Chunk Recovery: {}", if get_runtime_config().enable_chunk_recovery { "Enabled" } else { "Disabled" });
+            println!("🔌 | API Mode: {}", if self.config.legacy { "Legacy (OpenAI-compatible)" } else { "LM Studio REST API - beta" });
             if !self.config.legacy {
-                println!("   • Requires LM Studio 0.3.6+ (use --legacy for older versions)");
+                println!("     • Requires LM Studio 0.3.6+ (use --legacy for older versions)");
             }
-            println!();
-            println!("ℹ️  Proxy forwards all requests and timing to LM Studio backend.");
-            println!();
+
+            println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            println!("ℹ️ | Proxy forwards all requests and timing to LM Studio backend.");
         }
     }
 }
