@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 use crate::check_cancelled;
 use crate::common::{CancellableRequest, RequestContext};
 use crate::constants::ERROR_LM_STUDIO_UNAVAILABLE;
-use crate::model::clean_model_name;
+use crate::model_legacy::clean_model_name_legacy;
 use crate::utils::{is_model_loading_error, log_error, log_info, log_warning, ProxyError};
 
 #[derive(Serialize)]
@@ -30,7 +30,7 @@ pub async fn trigger_model_loading(
     ollama_model_name: &str,
     cancellation_token: CancellationToken,
 ) -> Result<bool, ProxyError> {
-    let cleaned_ollama_model_for_logging = clean_model_name(ollama_model_name);
+    let cleaned_ollama_model_for_logging = clean_model_name_legacy(ollama_model_name);
     let model_for_lm_studio_trigger = cleaned_ollama_model_for_logging;
 
     let url = format!("{}/v1/chat/completions", context.lmstudio_url);

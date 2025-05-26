@@ -1,4 +1,4 @@
-/// src/constants.rs - Runtime configurable constants and static values
+/// src/constants.rs - Runtime configurable constants and static values with native API support
 
 use std::sync::OnceLock;
 
@@ -37,6 +37,18 @@ pub fn get_runtime_config() -> &'static RuntimeConfig {
     })
 }
 
+/// Legacy OpenAI-compatible endpoints
+pub const LM_STUDIO_LEGACY_MODELS: &str = "/v1/models";
+pub const LM_STUDIO_LEGACY_CHAT: &str = "/v1/chat/completions";
+pub const LM_STUDIO_LEGACY_COMPLETIONS: &str = "/v1/completions";
+pub const LM_STUDIO_LEGACY_EMBEDDINGS: &str = "/v1/embeddings";
+
+/// Native LM Studio API endpoints
+pub const LM_STUDIO_NATIVE_MODELS: &str = "/api/v0/models";
+pub const LM_STUDIO_NATIVE_CHAT: &str = "/api/v0/chat/completions";
+pub const LM_STUDIO_NATIVE_COMPLETIONS: &str = "/api/v0/completions";
+pub const LM_STUDIO_NATIVE_EMBEDDINGS: &str = "/api/v0/embeddings";
+
 /// Timing and performance constants
 pub const TOKEN_TO_CHAR_RATIO: f64 = 0.25;
 pub const DEFAULT_LOAD_DURATION_NS: u64 = 1_000_000;
@@ -73,6 +85,7 @@ pub const ERROR_TIMEOUT: &str = "Stream timeout";
 pub const ERROR_CANCELLED: &str = "Request cancelled by client";
 pub const ERROR_LM_STUDIO_UNAVAILABLE: &str = "LM Studio not available";
 pub const ERROR_REQUEST_TOO_LARGE: &str = "Request body too large";
+pub const ERROR_NATIVE_API_UNAVAILABLE: &str = "LM Studio native API not available - use --legacy flag for older versions";
 
 /// SSE parsing constants
 pub const SSE_DATA_PREFIX: &str = "data: ";

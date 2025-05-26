@@ -1,4 +1,4 @@
-/// src/server.rs - High-performance server with concurrent request support
+/// src/server.rs - High-performance server with native and legacy LM Studio API support
 use clap::Parser;
 use moka::future::Cache;
 use serde_json::Value;
@@ -15,7 +15,7 @@ use crate::constants::*;
 use crate::handlers;
 use crate::handlers::json_response;
 use crate::model::ModelResolver;
-// Added
+use crate::model_legacy::ModelResolverLegacy;
 use crate::utils::{
     init_global_logger, is_logging_enabled, log_error, log_info, validate_config, ProxyError,
 };
@@ -33,6 +33,9 @@ pub struct Config {
         help = "LM Studio backend URL"
     )]
     pub lmstudio_url: String,
+
+    #[arg(long, help = "Use legacy OpenAI-compatible API instead of native LM Studio API")]
+    pub legacy: bool,
 
     #[arg(long, help = "Disable logging output")]
     pub no_log: bool,
@@ -56,25 +59,25 @@ pub struct Config {
 
     #[arg(
         long,
-        default_value = "300", // 5 minutes
+        default_value = "300",
         help = "TTL for model resolution cache in seconds"
     )]
     pub model_resolution_cache_ttl_seconds: u64,
 }
 
-/// Production-ready proxy server with concurrent request support
+/// Enum to hold either native or legacy model resolver
+#[derive(Clone)]
+pub enum ModelResolverType {
+    Native(Arc<ModelResolver>),
+    Legacy(Arc<ModelResolverLegacy>),
+}
+
+/// Production-ready proxy server with dual API support
 #[derive(Clone)]
 pub struct ProxyServer {
     pub client: reqwest::Client,
     pub config: Arc<Config>,
-    pub model_resolver: Arc<ModelResolver>, // Added
-}
-
-/// Wrapper for ollama show handler
-async fn handle_ollama_show_rejection_wrapper(body: Value) -> Result<impl Reply, Rejection> {
-    handlers::ollama::handle_ollama_show(body)
-        .await
-        .map_err(warp::reject::custom)
+    pub model_resolver: ModelResolverType,
 }
 
 /// Wrapper for ollama version handler
@@ -85,7 +88,7 @@ async fn handle_ollama_version_rejection_wrapper() -> Result<impl Reply, Rejecti
 }
 
 impl ProxyServer {
-    /// Create new proxy server instance
+    /// Create new proxy server instance with API selection
     pub fn new(config: Config) -> Result<Self, Box<dyn std::error::Error>> {
         validate_config(&config)?;
 
@@ -113,10 +116,20 @@ impl ProxyServer {
             ))
             .build();
 
-        let model_resolver = Arc::new(ModelResolver::new(
-            config.lmstudio_url.clone(),
-            model_cache,
-        ));
+        // Choose resolver based on legacy flag
+        let model_resolver = if config.legacy {
+            log_info("Using legacy OpenAI-compatible API mode");
+            ModelResolverType::Legacy(Arc::new(ModelResolverLegacy::new_legacy(
+                config.lmstudio_url.clone(),
+                model_cache,
+            )))
+        } else {
+            log_info("Using native LM Studio API mode");
+            ModelResolverType::Native(Arc::new(ModelResolver::new(
+                config.lmstudio_url.clone(),
+                model_cache,
+            )))
+        };
 
         Ok(Self {
             client,
@@ -180,7 +193,7 @@ impl ProxyServer {
                     lmstudio_url: &s.config.lmstudio_url,
                 };
                 let token = CancellationToken::new();
-                handlers::ollama::handle_ollama_tags(context, token)
+                handlers::ollama::handle_ollama_tags(context, s.model_resolver.clone(), token)
                     .await
                     .map_err(warp::reject::custom)
             });
@@ -198,7 +211,7 @@ impl ProxyServer {
                 let config_ref = s.config.as_ref();
                 handlers::ollama::handle_ollama_chat(
                     context,
-                    s.model_resolver.clone(), // Pass ModelResolver
+                    s.model_resolver.clone(),
                     body,
                     token,
                     config_ref,
@@ -220,7 +233,7 @@ impl ProxyServer {
                 let config_ref = s.config.as_ref();
                 handlers::ollama::handle_ollama_generate(
                     context,
-                    s.model_resolver.clone(), // Pass ModelResolver
+                    s.model_resolver.clone(),
                     body,
                     token,
                     config_ref,
@@ -243,10 +256,10 @@ impl ProxyServer {
                 let token = CancellationToken::new();
                 handlers::ollama::handle_ollama_embeddings(
                     context,
-                    s.model_resolver.clone(), // Pass ModelResolver
+                    s.model_resolver.clone(),
                     body,
                     token,
-                    s.config.as_ref(), // Pass config for load_timeout_seconds
+                    s.config.as_ref(),
                 )
                     .await
                     .map_err(warp::reject::custom)
@@ -255,7 +268,12 @@ impl ProxyServer {
         let ollama_show_route = warp::path!("api" / "show")
             .and(warp::post())
             .and(warp::body::json())
-            .and_then(handle_ollama_show_rejection_wrapper);
+            .and(with_server_state.clone())
+            .and_then(|body: Value, s: Arc<ProxyServer>| async move {
+                handlers::ollama::handle_ollama_show(body, s.model_resolver.clone())
+                    .await
+                    .map_err(warp::reject::custom)
+            });
 
         let ollama_ps_route = warp::path!("api" / "ps")
             .and(warp::get())
@@ -266,7 +284,7 @@ impl ProxyServer {
                     lmstudio_url: &s.config.lmstudio_url,
                 };
                 let token = CancellationToken::new();
-                handlers::ollama::handle_ollama_ps(context, token)
+                handlers::ollama::handle_ollama_ps(context, s.model_resolver.clone(), token)
                     .await
                     .map_err(warp::reject::custom)
             });
@@ -297,7 +315,7 @@ impl ProxyServer {
                     let full_path = format!("/v1/{}", tail.as_str());
                     handlers::lmstudio::handle_lmstudio_passthrough(
                         context,
-                        s.model_resolver.clone(), // Pass ModelResolver
+                        s.model_resolver.clone(),
                         method.as_str(),
                         &full_path,
                         body,
@@ -355,42 +373,24 @@ impl ProxyServer {
     fn print_startup_banner(&self) {
         if is_logging_enabled() {
             println!();
-            println!("------------------------------------------------------");
-            println!("Ollama <-> LM Studio Proxy - Version: {}", crate::VERSION);
-            println!("------------------------------------------------------");
-            println!(" Listening on: {}", self.config.listen);
-            println!(" LM Studio URL: {}", self.config.lmstudio_url);
-            println!(
-                " Logging: {}",
-                if is_logging_enabled() {
-                    "Enabled"
-                } else {
-                    "Disabled"
-                }
-            );
-            println!(
-                " Model Load Timeout: {}s",
-                self.config.load_timeout_seconds
-            );
-            println!(
-                " Model Resolution Cache TTL: {}s",
-                self.config.model_resolution_cache_ttl_seconds
-            );
-            println!(
-                " Initial SSE Buffer: {} bytes",
-                self.config.max_buffer_size
-            );
-            println!(
-                " Chunk Recovery: {}",
-                if get_runtime_config().enable_chunk_recovery {
-                    "Enabled"
-                } else {
-                    "Disabled"
-                }
-            );
-            println!("------------------------------------------------------");
-            println!(" INFO: Proxy forwards all requests and timing to LM Studio backend.");
-            println!("------------------------------------------------------");
+            println!("✨ Ollama <-> LM Studio Proxy - Version: {} ✨", crate::VERSION);
+            println!();
+            println!("📡 Listening on: {}", self.config.listen);
+            println!("🔗 LM Studio URL: {}", self.config.lmstudio_url);
+            println!("📝 Logging: {}", if is_logging_enabled() { "Enabled" } else { "Disabled" });
+            println!("⏱️  Model Load Timeout: {}s", self.config.load_timeout_seconds);
+            println!("🕒 Model Resolution Cache TTL: {}s", self.config.model_resolution_cache_ttl_seconds);
+            println!("📊 Initial SSE Buffer: {} bytes", self.config.max_buffer_size);
+            println!("🔄 Chunk Recovery: {}",
+                     if get_runtime_config().enable_chunk_recovery { "Enabled" } else { "Disabled" });
+            println!("🔌 API Mode: {}",
+                     if self.config.legacy { "Legacy (OpenAI-compatible)" } else { "LM Studio REST API - beta" });
+            if !self.config.legacy {
+                println!("   • Requires LM Studio 0.3.6+ (use --legacy for older versions)");
+            }
+            println!();
+            println!("ℹ️  Proxy forwards all requests and timing to LM Studio backend.");
+            println!();
         }
     }
 }

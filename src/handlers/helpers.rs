@@ -1,4 +1,4 @@
-/// src/handlers/helpers.rs - Helper functions for request/response transformation and timing.
+/// src/handlers/helpers.rs - Enhanced request/response transformation with native API support
 
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
@@ -28,7 +28,7 @@ pub fn json_response(value: &Value) -> warp::reply::Response {
         })
 }
 
-/// Consolidated timing information for Ollama responses
+/// Enhanced timing information for Ollama responses with native API support
 #[derive(Debug, Clone)]
 pub struct TimingInfo {
     pub total_duration: u64,
@@ -40,8 +40,68 @@ pub struct TimingInfo {
 }
 
 impl TimingInfo {
-    /// Calculate timing from token counts and duration
-    pub fn calculate(
+    /// Calculate timing from native LM Studio stats (preferred when available)
+    pub fn from_native_stats(
+        lm_response: &Value,
+        estimated_input_tokens: u64,
+        estimated_output_tokens: u64,
+    ) -> Self {
+        // Extract real stats from native API response
+        if let Some(stats) = lm_response.get("stats") {
+            let generation_time = stats
+                .get("generation_time")
+                .and_then(|t| t.as_f64())
+                .unwrap_or(0.001); // Default to 1 ms to avoid division by zero
+
+            let time_to_first_token = stats
+                .get("time_to_first_token")
+                .and_then(|t| t.as_f64())
+                .unwrap_or(0.1);
+
+            // Extract actual token counts from usage
+            let actual_prompt_tokens = lm_response
+                .get("usage")
+                .and_then(|u| u.get("prompt_tokens"))
+                .and_then(|t| t.as_u64())
+                .unwrap_or(estimated_input_tokens);
+
+            let actual_completion_tokens = lm_response
+                .get("usage")
+                .and_then(|u| u.get("completion_tokens"))
+                .and_then(|t| t.as_u64())
+                .unwrap_or(estimated_output_tokens);
+
+            // Convert seconds to nanoseconds
+            let generation_time_ns = (generation_time * 1_000_000_000.0) as u64;
+            let ttft_ns = (time_to_first_token * 1_000_000_000.0) as u64;
+
+            // Calculate more accurate timing breakdown
+            let prompt_eval_duration_ns = ttft_ns.max(1);
+            let eval_duration_ns = generation_time_ns.saturating_sub(ttft_ns).max(1);
+            let total_duration_ns = generation_time_ns.max(prompt_eval_duration_ns + eval_duration_ns);
+
+            return Self {
+                total_duration: total_duration_ns,
+                load_duration: DEFAULT_LOAD_DURATION_NS,
+                prompt_eval_count: actual_prompt_tokens.max(1),
+                prompt_eval_duration: prompt_eval_duration_ns,
+                eval_count: actual_completion_tokens.max(1),
+                eval_duration: eval_duration_ns,
+            };
+        }
+
+        // Fallback to legacy calculation if native stats not available
+        Self::calculate_legacy(
+            Instant::now(),
+            estimated_input_tokens,
+            estimated_output_tokens,
+            lm_response.get("usage").and_then(|u| u.get("prompt_tokens")).and_then(|t| t.as_u64()),
+            lm_response.get("usage").and_then(|u| u.get("completion_tokens")).and_then(|t| t.as_u64()),
+        )
+    }
+
+    /// Calculate timing from token counts and duration (legacy method)
+    pub fn calculate_legacy(
         start_time: Instant,
         input_tokens_estimate: u64,
         output_tokens_estimate: u64,
@@ -76,44 +136,53 @@ impl TimingInfo {
         }
     }
 
-    /// Calculate timing from text content
+    /// Calculate timing from text content (legacy fallback)
     pub fn from_text_content(start_time: Instant, input_text: &str, output_text: &str) -> Self {
         let input_tokens = estimate_token_count(input_text);
         let output_tokens = estimate_token_count(output_text);
-        Self::calculate(start_time, input_tokens, output_tokens, None, None)
+        Self::calculate_legacy(start_time, input_tokens, output_tokens, None, None)
     }
 
-    /// Calculate timing from message count
+    /// Calculate timing from message count (legacy fallback)
     pub fn from_message_count(start_time: Instant, message_count: usize, output_text: &str) -> Self {
         let input_tokens = (message_count * 10).max(1) as u64;
         let output_tokens = estimate_token_count(output_text);
-        Self::calculate(start_time, input_tokens, output_tokens, None, None)
+        Self::calculate_legacy(start_time, input_tokens, output_tokens, None, None)
     }
 }
 
-/// Transform LM Studio responses to Ollama format
+/// Enhanced response transformer with native API support
 pub struct ResponseTransformer;
 
 impl ResponseTransformer {
-    /// Transform LM Studio chat response to Ollama format
+    /// Transform LM Studio chat response to Ollama format with native API support
     pub fn convert_to_ollama_chat(
         lm_response: &Value,
         model_ollama_name: &str,
         message_count_for_estimation: usize,
         start_time: Instant,
+        use_native_stats: bool,
     ) -> Value {
         let content = Self::extract_chat_content_with_reasoning(lm_response);
 
-        let actual_prompt_tokens = lm_response.get("usage").and_then(|u| u.get("prompt_tokens")).and_then(|t| t.as_u64());
-        let actual_completion_tokens = lm_response.get("usage").and_then(|u| u.get("completion_tokens")).and_then(|t| t.as_u64());
+        let timing = if use_native_stats {
+            TimingInfo::from_native_stats(
+                lm_response,
+                (message_count_for_estimation * 10).max(1) as u64,
+                estimate_token_count(&content),
+            )
+        } else {
+            let actual_prompt_tokens = lm_response.get("usage").and_then(|u| u.get("prompt_tokens")).and_then(|t| t.as_u64());
+            let actual_completion_tokens = lm_response.get("usage").and_then(|u| u.get("completion_tokens")).and_then(|t| t.as_u64());
 
-        let timing = TimingInfo::calculate(
-            start_time,
-            (message_count_for_estimation * 10).max(1) as u64,
-            estimate_token_count(&content),
-            actual_prompt_tokens,
-            actual_completion_tokens,
-        );
+            TimingInfo::calculate_legacy(
+                start_time,
+                (message_count_for_estimation * 10).max(1) as u64,
+                estimate_token_count(&content),
+                actual_prompt_tokens,
+                actual_completion_tokens,
+            )
+        };
 
         let mut ollama_message = json!({
             "role": "assistant",
@@ -146,25 +215,34 @@ impl ResponseTransformer {
         })
     }
 
-    /// Transform LM Studio completion response to Ollama format
+    /// Transform LM Studio completion response to Ollama format with native API support
     pub fn convert_to_ollama_generate(
         lm_response: &Value,
         model_ollama_name: &str,
         prompt_for_estimation: &str,
         start_time: Instant,
+        use_native_stats: bool,
     ) -> Value {
         let content = Self::extract_completion_content(lm_response);
 
-        let actual_prompt_tokens = lm_response.get("usage").and_then(|u| u.get("prompt_tokens")).and_then(|t| t.as_u64());
-        let actual_completion_tokens = lm_response.get("usage").and_then(|u| u.get("completion_tokens")).and_then(|t| t.as_u64());
+        let timing = if use_native_stats {
+            TimingInfo::from_native_stats(
+                lm_response,
+                estimate_token_count(prompt_for_estimation),
+                estimate_token_count(&content),
+            )
+        } else {
+            let actual_prompt_tokens = lm_response.get("usage").and_then(|u| u.get("prompt_tokens")).and_then(|t| t.as_u64());
+            let actual_completion_tokens = lm_response.get("usage").and_then(|u| u.get("completion_tokens")).and_then(|t| t.as_u64());
 
-        let timing = TimingInfo::calculate(
-            start_time,
-            estimate_token_count(prompt_for_estimation),
-            estimate_token_count(&content),
-            actual_prompt_tokens,
-            actual_completion_tokens,
-        );
+            TimingInfo::calculate_legacy(
+                start_time,
+                estimate_token_count(prompt_for_estimation),
+                estimate_token_count(&content),
+                actual_prompt_tokens,
+                actual_completion_tokens,
+            )
+        };
 
         json!({
             "model": model_ollama_name,
@@ -181,26 +259,31 @@ impl ResponseTransformer {
         })
     }
 
-    /// Transform LM Studio embeddings response to Ollama format
+    /// Transform LM Studio embeddings response to Ollama format with native API support
     pub fn convert_to_ollama_embeddings(
         lm_response: &Value,
         model_ollama_name: &str,
         start_time: Instant,
+        use_native_stats: bool,
     ) -> Value {
         let embeddings = Self::extract_embeddings(lm_response);
-
-        let actual_prompt_tokens = lm_response.get("usage").and_then(|u| u.get("prompt_tokens")).and_then(|t| t.as_u64());
 
         let estimated_input_tokens = 10;
         let estimated_output_tokens = embeddings.len().max(1) as u64;
 
-        let timing = TimingInfo::calculate(
-            start_time,
-            estimated_input_tokens,
-            estimated_output_tokens,
-            actual_prompt_tokens,
-            None,
-        );
+        let timing = if use_native_stats {
+            TimingInfo::from_native_stats(lm_response, estimated_input_tokens, estimated_output_tokens)
+        } else {
+            let actual_prompt_tokens = lm_response.get("usage").and_then(|u| u.get("prompt_tokens")).and_then(|t| t.as_u64());
+
+            TimingInfo::calculate_legacy(
+                start_time,
+                estimated_input_tokens,
+                estimated_output_tokens,
+                actual_prompt_tokens,
+                None,
+            )
+        };
 
         json!({
             "model": model_ollama_name,
@@ -257,7 +340,7 @@ impl ResponseTransformer {
     }
 }
 
-/// Build LM Studio request from Ollama parameters
+/// Build LM Studio request from Ollama parameters with enhanced parameter mapping
 pub fn build_lm_studio_request(
     model_lm_studio_id: &str,
     request_type: LMStudioRequestType,
@@ -344,7 +427,7 @@ pub fn extract_content_from_chunk(chunk: &Value) -> Option<String> {
         })
 }
 
-/// Create Ollama streaming chunk
+/// Create Ollama streaming chunk with enhanced metadata support
 pub fn create_ollama_streaming_chunk(
     model_ollama_name: &str,
     content: &str,
@@ -396,14 +479,14 @@ pub fn create_error_chunk(model_ollama_name: &str, error_message: &str, is_chat_
     chunk
 }
 
-/// Create cancellation chunk with timing
+/// Create cancellation chunk with enhanced timing
 pub fn create_cancellation_chunk(
     model_ollama_name: &str,
     duration: Duration,
     tokens_generated_estimate: u64,
     is_chat_endpoint: bool,
 ) -> Value {
-    let timing = TimingInfo::calculate(Instant::now() - duration, 10, tokens_generated_estimate, None, Some(tokens_generated_estimate));
+    let timing = TimingInfo::calculate_legacy(Instant::now() - duration, 10, tokens_generated_estimate, None, Some(tokens_generated_estimate));
 
     let mut chunk = create_ollama_streaming_chunk(model_ollama_name, "", is_chat_endpoint, true, None);
 
@@ -433,14 +516,14 @@ pub fn create_cancellation_chunk(
     chunk
 }
 
-/// Create final completion chunk for streaming
+/// Create final completion chunk for streaming with enhanced timing
 pub fn create_final_chunk(
     model_ollama_name: &str,
     duration: Duration,
     chunk_count_for_token_estimation: u64,
     is_chat_endpoint: bool,
 ) -> Value {
-    let timing = TimingInfo::calculate(
+    let timing = TimingInfo::calculate_legacy(
         Instant::now() - duration,
         10,
         chunk_count_for_token_estimation.max(1),
@@ -467,7 +550,7 @@ fn estimate_token_count(text: &str) -> u64 {
     ((text.len() as f64) * TOKEN_TO_CHAR_RATIO).ceil() as u64
 }
 
-/// Execute request with optional retry logic
+/// Execute request with optional retry logic (dual API support)
 pub async fn execute_request_with_retry<F, Fut, T>(
     context: &crate::common::RequestContext<'_>,
     model_name_for_retry_logic: &str,

@@ -1,93 +1,96 @@
-/// src/model.rs - Enhanced programmatic model handling with fixed calculations
+/// src/model.rs - Native LM Studio API model handling with real data
 use moka::future::Cache;
-// Added
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::common::CancellableRequest;
-// Removed RequestContext
 use crate::constants::*;
-use crate::utils::{log_info, ProxyError};
-// Added log_info
+use crate::utils::{log_info, log_warning, ProxyError};
 
-/// Enhanced model information with corrected calculations
+/// Native LM Studio model data from /api/v0/models
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NativeModelData {
+    pub id: String,
+    pub object: String,
+    #[serde(rename = "type")]
+    pub model_type: String,
+    pub publisher: Option<String>,
+    pub arch: String,
+    pub compatibility_type: String,
+    pub quantization: String,
+    pub state: String,
+    pub max_context_length: u64,
+}
+
+/// Native LM Studio models response
+#[derive(Debug, Deserialize)]
+pub struct NativeModelsResponse {
+    pub object: String,
+    pub data: Vec<NativeModelData>,
+}
+
+/// Enhanced model information using real LM Studio data
 #[derive(Debug, Clone)]
 pub struct ModelInfo {
-    pub id_from_lm_studio: String,
+    pub id: String,
     pub ollama_name: String,
-    pub family: String,
-    pub parameter_size_str: String,
-    pub size_bytes: u64,
-    pub architecture: String,
-    pub quantization_level: String,
+    pub model_type: String,
+    pub publisher: String,
+    pub arch: String,
+    pub compatibility_type: String,
+    pub quantization: String,
+    pub state: String,
+    pub max_context_length: u64,
+    pub is_loaded: bool,
 }
 
 impl ModelInfo {
-    /// Create model info programmatically from an LM Studio model ID
-    pub fn from_lm_studio_id(lm_studio_id: &str) -> Self {
-        let lower_id = lm_studio_id.to_lowercase();
-
-        let family = extract_model_family(&lower_id);
-        let (parameter_size_str, size_bytes) = extract_model_size(&lower_id);
-        let architecture = extract_architecture(&lower_id, &family);
-        let quantization_level = extract_quantization_level(&lower_id);
-
-        let ollama_name = if lm_studio_id.contains(':') {
-            lm_studio_id.to_string()
+    /// Create model info from native LM Studio data
+    pub fn from_native_data(native_data: &NativeModelData) -> Self {
+        let is_loaded = native_data.state == "loaded";
+        let ollama_name = if native_data.id.contains(':') {
+            native_data.id.clone()
         } else {
-            format!("{}:latest", lm_studio_id)
+            format!("{}:latest", native_data.id)
         };
 
         Self {
-            id_from_lm_studio: lm_studio_id.to_string(),
+            id: native_data.id.clone(),
             ollama_name,
-            family,
-            parameter_size_str,
-            size_bytes,
-            architecture,
-            quantization_level,
+            model_type: native_data.model_type.clone(),
+            publisher: native_data.publisher.clone().unwrap_or_else(|| "unknown".to_string()),
+            arch: native_data.arch.clone(),
+            compatibility_type: native_data.compatibility_type.clone(),
+            quantization: native_data.quantization.clone(),
+            state: native_data.state.clone(),
+            max_context_length: native_data.max_context_length,
+            is_loaded,
         }
     }
 
-    /// Determine model capabilities based on name and family
+    /// Determine model capabilities based on type and architecture
     fn determine_capabilities(&self) -> Vec<String> {
         let mut caps = Vec::new();
-        let lower_name = self.ollama_name.to_lowercase();
-        let lower_family = self.family.to_lowercase();
 
-        caps.push("completion".to_string());
-
-        if lower_name.contains("instruct")
-            || lower_name.contains("chat")
-            || lower_family.contains("instruct")
-            || lower_family.contains("chat")
-        {
-            if !caps.contains(&"chat".to_string()) {
-                caps.push("chat".to_string());
+        match self.model_type.as_str() {
+            "llm" => {
+                caps.push("completion".to_string());
+                if self.arch.contains("instruct") || self.id.contains("instruct") || self.id.contains("chat") {
+                    caps.push("chat".to_string());
+                }
             }
-        }
-
-        if lower_name.contains("llava")
-            || lower_name.contains("vision")
-            || lower_name.contains("bakllava")
-            || lower_family.contains("llava")
-            || lower_family.contains("vision")
-            || lower_family.contains("bakllava")
-        {
-            if !caps.contains(&"vision".to_string()) {
+            "vlm" => {
+                caps.push("completion".to_string());
+                caps.push("chat".to_string());
                 caps.push("vision".to_string());
             }
-        }
-
-        if lower_family == "embedding" || lower_name.contains("embed") {
-            if !caps.contains(&"embedding".to_string()) {
+            "embeddings" => {
                 caps.push("embedding".to_string());
             }
-        }
-
-        // Ensure completion capability for chat models
-        if caps.contains(&"chat".to_string()) && !caps.contains(&"completion".to_string()) {
-            caps.push("completion".to_string());
+            _ => {
+                caps.push("completion".to_string());
+            }
         }
 
         if caps.is_empty() {
@@ -97,52 +100,97 @@ impl ModelInfo {
         caps
     }
 
+    /// Calculate estimated file size based on architecture and quantization
+    fn calculate_estimated_size(&self) -> u64 {
+        // Extract parameter count from model ID if possible
+        let lower_id = self.id.to_lowercase();
+        let base_params: u64 = if lower_id.contains("0.5b") || lower_id.contains("500m") {
+            500_000_000
+        } else if lower_id.contains("1b") && !lower_id.contains("11b") {
+            1_000_000_000
+        } else if lower_id.contains("2b") && !lower_id.contains("22b") {
+            2_000_000_000
+        } else if lower_id.contains("3b") && !lower_id.contains("13b") {
+            3_000_000_000
+        } else if lower_id.contains("7b") {
+            7_000_000_000
+        } else if lower_id.contains("8b") {
+            8_000_000_000
+        } else if lower_id.contains("13b") {
+            13_000_000_000
+        } else if lower_id.contains("70b") {
+            70_000_000_000
+        } else {
+            4_000_000_000 // Default estimate
+        };
+
+        // Apply quantization factor
+        let multiplier = match self.quantization.to_lowercase().as_str() {
+            q if q.contains("2bit") || q.contains("q2") => 0.35,
+            q if q.contains("3bit") || q.contains("q3") => 0.45,
+            q if q.contains("4bit") || q.contains("q4") => 0.55,
+            q if q.contains("5bit") || q.contains("q5") => 0.65,
+            q if q.contains("6bit") || q.contains("q6") => 0.75,
+            q if q.contains("8bit") || q.contains("q8") => 1.0,
+            q if q.contains("f16") || q.contains("fp16") => 2.0,
+            q if q.contains("f32") || q.contains("fp32") => 4.0,
+            _ => 0.55, // Default to Q4 estimate
+        };
+
+        ((base_params as f64) * multiplier) as u64
+    }
+
     /// Generate Ollama-compatible model entry for /api/tags
     pub fn to_ollama_tags_model(&self) -> Value {
+        let estimated_size = self.calculate_estimated_size();
+
         json!({
             "name": self.ollama_name,
             "model": self.ollama_name,
             "modified_at": chrono::Utc::now().to_rfc3339(),
-            "size": self.size_bytes,
+            "size": estimated_size,
             "digest": format!("{:x}", md5::compute(self.ollama_name.as_bytes())),
             "details": {
                 "parent_model": "",
-                "format": "gguf",
-                "family": self.family,
-                "families": if self.family.is_empty() { json!([]) } else { json!([self.family]) },
-                "parameter_size": self.parameter_size_str,
-                "quantization_level": self.quantization_level
+                "format": self.compatibility_type,
+                "family": self.arch,
+                "families": [self.arch],
+                "parameter_size": self.extract_parameter_size_string(),
+                "quantization_level": self.quantization
             }
         })
     }
 
-    /// Generate Ollama-compatible model entry for /api/ps
+    /// Generate Ollama-compatible model entry for /api/ps (running models)
     pub fn to_ollama_ps_model(&self) -> Value {
+        let estimated_size = self.calculate_estimated_size();
+
         json!({
             "name": self.ollama_name,
             "model": self.ollama_name,
-            "size": self.size_bytes,
+            "size": estimated_size,
             "digest": format!("{:x}", md5::compute(self.ollama_name.as_bytes())),
             "details": {
                 "parent_model": "",
-                "format": "gguf",
-                "family": self.family,
-                "families": if self.family.is_empty() { json!([]) } else { json!([self.family]) },
-                "parameter_size": self.parameter_size_str,
-                "quantization_level": self.quantization_level
+                "format": self.compatibility_type,
+                "family": self.arch,
+                "families": [self.arch],
+                "parameter_size": self.extract_parameter_size_string(),
+                "quantization_level": self.quantization
             },
             "expires_at": (chrono::Utc::now() + chrono::Duration::minutes(DEFAULT_KEEP_ALIVE_MINUTES)).to_rfc3339(),
-            "size_vram": self.size_bytes
+            "size_vram": estimated_size
         })
     }
 
     /// Generate model show response for /api/show
     pub fn to_show_response(&self) -> Value {
-        let model_info_details = self.create_fabricated_model_info_details();
+        let estimated_size = self.calculate_estimated_size();
         let capabilities = self.determine_capabilities();
+        let param_size_str = self.extract_parameter_size_string();
 
         json!({
-            "modelfile": format!("# Modelfile for {}\nFROM {} # (Fabricated by proxy)\n\nPARAMETER temperature {}\nPARAMETER top_p {}\nPARAMETER top_k {}\n\nTEMPLATE \"\"\"{{ if .System }}{{ .System }} {{ end }}{{ .Prompt }}\"\"\"",
+            "modelfile": format!("# Modelfile for {}\nFROM {} # (Real data from LM Studio)\n\nPARAMETER temperature {}\nPARAMETER top_p {}\nPARAMETER top_k {}\n\nTEMPLATE \"\"\"{{ if .System }}{{ .System }} {{ end }}{{ .Prompt }}\"\"\"",
                 self.ollama_name, self.ollama_name, DEFAULT_TEMPERATURE, DEFAULT_TOP_P, DEFAULT_TOP_K
             ),
             "parameters": format!("temperature {}\ntop_p {}\ntop_k {}\nrepeat_penalty {}",
@@ -150,326 +198,52 @@ impl ModelInfo {
             "template": "{{ if .System }}{{ .System }}\\n{{ end }}{{ .Prompt }}",
             "details": {
                 "parent_model": "",
-                "format": "gguf",
-                "family": self.family,
-                "families": if self.family.is_empty() { json!([]) } else { json!([self.family]) },
-                "parameter_size": self.parameter_size_str,
-                "quantization_level": self.quantization_level
+                "format": self.compatibility_type,
+                "family": self.arch,
+                "families": [self.arch],
+                "parameter_size": param_size_str,
+                "quantization_level": self.quantization
             },
-            "model_info": model_info_details,
+            "model_info": {
+                "general.architecture": self.arch,
+                "general.file_type": 2,
+                "general.quantization_version": 2,
+                "lmstudio.publisher": self.publisher,
+                "lmstudio.model_type": self.model_type,
+                "lmstudio.state": self.state,
+                "lmstudio.max_context_length": self.max_context_length,
+                "lmstudio.compatibility_type": self.compatibility_type
+            },
             "capabilities": capabilities,
             "digest": format!("{:x}", md5::compute(self.ollama_name.as_bytes())),
-            "size": self.size_bytes,
+            "size": estimated_size,
             "modified_at": chrono::Utc::now().to_rfc3339()
         })
     }
 
-    /// Create the nested "model_info" object for /api/show with fabricated details
-    fn create_fabricated_model_info_details(&self) -> Value {
-        let mut model_info = json!({
-            "general.architecture": self.architecture,
-            "general.file_type": 2,
-            "general.parameter_count": self.size_bytes / estimate_bytes_per_parameter(&self.quantization_level),
-            "general.quantization_version": 2,
-        });
+    /// Extract parameter size string from model ID
+    fn extract_parameter_size_string(&self) -> String {
+        let lower_id = self.id.to_lowercase();
 
-        let arch_params = self.get_base_architecture_params();
-        if let Some(obj) = model_info.as_object_mut() {
-            if let Some(base_obj) = arch_params.as_object() {
-                for (key, value) in base_obj {
-                    obj.insert(key.clone(), value.clone());
-                }
-            }
+        if lower_id.contains("0.5b") || lower_id.contains("500m") {
+            "0.5B".to_string()
+        } else if lower_id.contains("1b") && !lower_id.contains("11b") {
+            "1B".to_string()
+        } else if lower_id.contains("2b") && !lower_id.contains("22b") {
+            "2B".to_string()
+        } else if lower_id.contains("3b") && !lower_id.contains("13b") {
+            "3B".to_string()
+        } else if lower_id.contains("7b") {
+            "7B".to_string()
+        } else if lower_id.contains("8b") {
+            "8B".to_string()
+        } else if lower_id.contains("13b") {
+            "13B".to_string()
+        } else if lower_id.contains("70b") {
+            "70B".to_string()
+        } else {
+            "unknown".to_string()
         }
-
-        if let Some(obj) = model_info.as_object_mut() {
-            obj.insert(
-                "tokenizer.ggml.model".to_string(),
-                json!(self.family.split('-').next().unwrap_or("unknown")),
-            );
-            obj.insert("tokenizer.ggml.tokens_count".to_string(), json!(32000));
-            obj.insert("tokenizer.ggml.token_type_count".to_string(), json!(1));
-            obj.insert("tokenizer.ggml.bos_token_id".to_string(), json!(1));
-            obj.insert("tokenizer.ggml.eos_token_id".to_string(), json!(2));
-            obj.insert("tokenizer.ggml.unknown_token_id".to_string(), json!(0));
-            obj.insert("tokenizer.ggml.padding_token_id".to_string(), json!(null));
-            obj.insert("tokenizer.ggml.merges".to_string(), json!([]));
-            obj.insert("tokenizer.ggml.tokens".to_string(), json!([]));
-            obj.insert("tokenizer.ggml.token_type".to_string(), json!([]));
-            obj.insert(
-                "tokenizer.ggml.pre".to_string(),
-                json!(self.architecture.to_lowercase()),
-            );
-        }
-
-        model_info
-    }
-
-    /// Get base parameters for specific architectures
-    fn get_base_architecture_params(&self) -> Value {
-        match self.architecture.as_str() {
-            "llama" => json!({
-                "llama.attention.head_count": 32,
-                "llama.attention.head_count_kv": 8,
-                "llama.block_count": 32,
-                "llama.embedding_length": 4096,
-                "llama.context_length": if self.parameter_size_str.contains("8b") || self.parameter_size_str.contains("3.1") || self.parameter_size_str.contains("32k") || self.parameter_size_str.contains("128k") || self.parameter_size_str.contains("8192") { 8192 } else { 4096 },
-                "llama.rope.dimension_count": 128,
-                "llama.attention.layer_norm_rms_epsilon": 1e-5,
-                "llama.rope.freq_base": if self.ollama_name.contains("codellama") { 1_000_000.0 } else { 10_000.0 },
-                "llama.vocab_size": 32000,
-            }),
-            "qwen2" => json!({
-                "qwen2.attention.head_count": 32,
-                "qwen2.attention.head_count_kv": if self.parameter_size_str.contains("0.5b") { 4 } else { 8 },
-                "qwen2.block_count": if self.parameter_size_str.contains("0.5b") { 24 } else { 28 },
-                "qwen2.embedding_length": if self.parameter_size_str.contains("0.5b") { 1024 } else { 3584 },
-                "qwen2.context_length": 32768,
-                "qwen2.attention.layer_norm_rms_epsilon": 1e-6,
-                "qwen2.feed_forward_length": if self.parameter_size_str.contains("0.5b") { 2816 } else { 9728 },
-                "qwen2.rope.freq_base": 1_000_000.0,
-                "qwen2.vocab_size": 151936,
-            }),
-            "mistral" | "mixtral" => json!({
-                "mistral.attention.head_count": 32,
-                "mistral.attention.head_count_kv": 8,
-                "mistral.block_count": 32,
-                "mistral.embedding_length": 4096,
-                "mistral.context_length": 32768,
-                "mistral.attention.layer_norm_rms_epsilon": 1e-5,
-                "mistral.feed_forward_length": 14336,
-                "mistral.rope.dimension_count": 128,
-                "mistral.rope.freq_base": 1_000_000.0,
-                "mistral.vocab_size": 32000,
-            }),
-            "gemma" => json!({
-                "gemma.attention.head_count": if self.parameter_size_str.contains("2b") {8} else {16},
-                "gemma.attention.head_count_kv": 1,
-                "gemma.block_count": if self.parameter_size_str.contains("2b") {18} else {28},
-                "gemma.embedding_length": if self.parameter_size_str.contains("2b") {2048} else {3072},
-                "gemma.context_length": 8192,
-                "gemma.attention.layer_norm_rms_epsilon": 1e-6,
-                "gemma.feed_forward_length": if self.parameter_size_str.contains("2b") {16384} else {24576},
-                "gemma.vocab_size": 256000,
-            }),
-            _ => json!({})
-        }
-    }
-}
-
-/// FIXED: Helper to estimate bytes per parameter based on quantization
-fn estimate_bytes_per_parameter(quant_level: &str) -> u64 {
-    let q_lower = quant_level.to_lowercase();
-    // Corrected estimates for effective bytes per parameter
-    if q_lower.contains("q2") {
-        3 // Q2_K uses ~2.5-3 bytes per parameter
-    } else if q_lower.contains("q3") {
-        4 // Q3_K uses ~3.5-4 bytes per parameter
-    } else if q_lower.contains("q4") {
-        5 // Q4_K uses ~4.5-5 bytes per parameter
-    } else if q_lower.contains("q5") {
-        6 // Q5_K uses ~5.5-6 bytes per parameter
-    } else if q_lower.contains("q6") {
-        7 // Q6_K uses ~6.5-7 bytes per parameter
-    } else if q_lower.contains("q8") {
-        9 // Q8_0 uses ~8.5-9 bytes per parameter
-    } else if q_lower.contains("f16") {
-        16 // F16 uses 2 bytes per weight + overhead
-    } else if q_lower.contains("f32") {
-        32 // F32 uses 4 bytes per weight + overhead
-    } else {
-        5 // Default to Q4-level estimate
-    }
-}
-
-/// Extract model family from name programmatically
-fn extract_model_family(name: &str) -> String {
-    const FAMILY_PATTERNS: &[(&str, &str)] = &[
-        ("llama", "llama"),
-        ("codellama", "llama"),
-        ("qwen", "qwen2"),
-        ("mistral", "mistral"),
-        ("mixtral", "mixtral"),
-        ("deepseek-coder", "deepseek"),
-        ("deepseek-moe", "deepseek"),
-        ("deepseek-llm", "deepseek"),
-        ("deepseek", "deepseek"),
-        ("gemma", "gemma"),
-        ("phi", "phi"),
-        ("starcoder", "starcoder"),
-        ("stablelm", "stablelm"),
-        ("command-r", "cohere"),
-        ("cohere", "cohere"),
-        ("all-minilm", "embedding"),
-        ("nomic-embed", "embedding"),
-        ("bge-", "embedding"),
-        ("gte-", "embedding"),
-        ("embed", "embedding"),
-    ];
-
-    for (pattern, family) in FAMILY_PATTERNS {
-        if name.contains(pattern) {
-            return family.to_string();
-        }
-    }
-    name.split(&['-', ':', '/'][..])
-        .next()
-        .unwrap_or("unknown")
-        .to_string()
-}
-
-/// Extract model architecture from name and family
-fn extract_architecture(name: &str, family: &str) -> String {
-    match family {
-        "llama" | "deepseek" | "mixtral" | "stablelm" => return "llama".to_string(),
-        "qwen2" => return "qwen2".to_string(),
-        "mistral" => return "mistral".to_string(),
-        "gemma" => return "gemma".to_string(),
-        "phi" => return "phi".to_string(),
-        "starcoder" => return "gpt_bigcode".to_string(),
-        "cohere" => return "cohere".to_string(),
-        "embedding" => return "bert".to_string(),
-        _ => {}
-    }
-    if name.contains("qwen") {
-        return "qwen2".to_string();
-    }
-    if name.contains("llama") || name.contains("codellama") {
-        return "llama".to_string();
-    }
-    if name.contains("mistral") || name.contains("mixtral") {
-        return "mistral".to_string();
-    }
-
-    if !family.is_empty() && family != "unknown" {
-        family.to_string()
-    } else {
-        "transformer".to_string()
-    }
-}
-
-/// Extract model size programmatically
-fn extract_model_size(name: &str) -> (String, u64) {
-    const SIZE_PATTERNS: &[(&str, &str, u64)] = &[
-        ("0.5b", "0.5B", 500_000_000),
-        ("500m", "0.5B", 500_000_000),
-        ("1.5b", "1.5B", 1_500_000_000),
-        ("1b5", "1.5B", 1_500_000_000),
-        ("1.6b", "1.6B", 1_600_000_000),
-        ("1.8b", "1.8B", 1_800_000_000),
-        ("2.7b", "2.7B", 2_700_000_000),
-        ("2b7", "2.7B", 2_700_000_000),
-        ("3.1b", "3.1B", 3_100_000_000),
-        ("3.8b", "3.8B", 3_800_000_000),
-        ("1b", "1B", 1_000_000_000),
-        ("2b", "2B", 2_000_000_000),
-        ("3b", "3B", 3_000_000_000),
-        ("4b", "4B", 4_000_000_000),
-        ("6b", "6B", 6_000_000_000),
-        ("7b", "7B", 7_000_000_000),
-        ("8b", "8B", 8_000_000_000),
-        ("9b", "9B", 9_000_000_000),
-        ("11b", "11B", 11_000_000_000),
-        ("13b", "13B", 13_000_000_000),
-        ("14b", "14B", 14_000_000_000),
-        ("15b", "15B", 15_000_000_000),
-        ("16b", "16B", 16_000_000_000),
-        ("20b", "20B", 20_000_000_000),
-        ("22b", "22B", 22_000_000_000),
-        ("30b", "30B", 30_000_000_000),
-        ("32b", "32B", 32_000_000_000),
-        ("34b", "34B", 34_000_000_000),
-        ("40b", "40B", 40_000_000_000),
-        ("65b", "65B", 65_000_000_000),
-        ("70b", "70B", 70_000_000_000),
-        ("72b", "72B", 72_000_000_000),
-        ("8x7b", "56B", 56_000_000_000),
-        ("8x22b", "176B", 176_000_000_000),
-        ("120b", "120B", 120_000_000_000),
-        ("128b", "128B", 128_000_000_000),
-        ("175b", "175B", 175_000_000_000),
-        ("180b", "180B", 180_000_000_000),
-        ("405b", "405B", 405_000_000_000),
-    ];
-
-    for (pattern, size_str, size_bytes_val) in SIZE_PATTERNS {
-        if name.contains(pattern) {
-            // Adjust size based on quantization
-            let quant = extract_quantization_level(name);
-            let multiplier = match quant.as_str() {
-                "Q2_K" | "Q2_K_S" => 0.35,
-                "Q3_K_S" | "Q3_K_M" | "Q3_K_L" => 0.45,
-                "Q4_0" | "Q4_1" => 0.5,
-                "Q4_K_S" | "Q4_K_M" => 0.55,
-                "Q5_0" | "Q5_1" => 0.625,
-                "Q5_K_S" | "Q5_K_M" => 0.675,
-                "Q6_K" => 0.75,
-                "Q8_0" => 1.0,
-                "F16" => 2.0,
-                "F32" => 4.0,
-                _ => 0.55,
-            };
-            let estimated_file_size = (*size_bytes_val as f64 * multiplier) as u64;
-
-            return (size_str.to_string(), estimated_file_size.max(100_000_000));
-        }
-    }
-    ("unknown".to_string(), DEFAULT_MODEL_SIZE_BYTES)
-}
-
-/// Extract quantization level programmatically
-fn extract_quantization_level(name: &str) -> String {
-    const QUANT_PATTERNS: &[(&str, &str)] = &[
-        ("q2_k_s", "Q2_K_S"),
-        ("q2_k", "Q2_K"),
-        ("q3_k_s", "Q3_K_S"),
-        ("q3_k_m", "Q3_K_M"),
-        ("q3_k_l", "Q3_K_L"),
-        ("q3_k", "Q3_K"),
-        ("q4_0", "Q4_0"),
-        ("q4_1", "Q4_1"),
-        ("q4_k_s", "Q4_K_S"),
-        ("q4_k_m", "Q4_K_M"),
-        ("q4_k", "Q4_K"),
-        ("q5_0", "Q5_0"),
-        ("q5_1", "Q5_1"),
-        ("q5_k_s", "Q5_K_S"),
-        ("q5_k_m", "Q5_K_M"),
-        ("q5_k", "Q5_K"),
-        ("q6_k", "Q6_K"),
-        ("q8_0", "Q8_0"),
-        ("q8_1", "Q8_1"),
-        ("q8_k_s", "Q8_K_S"),
-        ("q8_k", "Q8_K"),
-        ("iq1_s", "IQ1_S"),
-        ("iq1_m", "IQ1_M"),
-        ("iq2_xs", "IQ2_XS"),
-        ("iq2_s", "IQ2_S"),
-        ("iq2_m", "IQ2_M"),
-        ("iq2_xxs", "IQ2_XXS"),
-        ("iq3_s", "IQ3_S"),
-        ("iq3_m", "IQ3_M"),
-        ("iq3_xs", "IQ3_XS"),
-        ("iq3_xxs", "IQ3_XXS"),
-        ("iq4_xs", "IQ4_XS"),
-        ("iq4_nl", "IQ4_NL"),
-        ("bpw", "BPW"),
-        ("f16", "F16"),
-        ("fp16", "F16"),
-        ("f32", "F32"),
-        ("fp32", "F32"),
-        ("gguf", "GGUF"),
-    ];
-
-    for (pattern, quant) in QUANT_PATTERNS {
-        if name.contains(pattern) {
-            return quant.to_string();
-        }
-    }
-    if name.contains("gguf") {
-        "Q4_K_M".to_string()
-    } else {
-        "unknown".to_string()
     }
 }
 
@@ -492,14 +266,14 @@ pub fn clean_model_name(name: &str) -> &str {
     after_latest
 }
 
-/// ModelResolver for handling model resolution with LM Studio
+/// ModelResolver for handling model resolution with native LM Studio API
 pub struct ModelResolver {
     lmstudio_url: String,
     cache: Cache<String, String>,
 }
 
 impl ModelResolver {
-    /// Create new model resolver
+    /// Create new model resolver for native API
     pub fn new(lmstudio_url: String, cache: Cache<String, String>) -> Self {
         Self {
             lmstudio_url,
@@ -507,11 +281,11 @@ impl ModelResolver {
         }
     }
 
-    /// Direct model resolution with fail-fast approach and caching
+    /// Direct model resolution using native API with strict error handling
     pub async fn resolve_model_name(
         &self,
         ollama_model_name_requested: &str,
-        client: &reqwest::Client, // Client passed in
+        client: &reqwest::Client,
         cancellation_token: CancellationToken,
     ) -> Result<String, ProxyError> {
         let cleaned_ollama_request = clean_model_name(ollama_model_name_requested).to_string();
@@ -519,52 +293,77 @@ impl ModelResolver {
         // Check cache first
         if let Some(cached_lm_studio_id) = self.cache.get(&cleaned_ollama_request).await {
             log_info(&format!(
-                "Cache hit for model resolution: '{}' -> '{}'",
+                "Cache hit for native model resolution: '{}' -> '{}'",
                 cleaned_ollama_request, cached_lm_studio_id
             ));
             return Ok(cached_lm_studio_id);
         }
 
         log_info(&format!(
-            "Cache miss for model resolution: '{}'. Fetching from LM Studio.",
+            "Cache miss for native model resolution: '{}'. Fetching from LM Studio native API.",
             cleaned_ollama_request
         ));
 
         match self
-            .get_available_lm_studio_models(client, cancellation_token)
+            .get_available_lm_studio_models_native(client, cancellation_token)
             .await
         {
-            Ok(available_lm_studio_ids) => {
-                if let Some(matched_lm_studio_id) =
-                    self.find_best_match(&cleaned_ollama_request, &available_lm_studio_ids)
+            Ok(available_models) => {
+                if let Some(matched_model) =
+                    self.find_best_match_native(&cleaned_ollama_request, &available_models)
                 {
-                    // Store in cache on successful match
+                    // Check if model is loaded for strict error handling
+                    if !matched_model.is_loaded {
+                        log_warning(
+                            "Model resolution",
+                            &format!(
+                                "Model '{}' found but not loaded (state: {}). This may cause request failures.",
+                                matched_model.id, matched_model.state
+                            ),
+                        );
+                    }
+
                     self.cache
-                        .insert(cleaned_ollama_request.clone(), matched_lm_studio_id.clone())
+                        .insert(cleaned_ollama_request.clone(), matched_model.id.clone())
                         .await;
                     log_info(&format!(
-                        "Resolved and cached: '{}' -> '{}'",
-                        cleaned_ollama_request, matched_lm_studio_id
+                        "Resolved and cached (native): '{}' -> '{}' (state: {})",
+                        cleaned_ollama_request, matched_model.id, matched_model.state
                     ));
-                    Ok(matched_lm_studio_id)
+                    Ok(matched_model.id)
                 } else {
-                    // No match found, return original cleaned request (don't cache this "passthrough")
-                    Ok(cleaned_ollama_request)
+                    // Strict error handling - don't allow unknown models
+                    Err(ProxyError::not_found(&format!(
+                        "Model '{}' not found in LM Studio. Available models can be listed via /api/tags",
+                        cleaned_ollama_request
+                    )))
                 }
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                // Provide helpful error message for native API issues
+                if e.message.contains("404") || e.message.contains("not found") {
+                    Err(ProxyError::new(
+                        format!(
+                            "LM Studio native API not available. Please update to LM Studio 0.3.6+ or use --legacy flag. Original error: {}",
+                            e.message
+                        ),
+                        503,
+                    ))
+                } else {
+                    Err(e)
+                }
+            }
         }
     }
 
-    /// Get available models from LM Studio with fail-fast strategy
-    async fn get_available_lm_studio_models(
+    /// Get available models from LM Studio native API
+    async fn get_available_lm_studio_models_native(
         &self,
-        client: &reqwest::Client, // Client passed in
+        client: &reqwest::Client,
         cancellation_token: CancellationToken,
-    ) -> Result<Vec<String>, ProxyError> {
-        let url = format!("{}/v1/models", self.lmstudio_url);
+    ) -> Result<Vec<ModelInfo>, ProxyError> {
+        let url = format!("{}/api/v0/models", self.lmstudio_url);
 
-        // Create a temporary RequestContext for CancellableRequest
         let temp_context = crate::common::RequestContext {
             client,
             lmstudio_url: &self.lmstudio_url,
@@ -572,61 +371,58 @@ impl ModelResolver {
         let request = CancellableRequest::new(temp_context, cancellation_token);
 
         let response = request
-            .make_request(reqwest::Method::GET, &url, None::<Value>) // Specify type for None
+            .make_request(reqwest::Method::GET, &url, None::<Value>)
             .await?;
 
         if !response.status().is_success() {
             return Err(ProxyError::new(
                 format!(
-                    "{}: {}",
-                    ERROR_LM_STUDIO_UNAVAILABLE,
-                    response.status()
+                    "LM Studio native API error ({}): {}. Try --legacy flag for older LM Studio versions.",
+                    response.status(), ERROR_LM_STUDIO_UNAVAILABLE
                 ),
                 response.status().as_u16(),
             ));
         }
 
-        let models_response = response
-            .json::<Value>()
+        let native_response = response
+            .json::<NativeModelsResponse>()
             .await
             .map_err(|e| {
                 ProxyError::internal_server_error(&format!(
-                    "Invalid JSON from LM Studio /v1/models: {}",
+                    "Invalid JSON from LM Studio native API /api/v0/models: {}. Try --legacy flag.",
                     e
                 ))
             })?;
 
-        let mut model_ids = Vec::new();
-        if let Some(data) = models_response.get("data").and_then(|d| d.as_array()) {
-            for model_entry in data {
-                if let Some(model_id) = model_entry.get("id").and_then(|id| id.as_str()) {
-                    model_ids.push(model_id.to_string());
-                }
-            }
-        }
-        Ok(model_ids)
+        let models = native_response
+            .data
+            .iter()
+            .map(|native_data| ModelInfo::from_native_data(native_data))
+            .collect();
+
+        Ok(models)
     }
 
-    /// Enhanced model matching with better scoring
-    fn find_best_match(
+    /// Find best matching model using native model data
+    fn find_best_match_native(
         &self,
         ollama_name_cleaned: &str,
-        available_lm_studio_ids: &[String],
-    ) -> Option<String> {
+        available_models: &[ModelInfo],
+    ) -> Option<ModelInfo> {
         let lower_ollama = ollama_name_cleaned.to_lowercase();
 
         // Exact match first
-        for lm_id in available_lm_studio_ids {
-            if lm_id.to_lowercase() == lower_ollama {
-                return Some(lm_id.clone());
+        for model in available_models {
+            if model.id.to_lowercase() == lower_ollama {
+                return Some(model.clone());
             }
         }
 
         // Substring match
-        for lm_id in available_lm_studio_ids {
-            if lm_id.to_lowercase().contains(&lower_ollama) {
-                if lower_ollama.len() > lm_id.len() / 2 || lower_ollama.len() > 10 {
-                    return Some(lm_id.clone());
+        for model in available_models {
+            if model.id.to_lowercase().contains(&lower_ollama) {
+                if lower_ollama.len() > model.id.len() / 2 || lower_ollama.len() > 10 {
+                    return Some(model.clone());
                 }
             }
         }
@@ -634,30 +430,25 @@ impl ModelResolver {
         // Enhanced scoring match
         let mut best_match = None;
         let mut best_score = 0;
-        for lm_id in available_lm_studio_ids {
-            let score = self.calculate_enhanced_match_score(&lower_ollama, &lm_id.to_lowercase());
+        for model in available_models {
+            let score = self.calculate_match_score_native(&lower_ollama, model);
             if score > best_score && score >= 3 {
                 best_score = score;
-                best_match = Some(lm_id.clone());
+                best_match = Some(model.clone());
             }
         }
 
-        if best_match.is_none()
-            && ollama_name_cleaned.contains('/')
-            && ollama_name_cleaned.to_lowercase().ends_with(".gguf")
-        {
-            return Some(ollama_name_cleaned.to_string());
-        }
         best_match
     }
 
-    /// Enhanced match scoring algorithm
-    fn calculate_enhanced_match_score(&self, ollama_name: &str, lm_name: &str) -> usize {
+    /// Calculate match score using native model data
+    fn calculate_match_score_native(&self, ollama_name: &str, model: &ModelInfo) -> usize {
+        let model_name_lower = model.id.to_lowercase();
         let ollama_parts: Vec<&str> = ollama_name
             .split(&['-', '_', ':', '.', '/', ' '])
             .filter(|s| !s.is_empty() && s.len() > 1)
             .collect();
-        let lm_parts: Vec<&str> = lm_name
+        let model_parts: Vec<&str> = model_name_lower
             .split(&['-', '_', ':', '.', '/', ' '])
             .filter(|s| !s.is_empty() && s.len() > 1)
             .collect();
@@ -666,35 +457,61 @@ impl ModelResolver {
 
         // Part matching
         for ollama_part in &ollama_parts {
-            for lm_part in &lm_parts {
-                if ollama_part == lm_part {
-                    score += ollama_part.len() * 2; // exact part
-                } else if lm_part.contains(ollama_part) || ollama_part.contains(lm_part) {
-                    score += ollama_part.len().min(lm_part.len()); // partial match
+            for model_part in &model_parts {
+                if ollama_part == model_part {
+                    score += ollama_part.len() * 2; // Exact part match
+                } else if model_part.contains(ollama_part) || ollama_part.contains(model_part) {
+                    score += ollama_part.len().min(model_part.len()); // Partial match
                 }
             }
         }
 
-        // Family matching bonus
-        let ollama_family = extract_model_family(ollama_name);
-        let lm_family = extract_model_family(lm_name);
-        if ollama_family == lm_family && ollama_family != "unknown" {
+        // Architecture matching bonus
+        if model.arch.to_lowercase().contains(&ollama_name.to_lowercase()) {
             score += 5;
         }
 
-        // Size matching bonus
-        let (ollama_size_str, _) = extract_model_size(ollama_name);
-        let (lm_size_str, _) = extract_model_size(lm_name);
-        if ollama_size_str == lm_size_str && ollama_size_str != "unknown" {
+        // Model type matching bonus
+        if model.model_type == "llm" && (ollama_name.contains("chat") || ollama_name.contains("instruct")) {
+            score += 3;
+        }
+        if model.model_type == "vlm" && (ollama_name.contains("vision") || ollama_name.contains("llava")) {
+            score += 3;
+        }
+        if model.model_type == "embeddings" && ollama_name.contains("embed") {
             score += 3;
         }
 
+        // Loaded model bonus (prefer loaded models)
+        if model.is_loaded {
+            score += 2;
+        }
+
         // Prefix matching bonus
-        let cleaned_lm_name = lm_name.split('/').last().unwrap_or(lm_name);
-        if cleaned_lm_name.starts_with(ollama_name) {
+        if model_name_lower.starts_with(ollama_name) {
             score += ollama_name.len();
         }
 
         score
+    }
+
+    /// Get all available models (for /api/tags and /api/ps)
+    pub async fn get_all_models(
+        &self,
+        client: &reqwest::Client,
+        cancellation_token: CancellationToken,
+    ) -> Result<Vec<ModelInfo>, ProxyError> {
+        self.get_available_lm_studio_models_native(client, cancellation_token)
+            .await
+    }
+
+    /// Get only loaded models (for /api/ps)
+    pub async fn get_loaded_models(
+        &self,
+        client: &reqwest::Client,
+        cancellation_token: CancellationToken,
+    ) -> Result<Vec<ModelInfo>, ProxyError> {
+        let all_models = self.get_all_models(client, cancellation_token).await?;
+        Ok(all_models.into_iter().filter(|m| m.is_loaded).collect())
     }
 }
