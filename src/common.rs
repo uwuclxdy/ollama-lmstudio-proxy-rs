@@ -1,5 +1,6 @@
 /// src/common.rs - Enhanced infrastructure with centralized logging
-
+use serde::Serialize;
+// Added
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -27,11 +28,11 @@ impl<'a> CancellableRequest<'a> {
     }
 
     /// Make a cancellable HTTP request with proper error handling
-    pub async fn make_request(
+    pub async fn make_request<B: Serialize>( // Changed body type to generic B: Serialize
         &self,
         method: reqwest::Method,
         url: &str,
-        body: Option<Value>,
+        body: Option<B>, // Body is now Option<B>
     ) -> Result<reqwest::Response, ProxyError> {
         check_cancelled!(self.token);
 
@@ -40,7 +41,7 @@ impl<'a> CancellableRequest<'a> {
         if let Some(body_content) = body {
             request_builder = request_builder
                 .header("Content-Type", CONTENT_TYPE_JSON)
-                .json(&body_content);
+                .json(&body_content); // reqwest::RequestBuilder::json takes &T where T: Serialize
         }
 
         // Race request against cancellation
@@ -165,17 +166,24 @@ impl Default for RequestBuilder {
 }
 
 /// Common parameter mapping for LM Studio requests
-pub fn map_ollama_to_lmstudio_params(ollama_options: Option<&Value>) -> serde_json::Map<String, Value> {
+pub fn map_ollama_to_lmstudio_params(
+    ollama_options: Option<&Value>,
+) -> serde_json::Map<String, Value> {
     let mut params = serde_json::Map::new();
 
     if let Some(options) = ollama_options {
         // Direct parameter mappings
         const DIRECT_MAPPINGS: &[&str] = &[
-            "temperature", "top_p", "top_k", "presence_penalty",
-            "frequency_penalty", "seed", "stop"
+            "temperature",
+            "top_p",
+            "top_k",
+            "presence_penalty",
+            "frequency_penalty",
+            "seed",
+            "stop",
         ];
 
-        for &param in DIRECT_MAPPINGS {
+        for param in DIRECT_MAPPINGS {
             if let Some(value) = options.get(param) {
                 params.insert(param.to_string(), value.clone());
             }
@@ -188,10 +196,14 @@ pub fn map_ollama_to_lmstudio_params(ollama_options: Option<&Value>) -> serde_js
 
         if let Some(repeat_penalty_val) = options.get("repeat_penalty") {
             // Map to frequency_penalty
-            if !params.contains_key("frequency_penalty") && !params.contains_key("presence_penalty") {
+            if !params.contains_key("frequency_penalty") && !params.contains_key("presence_penalty")
+            {
                 params.insert("repeat_penalty".to_string(), repeat_penalty_val.clone());
             } else if !params.contains_key("frequency_penalty") {
-                params.insert("frequency_penalty".to_string(), repeat_penalty_val.clone());
+                params.insert(
+                    "frequency_penalty".to_string(),
+                    repeat_penalty_val.clone(),
+                );
             }
         }
 
@@ -205,7 +217,10 @@ pub fn map_ollama_to_lmstudio_params(ollama_options: Option<&Value>) -> serde_js
 }
 
 /// Utility function to merge JSON objects efficiently
-pub fn merge_json_objects(base: &mut serde_json::Map<String, Value>, overlay: serde_json::Map<String, Value>) {
+pub fn merge_json_objects(
+    base: &mut serde_json::Map<String, Value>,
+    overlay: serde_json::Map<String, Value>,
+) {
     for (key, value) in overlay {
         base.insert(key, value);
     }

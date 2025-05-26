@@ -16,3 +16,5 @@ bytes = "1.0"
 futures-util = "0.3.31"
 tokio-util = "0.7"
 url = "2.5.4"
+serde = { version = "1.0.219", features = ["derive"] }
+moka = { version = "0.12.10", features = ["future"] }

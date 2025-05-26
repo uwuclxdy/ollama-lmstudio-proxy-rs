@@ -1,10 +1,11 @@
 /// src/server.rs - High-performance server with concurrent request support
-
 use clap::Parser;
+use moka::future::Cache;
 use serde_json::Value;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use warp::log::Info as LogInfo;
 use warp::{Filter, Rejection, Reply};
@@ -13,7 +14,11 @@ use crate::common::RequestContext;
 use crate::constants::*;
 use crate::handlers;
 use crate::handlers::json_response;
-use crate::utils::{init_global_logger, is_logging_enabled, log_error, log_info, validate_config, ProxyError};
+use crate::model::ModelResolver;
+// Added
+use crate::utils::{
+    init_global_logger, is_logging_enabled, log_error, log_info, validate_config, ProxyError,
+};
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "ollama-lmstudio-proxy")]
@@ -22,7 +27,11 @@ pub struct Config {
     #[arg(long, default_value = "0.0.0.0:11434", help = "Server listen address")]
     pub listen: String,
 
-    #[arg(long, default_value = "http://localhost:1234", help = "LM Studio backend URL")]
+    #[arg(
+        long,
+        default_value = "http://localhost:1234",
+        help = "LM Studio backend URL"
+    )]
     pub lmstudio_url: String,
 
     #[arg(long, help = "Disable logging output")]
@@ -44,6 +53,13 @@ pub struct Config {
 
     #[arg(long, help = "Enable partial chunk recovery for streams")]
     pub enable_chunk_recovery: bool,
+
+    #[arg(
+        long,
+        default_value = "300", // 5 minutes
+        help = "TTL for model resolution cache in seconds"
+    )]
+    pub model_resolution_cache_ttl_seconds: u64,
 }
 
 /// Production-ready proxy server with concurrent request support
@@ -51,16 +67,21 @@ pub struct Config {
 pub struct ProxyServer {
     pub client: reqwest::Client,
     pub config: Arc<Config>,
+    pub model_resolver: Arc<ModelResolver>, // Added
 }
 
 /// Wrapper for ollama show handler
 async fn handle_ollama_show_rejection_wrapper(body: Value) -> Result<impl Reply, Rejection> {
-    handlers::ollama::handle_ollama_show(body).await.map_err(warp::reject::custom)
+    handlers::ollama::handle_ollama_show(body)
+        .await
+        .map_err(warp::reject::custom)
 }
 
 /// Wrapper for ollama version handler
 async fn handle_ollama_version_rejection_wrapper() -> Result<impl Reply, Rejection> {
-    handlers::ollama::handle_ollama_version().await.map_err(warp::reject::custom)
+    handlers::ollama::handle_ollama_version()
+        .await
+        .map_err(warp::reject::custom)
 }
 
 impl ProxyServer {
@@ -69,7 +90,11 @@ impl ProxyServer {
         validate_config(&config)?;
 
         let runtime_config = RuntimeConfig {
-            max_buffer_size: if config.max_buffer_size > 0 { config.max_buffer_size } else { usize::MAX },
+            max_buffer_size: if config.max_buffer_size > 0 {
+                config.max_buffer_size
+            } else {
+                usize::MAX
+            },
             max_partial_content_size: usize::MAX,
             string_buffer_size: 2048,
             enable_chunk_recovery: config.enable_chunk_recovery,
@@ -78,13 +103,25 @@ impl ProxyServer {
         init_global_logger(!config.no_log);
 
         let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(10))
             .pool_max_idle_per_host(10)
             .build()?;
+
+        let model_cache: Cache<String, String> = Cache::builder()
+            .time_to_live(Duration::from_secs(
+                config.model_resolution_cache_ttl_seconds,
+            ))
+            .build();
+
+        let model_resolver = Arc::new(ModelResolver::new(
+            config.lmstudio_url.clone(),
+            model_cache,
+        ));
 
         Ok(Self {
             client,
             config: Arc::new(config),
+            model_resolver,
         })
     }
 
@@ -92,7 +129,10 @@ impl ProxyServer {
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
         self.print_startup_banner();
 
-        let addr: SocketAddr = self.config.listen.parse()
+        let addr: SocketAddr = self
+            .config
+            .listen
+            .parse()
             .map_err(|e| format!("Invalid listen address '{}': {}", self.config.listen, e))?;
 
         let server_arc = Arc::new(self);
@@ -111,9 +151,15 @@ impl ProxyServer {
                         let mut buffer = buf_cell.borrow_mut();
                         buffer.clear();
                         use std::fmt::Write;
-                        let _ = write!(buffer, "{} {} {} | {} | {}",
-                                       status_icon, info.method(), info.path(), info.status(),
-                                       crate::utils::format_duration(info.elapsed()));
+                        let _ = write!(
+                            buffer,
+                            "{} {} {} | {} | {}",
+                            status_icon,
+                            info.method(),
+                            info.path(),
+                            info.status(),
+                            crate::utils::format_duration(info.elapsed())
+                        );
                         println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), buffer);
                     });
                 }
@@ -134,7 +180,9 @@ impl ProxyServer {
                     lmstudio_url: &s.config.lmstudio_url,
                 };
                 let token = CancellationToken::new();
-                handlers::ollama::handle_ollama_tags(context, token).await.map_err(warp::reject::custom)
+                handlers::ollama::handle_ollama_tags(context, token)
+                    .await
+                    .map_err(warp::reject::custom)
             });
 
         let ollama_chat_route = warp::path!("api" / "chat")
@@ -148,7 +196,15 @@ impl ProxyServer {
                 };
                 let token = CancellationToken::new();
                 let config_ref = s.config.as_ref();
-                handlers::ollama::handle_ollama_chat(context, body, token, config_ref).await.map_err(warp::reject::custom)
+                handlers::ollama::handle_ollama_chat(
+                    context,
+                    s.model_resolver.clone(), // Pass ModelResolver
+                    body,
+                    token,
+                    config_ref,
+                )
+                    .await
+                    .map_err(warp::reject::custom)
             });
 
         let ollama_generate_route = warp::path!("api" / "generate")
@@ -162,7 +218,15 @@ impl ProxyServer {
                 };
                 let token = CancellationToken::new();
                 let config_ref = s.config.as_ref();
-                handlers::ollama::handle_ollama_generate(context, body, token, config_ref).await.map_err(warp::reject::custom)
+                handlers::ollama::handle_ollama_generate(
+                    context,
+                    s.model_resolver.clone(), // Pass ModelResolver
+                    body,
+                    token,
+                    config_ref,
+                )
+                    .await
+                    .map_err(warp::reject::custom)
             });
 
         let ollama_embeddings_route = warp::path!("api" / "embeddings")
@@ -177,7 +241,15 @@ impl ProxyServer {
                     lmstudio_url: &s.config.lmstudio_url,
                 };
                 let token = CancellationToken::new();
-                handlers::ollama::handle_ollama_embeddings(context, body, token).await.map_err(warp::reject::custom)
+                handlers::ollama::handle_ollama_embeddings(
+                    context,
+                    s.model_resolver.clone(), // Pass ModelResolver
+                    body,
+                    token,
+                    s.config.as_ref(), // Pass config for load_timeout_seconds
+                )
+                    .await
+                    .map_err(warp::reject::custom)
             });
 
         let ollama_show_route = warp::path!("api" / "show")
@@ -194,7 +266,9 @@ impl ProxyServer {
                     lmstudio_url: &s.config.lmstudio_url,
                 };
                 let token = CancellationToken::new();
-                handlers::ollama::handle_ollama_ps(context, token).await.map_err(warp::reject::custom)
+                handlers::ollama::handle_ollama_ps(context, token)
+                    .await
+                    .map_err(warp::reject::custom)
             });
 
         let ollama_version_route = warp::path!("api" / "version")
@@ -204,17 +278,36 @@ impl ProxyServer {
         let lmstudio_passthrough_route = warp::path("v1")
             .and(warp::path::tail())
             .and(warp::method())
-            .and(warp::body::json().or(warp::any().map(|| Value::Null)).unify())
+            .and(
+                warp::body::json()
+                    .or(warp::any().map(|| Value::Null))
+                    .unify(),
+            )
             .and(with_server_state.clone())
-            .and_then(|tail: warp::path::Tail, method: warp::http::Method, body: Value, s: Arc<ProxyServer>| async move {
-                let context = RequestContext {
-                    client: &s.client,
-                    lmstudio_url: &s.config.lmstudio_url,
-                };
-                let token = CancellationToken::new();
-                let full_path = format!("/v1/{}", tail.as_str());
-                handlers::lmstudio::handle_lmstudio_passthrough(context, method.as_str(), &full_path, body, token).await.map_err(warp::reject::custom)
-            });
+            .and_then(
+                |tail: warp::path::Tail,
+                    method: warp::http::Method,
+                    body: Value,
+                    s: Arc<ProxyServer>| async move {
+                    let context = RequestContext {
+                        client: &s.client,
+                        lmstudio_url: &s.config.lmstudio_url,
+                    };
+                    let token = CancellationToken::new();
+                    let full_path = format!("/v1/{}", tail.as_str());
+                    handlers::lmstudio::handle_lmstudio_passthrough(
+                        context,
+                        s.model_resolver.clone(), // Pass ModelResolver
+                        method.as_str(),
+                        &full_path,
+                        body,
+                        token,
+                        s.config.load_timeout_seconds,
+                    )
+                        .await
+                        .map_err(warp::reject::custom)
+                },
+            );
 
         let health_route = warp::path("health")
             .and(warp::get())
@@ -234,10 +327,13 @@ impl ProxyServer {
         let unsupported_ollama_route = warp::path("api")
             .and(warp::path::full())
             .and_then(|path: warp::path::FullPath| async move {
-                handlers::ollama::handle_unsupported(path.as_str()).await.map_err(warp::reject::custom)
+                handlers::ollama::handle_unsupported(path.as_str())
+                    .await
+                    .map_err(warp::reject::custom)
             });
 
-        let app_routes = ollama_tags_route.boxed()
+        let app_routes = ollama_tags_route
+            .boxed()
             .or(ollama_chat_route.boxed())
             .or(ollama_generate_route.boxed())
             .or(ollama_embeddings_route.boxed())
@@ -248,11 +344,9 @@ impl ProxyServer {
             .or(health_route.boxed())
             .or(unsupported_ollama_route.boxed());
 
-        let final_routes = app_routes
-            .recover(handle_rejection)
-            .with(log_filter);
+        let final_routes = app_routes.recover(handle_rejection).with(log_filter);
 
-        log_info(&format!("Server starting: {addr}"));
+        log_info("Starting server...");
         warp::serve(final_routes).run(addr).await;
         Ok(())
     }
@@ -266,10 +360,34 @@ impl ProxyServer {
             println!("------------------------------------------------------");
             println!(" Listening on: {}", self.config.listen);
             println!(" LM Studio URL: {}", self.config.lmstudio_url);
-            println!(" Logging: {}", if is_logging_enabled() { "Enabled" } else { "Disabled" });
-            println!(" Model Load Timeout: {}s", self.config.load_timeout_seconds);
-            println!(" Initial SSE Buffer: {} bytes", self.config.max_buffer_size);
-            println!(" Chunk Recovery: {}", if get_runtime_config().enable_chunk_recovery { "Enabled" } else { "Disabled" });
+            println!(
+                " Logging: {}",
+                if is_logging_enabled() {
+                    "Enabled"
+                } else {
+                    "Disabled"
+                }
+            );
+            println!(
+                " Model Load Timeout: {}s",
+                self.config.load_timeout_seconds
+            );
+            println!(
+                " Model Resolution Cache TTL: {}s",
+                self.config.model_resolution_cache_ttl_seconds
+            );
+            println!(
+                " Initial SSE Buffer: {} bytes",
+                self.config.max_buffer_size
+            );
+            println!(
+                " Chunk Recovery: {}",
+                if get_runtime_config().enable_chunk_recovery {
+                    "Enabled"
+                } else {
+                    "Disabled"
+                }
+            );
             println!("------------------------------------------------------");
             println!(" INFO: Proxy forwards all requests and timing to LM Studio backend.");
             println!("------------------------------------------------------");
@@ -332,5 +450,8 @@ async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
         }
     });
 
-    Ok(warp::reply::with_status(warp::reply::json(&json_error), code))
+    Ok(warp::reply::with_status(
+        warp::reply::json(&json_error),
+        code,
+    ))
 }

@@ -1,6 +1,5 @@
 /// src/handlers/retry.rs - Fail-fast retry logic with model loading triggers.
-
-use serde_json::json;
+use serde::Serialize;
 use std::time::Duration;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
@@ -10,6 +9,20 @@ use crate::common::{CancellableRequest, RequestContext};
 use crate::constants::ERROR_LM_STUDIO_UNAVAILABLE;
 use crate::model::clean_model_name;
 use crate::utils::{is_model_loading_error, log_error, log_info, log_warning, ProxyError};
+
+#[derive(Serialize)]
+struct MinimalChatMessage<'a> {
+    role: &'a str,
+    content: &'a str,
+}
+
+#[derive(Serialize)]
+struct MinimalChatRequestPayload<'a> {
+    model: &'a str,
+    messages: Vec<MinimalChatMessage<'a>>,
+    max_tokens: u32,
+    stream: bool,
+}
 
 /// Trigger model loading via minimal request
 pub async fn trigger_model_loading(
@@ -21,32 +34,56 @@ pub async fn trigger_model_loading(
     let model_for_lm_studio_trigger = cleaned_ollama_model_for_logging;
 
     let url = format!("{}/v1/chat/completions", context.lmstudio_url);
-    let minimal_request_body = json!({
-        "model": model_for_lm_studio_trigger,
-        "messages": [{"role": "user", "content": "ping"}],
-        "max_tokens": 1,
-        "stream": false
-    });
+    let minimal_request_body = MinimalChatRequestPayload {
+        model: model_for_lm_studio_trigger,
+        messages: vec![MinimalChatMessage {
+            role: "user",
+            content: "ping",
+        }],
+        max_tokens: 1,
+        stream: false,
+    };
 
     let request = CancellableRequest::new(context.clone(), cancellation_token.clone());
-    log_info(&format!("Attempting to trigger load for model '{}' (as '{}') via minimal chat request.", ollama_model_name, model_for_lm_studio_trigger));
+    log_info(&format!(
+        "Attempting to trigger load for model '{}' (as '{}') via minimal chat request.",
+        ollama_model_name, model_for_lm_studio_trigger
+    ));
 
-    match request.make_request(reqwest::Method::POST, &url, Some(minimal_request_body)).await {
+    match request
+        .make_request(
+            reqwest::Method::POST,
+            &url,
+            Some(minimal_request_body), // Use struct here
+        )
+        .await
+    {
         Ok(response) => {
             let status = response.status();
             // Success or client error
             let trigger_considered_successful = status.is_success() || status.is_client_error();
 
             if !trigger_considered_successful {
-                log_warning("Model loading trigger", &format!("Trigger returned non-successful/non-client-error status: {}", status));
+                log_warning(
+                    "Model loading trigger",
+                    &format!(
+                        "Trigger returned non-successful/non-client-error status: {}",
+                        status
+                    ),
+                );
             } else {
-                log_info(&format!("Model loading trigger for '{}' completed with status: {}. Assuming model is loading/loaded.", ollama_model_name, status));
+                log_info(&format!(
+                    "Model loading trigger for '{}' completed with status: {}. Assuming model is loading/loaded.",
+                    ollama_model_name, status
+                ));
             }
             Ok(trigger_considered_successful)
         }
         Err(e) if e.is_cancelled() => Err(ProxyError::request_cancelled()),
         Err(e) if e.is_lm_studio_unavailable() => {
-            Err(ProxyError::lm_studio_unavailable(ERROR_LM_STUDIO_UNAVAILABLE))
+            Err(ProxyError::lm_studio_unavailable(
+                ERROR_LM_STUDIO_UNAVAILABLE,
+            ))
         }
         Err(e) => {
             log_error("Model loading trigger request failed", &e.message);
@@ -64,7 +101,13 @@ pub async fn trigger_model_loading_for_ollama(
     match trigger_model_loading(context, ollama_model_name, cancellation_token).await {
         Ok(true) => Ok(()),
         Ok(false) => {
-            log_warning("Model load hint", &format!("Trigger for '{}' returned false, proceeding with main request.", ollama_model_name));
+            log_warning(
+                "Model load hint",
+                &format!(
+                    "Trigger for '{}' returned false, proceeding with main request.",
+                    ollama_model_name
+                ),
+            );
             Ok(())
         }
         Err(e) => Err(e),
@@ -94,11 +137,22 @@ where
         }
         Err(e) => {
             if is_model_loading_error(&e.message) {
-                log_warning("Model operation failed (likely model not loaded)", &format!("Attempting to trigger load for model: {}", ollama_model_name));
+                log_warning(
+                    "Model operation failed (likely model not loaded)",
+                    &format!(
+                        "Attempting to trigger load for model: {}",
+                        ollama_model_name
+                    ),
+                );
 
-                match trigger_model_loading(context, ollama_model_name, cancellation_token.clone()).await {
+                match trigger_model_loading(context, ollama_model_name, cancellation_token.clone())
+                    .await
+                {
                     Ok(true) => {
-                        log_info(&format!("Model load triggered for {}. Waiting {}s before retry.", ollama_model_name, load_timeout_seconds));
+                        log_info(&format!(
+                            "Model load triggered for {}. Waiting {}s before retry.",
+                            ollama_model_name, load_timeout_seconds
+                        ));
                         tokio::select! {
                             _ = sleep(Duration::from_secs(load_timeout_seconds)) => {},
                             _ = cancellation_token.cancelled() => {
@@ -106,24 +160,42 @@ where
                             }
                         }
                         check_cancelled!(cancellation_token);
-                        log_info(&format!("Retrying operation for model: {}", ollama_model_name));
+                        log_info(&format!(
+                            "Retrying operation for model: {}",
+                            ollama_model_name
+                        ));
                         match operation().await {
                             Ok(result) => {
-                                log_info(&format!("Retry successful for model: {}", ollama_model_name));
+                                log_info(&format!(
+                                    "Retry successful for model: {}",
+                                    ollama_model_name
+                                ));
                                 Ok(result)
                             }
                             Err(retry_error) => {
-                                log_error(&format!("Retry failed for model: {}", ollama_model_name), &retry_error.message);
+                                log_error(
+                                    &format!("Retry failed for model: {}", ollama_model_name),
+                                    &retry_error.message,
+                                );
                                 Err(e) // Return original error
                             }
                         }
                     }
                     Ok(false) => {
-                        log_error("Model loading trigger", &format!("Failed to confirm model loading for {} or model may not exist. Original error: {}", ollama_model_name, e.message));
+                        log_error(
+                            "Model loading trigger",
+                            &format!(
+                                "Failed to confirm model loading for {} or model may not exist. Original error: {}",
+                                ollama_model_name, e.message
+                            ),
+                        );
                         Err(e)
                     }
                     Err(loading_trigger_error) => {
-                        log_error("Model loading trigger failed", &loading_trigger_error.message);
+                        log_error(
+                            "Model loading trigger failed",
+                            &loading_trigger_error.message,
+                        );
                         Err(loading_trigger_error)
                     }
                 }
@@ -155,18 +227,25 @@ pub async fn check_lm_studio_availability(
     let url = format!("{}/v1/models", context.lmstudio_url);
     let request = CancellableRequest::new(context.clone(), cancellation_token);
 
-    match request.make_request(reqwest::Method::GET, &url, None).await {
+    match request
+        .make_request(reqwest::Method::GET, &url, None::<serde_json::Value>)
+        .await
+    {
         Ok(response) => {
             if response.status().is_success() {
                 Ok(())
             } else {
-                Err(ProxyError::lm_studio_unavailable(
-                    &format!("LM Studio health check failed: {}", response.status())
-                ))
+                Err(ProxyError::lm_studio_unavailable(&format!(
+                    "LM Studio health check failed: {}",
+                    response.status()
+                )))
             }
         }
         Err(e) if e.is_cancelled() => Err(ProxyError::request_cancelled()),
-        Err(e) => Err(ProxyError::lm_studio_unavailable(&format!("{}: {}", ERROR_LM_STUDIO_UNAVAILABLE, e.message))),
+        Err(e) => Err(ProxyError::lm_studio_unavailable(&format!(
+            "{}: {}",
+            ERROR_LM_STUDIO_UNAVAILABLE, e.message
+        ))),
     }
 }
 
@@ -190,11 +269,10 @@ where
                 load_timeout_seconds,
                 operation,
                 cancellation_token,
-            ).await
+            )
+                .await
         }
-        None => {
-            with_simple_retry(operation, cancellation_token).await
-        }
+        None => with_simple_retry(operation, cancellation_token).await,
     }
 }
 

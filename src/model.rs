@@ -1,11 +1,14 @@
 /// src/model.rs - Enhanced programmatic model handling with fixed calculations
-
+use moka::future::Cache;
+// Added
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-use crate::common::{CancellableRequest, RequestContext};
+use crate::common::CancellableRequest;
+// Removed RequestContext
 use crate::constants::*;
-use crate::utils::ProxyError;
+use crate::utils::{log_info, ProxyError};
+// Added log_info
 
 /// Enhanced model information with corrected calculations
 #[derive(Debug, Clone)]
@@ -54,15 +57,23 @@ impl ModelInfo {
 
         caps.push("completion".to_string());
 
-        if lower_name.contains("instruct") || lower_name.contains("chat") ||
-            lower_family.contains("instruct") || lower_family.contains("chat") {
+        if lower_name.contains("instruct")
+            || lower_name.contains("chat")
+            || lower_family.contains("instruct")
+            || lower_family.contains("chat")
+        {
             if !caps.contains(&"chat".to_string()) {
                 caps.push("chat".to_string());
             }
         }
 
-        if lower_name.contains("llava") || lower_name.contains("vision") || lower_name.contains("bakllava") ||
-            lower_family.contains("llava") || lower_family.contains("vision") || lower_family.contains("bakllava") {
+        if lower_name.contains("llava")
+            || lower_name.contains("vision")
+            || lower_name.contains("bakllava")
+            || lower_family.contains("llava")
+            || lower_family.contains("vision")
+            || lower_family.contains("bakllava")
+        {
             if !caps.contains(&"vision".to_string()) {
                 caps.push("vision".to_string());
             }
@@ -172,7 +183,10 @@ impl ModelInfo {
         }
 
         if let Some(obj) = model_info.as_object_mut() {
-            obj.insert("tokenizer.ggml.model".to_string(), json!(self.family.split('-').next().unwrap_or("unknown")));
+            obj.insert(
+                "tokenizer.ggml.model".to_string(),
+                json!(self.family.split('-').next().unwrap_or("unknown")),
+            );
             obj.insert("tokenizer.ggml.tokens_count".to_string(), json!(32000));
             obj.insert("tokenizer.ggml.token_type_count".to_string(), json!(1));
             obj.insert("tokenizer.ggml.bos_token_id".to_string(), json!(1));
@@ -182,7 +196,10 @@ impl ModelInfo {
             obj.insert("tokenizer.ggml.merges".to_string(), json!([]));
             obj.insert("tokenizer.ggml.tokens".to_string(), json!([]));
             obj.insert("tokenizer.ggml.token_type".to_string(), json!([]));
-            obj.insert("tokenizer.ggml.pre".to_string(), json!(self.architecture.to_lowercase()));
+            obj.insert(
+                "tokenizer.ggml.pre".to_string(),
+                json!(self.architecture.to_lowercase()),
+            );
         }
 
         model_info
@@ -245,39 +262,49 @@ fn estimate_bytes_per_parameter(quant_level: &str) -> u64 {
     let q_lower = quant_level.to_lowercase();
     // Corrected estimates for effective bytes per parameter
     if q_lower.contains("q2") {
-        3  // Q2_K uses ~2.5-3 bytes per parameter
+        3 // Q2_K uses ~2.5-3 bytes per parameter
     } else if q_lower.contains("q3") {
-        4  // Q3_K uses ~3.5-4 bytes per parameter
+        4 // Q3_K uses ~3.5-4 bytes per parameter
     } else if q_lower.contains("q4") {
-        5  // Q4_K uses ~4.5-5 bytes per parameter
+        5 // Q4_K uses ~4.5-5 bytes per parameter
     } else if q_lower.contains("q5") {
-        6  // Q5_K uses ~5.5-6 bytes per parameter
+        6 // Q5_K uses ~5.5-6 bytes per parameter
     } else if q_lower.contains("q6") {
-        7  // Q6_K uses ~6.5-7 bytes per parameter
+        7 // Q6_K uses ~6.5-7 bytes per parameter
     } else if q_lower.contains("q8") {
-        9  // Q8_0 uses ~8.5-9 bytes per parameter
+        9 // Q8_0 uses ~8.5-9 bytes per parameter
     } else if q_lower.contains("f16") {
         16 // F16 uses 2 bytes per weight + overhead
     } else if q_lower.contains("f32") {
         32 // F32 uses 4 bytes per weight + overhead
     } else {
-        5  // Default to Q4-level estimate
+        5 // Default to Q4-level estimate
     }
 }
 
 /// Extract model family from name programmatically
 fn extract_model_family(name: &str) -> String {
     const FAMILY_PATTERNS: &[(&str, &str)] = &[
-        ("llama", "llama"), ("codellama", "llama"),
+        ("llama", "llama"),
+        ("codellama", "llama"),
         ("qwen", "qwen2"),
-        ("mistral", "mistral"), ("mixtral", "mixtral"),
-        ("deepseek-coder", "deepseek"), ("deepseek-moe", "deepseek"), ("deepseek-llm", "deepseek"), ("deepseek", "deepseek"),
+        ("mistral", "mistral"),
+        ("mixtral", "mixtral"),
+        ("deepseek-coder", "deepseek"),
+        ("deepseek-moe", "deepseek"),
+        ("deepseek-llm", "deepseek"),
+        ("deepseek", "deepseek"),
         ("gemma", "gemma"),
         ("phi", "phi"),
         ("starcoder", "starcoder"),
         ("stablelm", "stablelm"),
-        ("command-r", "cohere"), ("cohere", "cohere"),
-        ("all-minilm", "embedding"), ("nomic-embed", "embedding"), ("bge-", "embedding"), ("gte-", "embedding"), ("embed", "embedding"),
+        ("command-r", "cohere"),
+        ("cohere", "cohere"),
+        ("all-minilm", "embedding"),
+        ("nomic-embed", "embedding"),
+        ("bge-", "embedding"),
+        ("gte-", "embedding"),
+        ("embed", "embedding"),
     ];
 
     for (pattern, family) in FAMILY_PATTERNS {
@@ -285,7 +312,10 @@ fn extract_model_family(name: &str) -> String {
             return family.to_string();
         }
     }
-    name.split(&['-', ':', '/'][..]).next().unwrap_or("unknown").to_string()
+    name.split(&['-', ':', '/'][..])
+        .next()
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 /// Extract model architecture from name and family
@@ -301,9 +331,15 @@ fn extract_architecture(name: &str, family: &str) -> String {
         "embedding" => return "bert".to_string(),
         _ => {}
     }
-    if name.contains("qwen") { return "qwen2".to_string(); }
-    if name.contains("llama") || name.contains("codellama") { return "llama".to_string(); }
-    if name.contains("mistral") || name.contains("mixtral") { return "mistral".to_string(); }
+    if name.contains("qwen") {
+        return "qwen2".to_string();
+    }
+    if name.contains("llama") || name.contains("codellama") {
+        return "llama".to_string();
+    }
+    if name.contains("mistral") || name.contains("mixtral") {
+        return "mistral".to_string();
+    }
 
     if !family.is_empty() && family != "unknown" {
         family.to_string()
@@ -315,11 +351,14 @@ fn extract_architecture(name: &str, family: &str) -> String {
 /// Extract model size programmatically
 fn extract_model_size(name: &str) -> (String, u64) {
     const SIZE_PATTERNS: &[(&str, &str, u64)] = &[
-        ("0.5b", "0.5B", 500_000_000), ("500m", "0.5B", 500_000_000),
-        ("1.5b", "1.5B", 1_500_000_000), ("1b5", "1.5B", 1_500_000_000),
+        ("0.5b", "0.5B", 500_000_000),
+        ("500m", "0.5B", 500_000_000),
+        ("1.5b", "1.5B", 1_500_000_000),
+        ("1b5", "1.5B", 1_500_000_000),
         ("1.6b", "1.6B", 1_600_000_000),
         ("1.8b", "1.8B", 1_800_000_000),
-        ("2.7b", "2.7B", 2_700_000_000), ("2b7", "2.7B", 2_700_000_000),
+        ("2.7b", "2.7B", 2_700_000_000),
+        ("2b7", "2.7B", 2_700_000_000),
         ("3.1b", "3.1B", 3_100_000_000),
         ("3.8b", "3.8B", 3_800_000_000),
         ("1b", "1B", 1_000_000_000),
@@ -381,21 +420,44 @@ fn extract_model_size(name: &str) -> (String, u64) {
 /// Extract quantization level programmatically
 fn extract_quantization_level(name: &str) -> String {
     const QUANT_PATTERNS: &[(&str, &str)] = &[
-        ("q2_k_s", "Q2_K_S"), ("q2_k", "Q2_K"),
-        ("q3_k_s", "Q3_K_S"), ("q3_k_m", "Q3_K_M"), ("q3_k_l", "Q3_K_L"), ("q3_k", "Q3_K"),
-        ("q4_0", "Q4_0"), ("q4_1", "Q4_1"),
-        ("q4_k_s", "Q4_K_S"), ("q4_k_m", "Q4_K_M"), ("q4_k", "Q4_K"),
-        ("q5_0", "Q5_0"), ("q5_1", "Q5_1"),
-        ("q5_k_s", "Q5_K_S"), ("q5_k_m", "Q5_K_M"), ("q5_k", "Q5_K"),
+        ("q2_k_s", "Q2_K_S"),
+        ("q2_k", "Q2_K"),
+        ("q3_k_s", "Q3_K_S"),
+        ("q3_k_m", "Q3_K_M"),
+        ("q3_k_l", "Q3_K_L"),
+        ("q3_k", "Q3_K"),
+        ("q4_0", "Q4_0"),
+        ("q4_1", "Q4_1"),
+        ("q4_k_s", "Q4_K_S"),
+        ("q4_k_m", "Q4_K_M"),
+        ("q4_k", "Q4_K"),
+        ("q5_0", "Q5_0"),
+        ("q5_1", "Q5_1"),
+        ("q5_k_s", "Q5_K_S"),
+        ("q5_k_m", "Q5_K_M"),
+        ("q5_k", "Q5_K"),
         ("q6_k", "Q6_K"),
-        ("q8_0", "Q8_0"), ("q8_1", "Q8_1"), ("q8_k_s", "Q8_K_S"), ("q8_k", "Q8_K"),
-        ("iq1_s", "IQ1_S"), ("iq1_m", "IQ1_M"),
-        ("iq2_xs", "IQ2_XS"), ("iq2_s", "IQ2_S"), ("iq2_m", "IQ2_M"), ("iq2_xxs", "IQ2_XXS"),
-        ("iq3_s", "IQ3_S"), ("iq3_m", "IQ3_M"), ("iq3_xs", "IQ3_XS"), ("iq3_xxs", "IQ3_XXS"),
-        ("iq4_xs", "IQ4_XS"), ("iq4_nl", "IQ4_NL"),
+        ("q8_0", "Q8_0"),
+        ("q8_1", "Q8_1"),
+        ("q8_k_s", "Q8_K_S"),
+        ("q8_k", "Q8_K"),
+        ("iq1_s", "IQ1_S"),
+        ("iq1_m", "IQ1_M"),
+        ("iq2_xs", "IQ2_XS"),
+        ("iq2_s", "IQ2_S"),
+        ("iq2_m", "IQ2_M"),
+        ("iq2_xxs", "IQ2_XXS"),
+        ("iq3_s", "IQ3_S"),
+        ("iq3_m", "IQ3_M"),
+        ("iq3_xs", "IQ3_XS"),
+        ("iq3_xxs", "IQ3_XXS"),
+        ("iq4_xs", "IQ4_XS"),
+        ("iq4_nl", "IQ4_NL"),
         ("bpw", "BPW"),
-        ("f16", "F16"), ("fp16", "F16"),
-        ("f32", "F32"), ("fp32", "F32"),
+        ("f16", "F16"),
+        ("fp16", "F16"),
+        ("f32", "F32"),
+        ("fp32", "F32"),
         ("gguf", "GGUF"),
     ];
 
@@ -404,7 +466,11 @@ fn extract_quantization_level(name: &str) -> String {
             return quant.to_string();
         }
     }
-    if name.contains("gguf") { "Q4_K_M".to_string() } else { "unknown".to_string() }
+    if name.contains("gguf") {
+        "Q4_K_M".to_string()
+    } else {
+        "unknown".to_string()
+    }
 }
 
 /// Optimized model name cleaning
@@ -427,52 +493,108 @@ pub fn clean_model_name(name: &str) -> &str {
 }
 
 /// ModelResolver for handling model resolution with LM Studio
-pub struct ModelResolver<'a> {
-    context: RequestContext<'a>,
+pub struct ModelResolver {
+    lmstudio_url: String,
+    cache: Cache<String, String>,
 }
 
-impl<'a> ModelResolver<'a> {
+impl ModelResolver {
     /// Create new model resolver
-    pub fn new(context: RequestContext<'a>) -> Self {
-        Self { context }
+    pub fn new(lmstudio_url: String, cache: Cache<String, String>) -> Self {
+        Self {
+            lmstudio_url,
+            cache,
+        }
     }
 
-    /// Direct model resolution with fail-fast approach
+    /// Direct model resolution with fail-fast approach and caching
     pub async fn resolve_model_name(
         &self,
         ollama_model_name_requested: &str,
+        client: &reqwest::Client, // Client passed in
         cancellation_token: CancellationToken,
     ) -> Result<String, ProxyError> {
-        let cleaned_ollama_request = clean_model_name(ollama_model_name_requested);
+        let cleaned_ollama_request = clean_model_name(ollama_model_name_requested).to_string();
 
-        match self.get_available_lm_studio_models(cancellation_token).await {
+        // Check cache first
+        if let Some(cached_lm_studio_id) = self.cache.get(&cleaned_ollama_request).await {
+            log_info(&format!(
+                "Cache hit for model resolution: '{}' -> '{}'",
+                cleaned_ollama_request, cached_lm_studio_id
+            ));
+            return Ok(cached_lm_studio_id);
+        }
+
+        log_info(&format!(
+            "Cache miss for model resolution: '{}'. Fetching from LM Studio.",
+            cleaned_ollama_request
+        ));
+
+        match self
+            .get_available_lm_studio_models(client, cancellation_token)
+            .await
+        {
             Ok(available_lm_studio_ids) => {
-                if let Some(matched_lm_studio_id) = self.find_best_match(cleaned_ollama_request, &available_lm_studio_ids) {
+                if let Some(matched_lm_studio_id) =
+                    self.find_best_match(&cleaned_ollama_request, &available_lm_studio_ids)
+                {
+                    // Store in cache on successful match
+                    self.cache
+                        .insert(cleaned_ollama_request.clone(), matched_lm_studio_id.clone())
+                        .await;
+                    log_info(&format!(
+                        "Resolved and cached: '{}' -> '{}'",
+                        cleaned_ollama_request, matched_lm_studio_id
+                    ));
                     Ok(matched_lm_studio_id)
                 } else {
-                    Ok(cleaned_ollama_request.to_string())
+                    // No match found, return original cleaned request (don't cache this "passthrough")
+                    Ok(cleaned_ollama_request)
                 }
             }
-            Err(e) => Err(e)
+            Err(e) => Err(e),
         }
     }
 
     /// Get available models from LM Studio with fail-fast strategy
-    async fn get_available_lm_studio_models(&self, cancellation_token: CancellationToken) -> Result<Vec<String>, ProxyError> {
-        let url = format!("{}/v1/models", self.context.lmstudio_url);
-        let request = CancellableRequest::new(self.context.clone(), cancellation_token);
+    async fn get_available_lm_studio_models(
+        &self,
+        client: &reqwest::Client, // Client passed in
+        cancellation_token: CancellationToken,
+    ) -> Result<Vec<String>, ProxyError> {
+        let url = format!("{}/v1/models", self.lmstudio_url);
 
-        let response = request.make_request(reqwest::Method::GET, &url, None).await?;
+        // Create a temporary RequestContext for CancellableRequest
+        let temp_context = crate::common::RequestContext {
+            client,
+            lmstudio_url: &self.lmstudio_url,
+        };
+        let request = CancellableRequest::new(temp_context, cancellation_token);
+
+        let response = request
+            .make_request(reqwest::Method::GET, &url, None::<Value>) // Specify type for None
+            .await?;
 
         if !response.status().is_success() {
             return Err(ProxyError::new(
-                format!("{}: {}", ERROR_LM_STUDIO_UNAVAILABLE, response.status()),
+                format!(
+                    "{}: {}",
+                    ERROR_LM_STUDIO_UNAVAILABLE,
+                    response.status()
+                ),
                 response.status().as_u16(),
             ));
         }
 
-        let models_response = response.json::<Value>().await
-            .map_err(|e| ProxyError::internal_server_error(&format!("Invalid JSON from LM Studio /v1/models: {}", e)))?;
+        let models_response = response
+            .json::<Value>()
+            .await
+            .map_err(|e| {
+                ProxyError::internal_server_error(&format!(
+                    "Invalid JSON from LM Studio /v1/models: {}",
+                    e
+                ))
+            })?;
 
         let mut model_ids = Vec::new();
         if let Some(data) = models_response.get("data").and_then(|d| d.as_array()) {
@@ -486,7 +608,11 @@ impl<'a> ModelResolver<'a> {
     }
 
     /// Enhanced model matching with better scoring
-    fn find_best_match(&self, ollama_name_cleaned: &str, available_lm_studio_ids: &[String]) -> Option<String> {
+    fn find_best_match(
+        &self,
+        ollama_name_cleaned: &str,
+        available_lm_studio_ids: &[String],
+    ) -> Option<String> {
         let lower_ollama = ollama_name_cleaned.to_lowercase();
 
         // Exact match first
@@ -516,7 +642,10 @@ impl<'a> ModelResolver<'a> {
             }
         }
 
-        if best_match.is_none() && ollama_name_cleaned.contains('/') && ollama_name_cleaned.to_lowercase().ends_with(".gguf") {
+        if best_match.is_none()
+            && ollama_name_cleaned.contains('/')
+            && ollama_name_cleaned.to_lowercase().ends_with(".gguf")
+        {
             return Some(ollama_name_cleaned.to_string());
         }
         best_match
