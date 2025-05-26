@@ -98,6 +98,8 @@ pub const LOG_PREFIX_SUCCESS: &str = "✅";
 pub const LOG_PREFIX_ERROR: &str = "❌";
 pub const LOG_PREFIX_WARNING: &str = "⚠️";
 pub const LOG_PREFIX_CANCEL: &str = "🚫";
+pub const LOG_PREFIX_INFO: &str = "ℹ️";
+pub const LOG_PREFIX_CONN: &str = "↔️";
 
 /// Default context array for generate responses
 pub const DEFAULT_CONTEXT: [u32; 3] = [1, 2, 3];

@@ -1,4 +1,4 @@
-/// src/utils.rs - Centralized logging and utilities
+/// src/utils.rs - Enhanced centralized logging and utilities with model loading detection
 
 use std::cell::RefCell;
 use std::error::Error;
@@ -43,7 +43,7 @@ pub fn log_warning(operation: &str, warning: &str) {
         STRING_BUFFER.with(|buf| {
             let mut buffer = buf.borrow_mut();
             buffer.clear();
-            write!(buffer, "{} {} warning: {}", LOG_PREFIX_WARNING, sanitize_log_message(operation), sanitize_log_message(warning)).unwrap();
+            write!(buffer, "{} {} {}", LOG_PREFIX_WARNING, sanitize_log_message(warning), sanitize_log_message(operation)).unwrap();
             println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), buffer);
         });
     }
@@ -83,7 +83,7 @@ pub fn log_timed(prefix: &str, operation: &str, start: Instant) {
         STRING_BUFFER.with(|buf| {
             let mut buffer = buf.borrow_mut();
             buffer.clear();
-            write!(buffer, "{} {} ({})", prefix, operation, format_duration(duration)).unwrap();
+            write!(buffer, "{} {} | {}", prefix, operation, format_duration(duration)).unwrap();
             println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), buffer);
         });
     }
@@ -130,6 +130,7 @@ enum ProxyErrorKind {
     NotFound,
     NotImplemented,
     LMStudioUnavailable,
+    ModelLoading,
     Custom,
 }
 
@@ -197,6 +198,15 @@ impl ProxyError {
         }
     }
 
+    /// Create model loading error
+    pub fn model_loading(message: &str) -> Self {
+        Self {
+            message: message.to_string(),
+            status_code: 503,
+            kind: ProxyErrorKind::ModelLoading,
+        }
+    }
+
     /// Check if request is canceled
     pub fn is_cancelled(&self) -> bool {
         matches!(self.kind, ProxyErrorKind::RequestCancelled)
@@ -205,6 +215,11 @@ impl ProxyError {
     /// Check if LM Studio is unavailable
     pub fn is_lm_studio_unavailable(&self) -> bool {
         matches!(self.kind, ProxyErrorKind::LMStudioUnavailable)
+    }
+
+    /// Check if error is related to model loading
+    pub fn is_model_loading(&self) -> bool {
+        matches!(self.kind, ProxyErrorKind::ModelLoading) || is_model_loading_error(&self.message)
     }
 }
 
@@ -218,34 +233,88 @@ impl Error for ProxyError {}
 
 impl Reject for ProxyError {}
 
-/// Enhanced model loading error detection
+/// Enhanced model loading error detection with more patterns
 pub fn is_model_loading_error(message: &str) -> bool {
     let lower = message.to_lowercase();
 
-    let error_indicators = [
-        "no model", "not loaded", "model not found", "model unavailable",
-        "model not available", "invalid model", "unknown model",
-        "failed to load", "loading failed", "model error", "is not embedding"
+    // Explicit model loading indicators
+    let loading_indicators = [
+        "loading model", "model loading", "model is loading", "loading the model",
+        "model not loaded", "not loaded", "model unavailable", "model not available",
+        "model not found", "no model", "invalid model", "unknown model",
+        "failed to load", "loading failed", "model error", "is not embedding",
+        "model initialization", "initializing model", "warming up model",
+        "model startup", "preparing model", "model not ready"
     ];
 
-    error_indicators.iter().any(|&pattern| lower.contains(pattern)) ||
-        ((lower.contains("no") || lower.contains("not") || lower.contains("missing") ||
-            lower.contains("invalid") || lower.contains("unknown") || lower.contains("failed")) &&
-            (lower.contains("model") || lower.contains("load") || lower.contains("available")))
+    // Check explicit indicators first
+    if loading_indicators.iter().any(|&pattern| lower.contains(pattern)) {
+        return true;
+    }
+
+    // Check combinations of keywords that suggest model loading issues
+    let has_negative = lower.contains("no") || lower.contains("not") || lower.contains("missing")
+        || lower.contains("invalid") || lower.contains("unknown") || lower.contains("failed")
+        || lower.contains("unavailable") || lower.contains("unreachable");
+
+    let has_model_ref = lower.contains("model") || lower.contains("load") || lower.contains("available")
+        || lower.contains("ready") || lower.contains("initialize");
+
+    // Additional LM Studio specific error patterns
+    let lm_studio_loading_patterns = [
+        "service unavailable", "server error", "internal error",
+        "timeout", "connection", "503", "500"
+    ];
+
+    let has_lm_studio_loading = lm_studio_loading_patterns.iter().any(|&pattern| lower.contains(pattern));
+
+    (has_negative && has_model_ref) || has_lm_studio_loading
+}
+
+/// Detect if response time indicates model loading
+pub fn is_probable_model_loading_by_timing(duration: Duration, threshold_ms: u128) -> bool {
+    duration.as_millis() > threshold_ms
+}
+
+/// Classify model loading error type
+#[derive(Debug, PartialEq)]
+pub enum ModelLoadingErrorType {
+    ModelNotFound,
+    ModelNotLoaded,
+    ModelLoading,
+    ModelFailed,
+    ServiceUnavailable,
+    Unknown,
+}
+
+pub fn classify_model_loading_error(message: &str) -> ModelLoadingErrorType {
+    let lower = message.to_lowercase();
+
+    if lower.contains("not found") || lower.contains("unknown model") || lower.contains("invalid model") {
+        ModelLoadingErrorType::ModelNotFound
+    } else if lower.contains("not loaded") || lower.contains("model unavailable") {
+        ModelLoadingErrorType::ModelNotLoaded
+    } else if lower.contains("loading") || lower.contains("initializing") || lower.contains("warming up") {
+        ModelLoadingErrorType::ModelLoading
+    } else if lower.contains("failed to load") || lower.contains("loading failed") {
+        ModelLoadingErrorType::ModelFailed
+    } else if lower.contains("service unavailable") || lower.contains("503") || lower.contains("timeout") {
+        ModelLoadingErrorType::ServiceUnavailable
+    } else {
+        ModelLoadingErrorType::Unknown
+    }
 }
 
 /// Fast duration formatting with better precision
 pub fn format_duration(duration: Duration) -> String {
     let total_nanos = duration.as_nanos();
 
-    if total_nanos < 1_000 {
-        format!("{}ns", total_nanos)
-    } else if total_nanos < 1_000_000 {
+    if total_nanos < 1_000_000 {
         format!("{:.1}µs", total_nanos as f64 / 1_000.0)
     } else if total_nanos < 1_000_000_000 {
         format!("{:.2}ms", total_nanos as f64 / 1_000_000.0)
     } else {
-        format!("{:.3}s", total_nanos as f64 / 1_000_000_000.0)
+        format!("{:.2}s", total_nanos as f64 / 1_000_000_000.0)
     }
 }
 

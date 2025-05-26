@@ -1,4 +1,4 @@
-/// src/handlers/lmstudio.rs - LM Studio API passthrough handlers with native and legacy support
+/// src/handlers/lmstudio.rs - Enhanced LM Studio API passthrough handlers with model loading detection
 use serde_json::Value;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -9,9 +9,9 @@ use crate::handlers::helpers::json_response;
 use crate::handlers::retry::{with_retry_and_cancellation, with_simple_retry};
 use crate::handlers::streaming::{handle_passthrough_streaming_response, is_streaming_request};
 use crate::server::ModelResolverType;
-use crate::utils::{log_request, log_timed, ProxyError};
+use crate::utils::{format_duration, log_info, log_request, log_timed, ProxyError};
 
-/// Handle direct LM Studio API passthrough with dual API support
+/// Handle direct LM Studio API passthrough with model loading detection
 pub async fn handle_lmstudio_passthrough(
     context: RequestContext<'_>,
     model_resolver: ModelResolverType,
@@ -108,9 +108,11 @@ pub async fn handle_lmstudio_passthrough(
                     Some(current_body.clone())
                 };
 
+                let lm_studio_request_start = Instant::now();
                 let response = request
                     .make_request(request_method, &final_endpoint_url, request_body_opt)
                     .await?;
+                let lm_studio_response_time = lm_studio_request_start.elapsed();
 
                 if !response.status().is_success() {
                     let status = response.status();
@@ -138,6 +140,13 @@ pub async fn handle_lmstudio_passthrough(
                         _ => format!("LM Studio error ({})", status),
                     };
                     return Err(ProxyError::new(error_message, status.as_u16()));
+                }
+
+                // Log LM Studio response time for completions
+                if let Some(_) = current_original_model_name {
+                    if current_endpoint.contains("completion") || current_endpoint.contains("chat") {
+                        log_info(&format!("Processing... | LM Studio responded in {}", format_duration(lm_studio_response_time)));
+                    }
                 }
 
                 if is_streaming {
@@ -168,7 +177,7 @@ pub async fn handle_lmstudio_passthrough(
         with_simple_retry(operation, cancellation_token).await?
     };
 
-    log_timed(LOG_PREFIX_SUCCESS, "LM Studio passthrough", start_time);
+    log_timed(LOG_PREFIX_CONN, "Started LM Studio passthrough", start_time);
     Ok(result)
 }
 
@@ -200,7 +209,7 @@ fn determine_passthrough_endpoint_url(
     }
 }
 
-/// Get LM Studio server status for health checks with dual API support
+/// Get LM Studio server status for health checks
 pub async fn get_lmstudio_status(
     context: RequestContext<'_>,
     model_resolver: Option<&ModelResolverType>,
@@ -214,11 +223,14 @@ pub async fn get_lmstudio_status(
     let url = format!("{}{}", context.lmstudio_url, endpoint);
     let request = CancellableRequest::new(context.clone(), cancellation_token.clone());
 
+    let health_check_start = Instant::now();
+
     match request
         .make_request(reqwest::Method::GET, &url, None::<Value>)
         .await
     {
         Ok(response) => {
+            let response_time = health_check_start.elapsed();
             let status = response.status();
             let is_healthy = status.is_success();
             let mut additional_info = serde_json::Map::new();
@@ -256,6 +268,7 @@ pub async fn get_lmstudio_status(
                 "lmstudio_url": context.lmstudio_url,
                 "http_status": status.as_u16(),
                 "api_endpoint": endpoint,
+                "response_time_ms": response_time.as_millis(),
                 "timestamp": chrono::Utc::now().to_rfc3339()
             });
 
@@ -271,6 +284,7 @@ pub async fn get_lmstudio_status(
             Ok(result)
         }
         Err(_) => {
+            let response_time = health_check_start.elapsed();
             let status_message = if endpoint.starts_with("/api/v0/") {
                 "unreachable_native_api"
             } else {
@@ -282,6 +296,7 @@ pub async fn get_lmstudio_status(
                 "lmstudio_url": context.lmstudio_url,
                 "error": ERROR_LM_STUDIO_UNAVAILABLE,
                 "api_endpoint": endpoint,
+                "response_time_ms": response_time.as_millis(),
                 "timestamp": chrono::Utc::now().to_rfc3339(),
                 "suggestion": if endpoint.starts_with("/api/v0/") {
                     "Update to LM Studio 0.3.6+ or use --legacy flag"

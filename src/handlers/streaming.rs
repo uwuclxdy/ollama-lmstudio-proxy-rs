@@ -1,4 +1,4 @@
-/// src/handlers/streaming.rs - Enhanced streaming with SSE parsing and chunk recovery.
+/// src/handlers/streaming.rs - Enhanced streaming with model loading detection and better timing
 
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -12,16 +12,19 @@ use crate::constants::*;
 use crate::handlers::helpers::{
     create_cancellation_chunk, create_error_chunk, create_final_chunk, create_ollama_streaming_chunk,
 };
-use crate::utils::{log_error, log_timed, log_warning, ProxyError};
+use crate::utils::{log_error, log_info, log_timed, log_warning, ProxyError};
 
 static STREAM_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Threshold for detecting slow stream starts (likely model loading)
+const STREAM_START_LOADING_THRESHOLD_MS: u128 = 500;
 
 /// Check if request is streaming
 pub fn is_streaming_request(body: &Value) -> bool {
     body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false)
 }
 
-/// Handle streaming response with SSE parsing
+/// Handle streaming response with model loading detection
 pub async fn handle_streaming_response(
     lm_studio_response: reqwest::Response,
     is_chat_endpoint: bool,
@@ -41,9 +44,10 @@ pub async fn handle_streaming_response(
 
     tokio::spawn(async move {
         let mut stream = lm_studio_response.bytes_stream();
-        let mut sse_buffer = String::with_capacity(runtime_config.max_buffer_size.min(1024 * 1024)); // Cap initial capacity for memory efficiency
+        let mut sse_buffer = String::with_capacity(runtime_config.max_buffer_size.min(1024 * 1024));
         let mut chunk_count = 0u64;
         let mut accumulated_tool_calls: Option<Vec<Value>> = None;
+        let mut first_chunk_received = false;
 
         let stream_result = 'stream_loop: loop {
             tokio::select! {
@@ -62,6 +66,19 @@ pub async fn handle_streaming_response(
                 chunk_result = timeout(Duration::from_secs(stream_timeout_seconds), stream.next()) => {
                     match chunk_result {
                         Ok(Some(Ok(bytes_chunk))) => {
+                            // Track first chunk timing for model loading detection
+                            if !first_chunk_received {
+                                first_chunk_received = true;
+                                let time_to_first_chunk = start_time.elapsed();
+
+                                if time_to_first_chunk.as_millis() > STREAM_START_LOADING_THRESHOLD_MS {
+                                    log_info(&format!(
+                                        "{} loaded | took {}ms",
+                                        model_clone_for_task, time_to_first_chunk.as_millis()
+                                    ));
+                                }
+                            }
+
                             if let Ok(chunk_str) = std::str::from_utf8(&bytes_chunk) {
                                 sse_buffer.push_str(chunk_str);
 
@@ -203,7 +220,7 @@ pub async fn handle_passthrough_streaming_response(
             }
         }
 
-        log_timed("Passthrough stream", &format!("[{}] {} chunks", stream_id, chunk_count), start_time);
+        log_timed(LOG_PREFIX_SUCCESS,&format!("Passthrough stream [{}] finished! | {} chunks", stream_id, chunk_count), start_time);
     });
 
     create_passthrough_streaming_response_format(rx)

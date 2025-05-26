@@ -155,7 +155,7 @@ impl ProxyServer {
             move |info: LogInfo| {
                 if logging_enabled {
                     let status_icon = match info.status().as_u16() {
-                        200..=299 => LOG_PREFIX_SUCCESS,
+                        200..=299 => LOG_PREFIX_REQUEST,
                         400..=499 => LOG_PREFIX_WARNING,
                         500..=599 => LOG_PREFIX_ERROR,
                         _ => "❔",

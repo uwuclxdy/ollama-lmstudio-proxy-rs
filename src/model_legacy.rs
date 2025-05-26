@@ -1,11 +1,13 @@
 /// src/model-legacy.rs - Legacy model handling with programmatic calculations (OpenAI-compatible endpoints)
 use moka::future::Cache;
 use serde_json::{json, Value};
+use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::common::CancellableRequest;
 use crate::constants::*;
 use crate::utils::{log_info, ProxyError};
+use crate::{log_timed, log_warning};
 
 /// Legacy model information with calculated estimates
 #[derive(Debug, Clone)]
@@ -508,20 +510,18 @@ impl ModelResolverLegacy {
         client: &reqwest::Client,
         cancellation_token: CancellationToken,
     ) -> Result<String, ProxyError> {
+        let start_time = Instant::now();
         let cleaned_ollama_request = clean_model_name_legacy(ollama_model_name_requested).to_string();
 
         if let Some(cached_lm_studio_id) = self.cache.get(&cleaned_ollama_request).await {
-            log_info(&format!(
-                "Cache hit for legacy model resolution: '{}' -> '{}'",
+            log_timed(LOG_PREFIX_SUCCESS, &format!(
+                "Cache hit - legacy: '{}' -> '{}'",
                 cleaned_ollama_request, cached_lm_studio_id
-            ));
+            ), start_time);
             return Ok(cached_lm_studio_id);
         }
 
-        log_info(&format!(
-            "Cache miss for legacy model resolution: '{}'. Fetching from LM Studio.",
-            cleaned_ollama_request
-        ));
+        log_warning("Fetching from LM Studio - legacy.", &format!("Cache miss: '{}'.", cleaned_ollama_request));
 
         match self
             .get_available_lm_studio_models_legacy(client, cancellation_token)

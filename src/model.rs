@@ -2,11 +2,13 @@
 use moka::future::Cache;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::common::CancellableRequest;
 use crate::constants::*;
-use crate::utils::{log_info, log_warning, ProxyError};
+use crate::log_timed;
+use crate::utils::{log_warning, ProxyError};
 
 /// Native LM Studio model data from /api/v0/models
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -288,34 +290,27 @@ impl ModelResolver {
         client: &reqwest::Client,
         cancellation_token: CancellationToken,
     ) -> Result<String, ProxyError> {
+        let start_time = Instant::now();
         let cleaned_ollama_request = clean_model_name(ollama_model_name_requested).to_string();
 
         // Check cache first
         if let Some(cached_lm_studio_id) = self.cache.get(&cleaned_ollama_request).await {
-            log_info(&format!(
-                "Cache hit for native model resolution: '{}' -> '{}'",
+            log_timed(LOG_PREFIX_SUCCESS, &format!(
+                "Cache hit - native API: '{}' -> '{}'",
                 cleaned_ollama_request, cached_lm_studio_id
-            ));
+            ), start_time);
             return Ok(cached_lm_studio_id);
         }
 
-        log_info(&format!(
-            "Cache miss for native model resolution: '{}'. Fetching from LM Studio native API.",
-            cleaned_ollama_request
-        ));
+        log_warning("Fetching from LM Studio - native API.", &format!("Cache miss: '{}'.", cleaned_ollama_request));
 
-        match self
-            .get_available_lm_studio_models_native(client, cancellation_token)
-            .await
-        {
+        match self.get_available_lm_studio_models_native(client, cancellation_token).await {
             Ok(available_models) => {
-                if let Some(matched_model) =
-                    self.find_best_match_native(&cleaned_ollama_request, &available_models)
-                {
+                if let Some(matched_model) = self.find_best_match_native(&cleaned_ollama_request, &available_models) {
                     // Check if model is loaded for strict error handling
                     if !matched_model.is_loaded {
                         log_warning(
-                            "Model resolution",
+                            "",
                             &format!(
                                 "Model '{}' found but not loaded (state: {}). This may cause request failures.",
                                 matched_model.id, matched_model.state
@@ -323,13 +318,8 @@ impl ModelResolver {
                         );
                     }
 
-                    self.cache
-                        .insert(cleaned_ollama_request.clone(), matched_model.id.clone())
-                        .await;
-                    log_info(&format!(
-                        "Resolved and cached (native): '{}' -> '{}' (state: {})",
-                        cleaned_ollama_request, matched_model.id, matched_model.state
-                    ));
+                    self.cache.insert(cleaned_ollama_request.clone(), matched_model.id.clone()).await;
+                    log_timed(LOG_PREFIX_INFO, &format!("Resolved and cached: '{}' -> '{}' (state: {})", cleaned_ollama_request, matched_model.id, matched_model.state), start_time);
                     Ok(matched_model.id)
                 } else {
                     // Strict error handling - don't allow unknown models
