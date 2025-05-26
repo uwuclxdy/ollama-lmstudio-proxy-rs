@@ -252,7 +252,7 @@ impl ProxyServer {
             .recover(handle_rejection)
             .with(log_filter);
 
-        log_info("Starting server...");
+        log_info(&format!("Server starting: {addr}"));
         warp::serve(final_routes).run(addr).await;
         Ok(())
     }
@@ -273,7 +273,6 @@ impl ProxyServer {
             println!("------------------------------------------------------");
             println!(" INFO: Proxy forwards all requests and timing to LM Studio backend.");
             println!("------------------------------------------------------");
-            println!();
         }
     }
 }
